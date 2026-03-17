@@ -1652,10 +1652,15 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             packed_dir = str(Path(model_path) / "packed_experts")
             expert_size = packed_layout["expert_size"]
 
-            _fwl_module.init(num_workers=8)
-            _fwl_buffers = _fwl_module.prealloc_stacked(
-                num_layers, active_experts, _fwl_components,
-                packed_dir, expert_size)
+            # K must accommodate the SUPERSET (unique experts across all prompt positions)
+            # which can be much larger than active_experts during prefill.
+            # Use a generous upper bound.
+            _fwl_K = min(active_experts * 4, 16)  # up to 16 unique per layer
+            _fwl_module.init(
+                num_workers=8, num_layers=num_layers, K=_fwl_K,
+                components=_fwl_components, packed_dir=packed_dir,
+                expert_size=expert_size)
+            _fwl_buffers = None  # Not needed — load_and_assemble returns fresh arrays
             _fwl_active = True
 
             import atexit as _fwl_atexit
@@ -2104,6 +2109,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
                         inds_np = np.array(inds_topk_i.tolist())
                         unique_experts = np.unique(inds_np)  # sorted
+                        # Cap unique experts to C extension's K limit
+                        if _fwl_active and len(unique_experts) > _fwl_K:
+                            unique_experts = unique_experts[:_fwl_K]
                         num_unique = len(unique_experts)
                         unique_list = unique_experts.tolist()
 
@@ -2131,9 +2139,14 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     # Dispatch ALL expert reads in one C call
                     # (parallel pread into pre-stacked Metal buffers)
                     _t_io = time.perf_counter()
+                    _fwl_fresh_dicts = []
                     if _fwl_load_routing:
-                        _fwl_module.load_and_assemble(_fwl_load_routing)
+                        _fwl_fresh_dicts = _fwl_module.load_and_assemble(_fwl_load_routing)
                     _se_io_total = time.perf_counter() - _t_io
+                    # Build layer→dict mapping from fresh arrays
+                    _fwl_layer_dicts = {}
+                    for idx, (li, _) in enumerate(_fwl_load_routing):
+                        _fwl_layer_dicts[li] = _fwl_fresh_dicts[idx]
 
                     # Track I/O stats
                     token_io_seeks += _fwl_total_experts
@@ -2167,28 +2180,26 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
                         h_post = layer.post_attention_layernorm(h_mid)
 
-                        # Use pre-stacked buffers from fast_moe_load directly.
-                        # Each buffer is [K, *shape]; slice to [:num_unique].
-                        #
-                        # CRITICAL: The buffers were mx.eval'd as zeros at prealloc
-                        # time, then pread overwrote the Metal buffer contents.
-                        # We must create new graph nodes so MLX reads from the
-                        # buffer at eval time instead of using cached zeros.
-                        # .view(different_dtype).view(original_dtype) forces this.
-                        layer_bufs = _fwl_buffers[i]
+                        # Use FRESH mx.arrays from fast_moe_load.load_and_assemble.
+                        # These are newly created each token — no stale buffer issue.
+                        layer_bufs = _fwl_layer_dicts.get(i, {})
                         expert_tensors = {}
                         for comp_name, stacked_arr in layer_bufs.items():
                             sliced = stacked_arr[:num_unique]
-                            if stacked_arr.dtype == mx.bfloat16:
-                                # BF16 scales/biases: round-trip through uint16
-                                expert_tensors[comp_name] = sliced.view(mx.uint16).view(mx.bfloat16)
-                            elif stacked_arr.dtype == mx.uint32:
-                                # Quantized weights: round-trip through float32
-                                expert_tensors[comp_name] = sliced.view(mx.float32).view(mx.uint32)
+                            if 'scales' in comp_name or 'biases' in comp_name:
+                                expert_tensors[comp_name] = sliced.view(mx.bfloat16)
                             else:
-                                # Fallback: identity view (should not occur for
-                                # standard quantized models)
-                                expert_tensors[comp_name] = sliced.view(sliced.dtype)
+                                expert_tensors[comp_name] = sliced
+
+
+
+
+
+
+
+
+
+
 
                         # Compute MoE (LAZY — no eval)
                         y = compute_moe_direct(
