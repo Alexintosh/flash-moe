@@ -15,4 +15,7 @@ HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.55	0	5.5	keep	2-BIT EXPERTS: 5.55 tok/s
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.61	0	5.5	keep	2-BIT 200tok: 5.61 tok/s sustained. Quality: math(255=15*17 CORRECT), code(sorted+key=len), science(plant analogy)
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	5.68	0	5.5	keep	F_NOCACHE + 2-bit: 5.68 avg, 5.91 peak. Bypass page cache avoids thrashing 120GB data.
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	4.15	0	5.5	keep	Default fused GPU delta-net: 3.90ms/layer vs 4.15ms with --cpu-linear fallback on the same tea prompt. Output identical ("to use a teapot.").
+HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	3.99	0	5.5	discard	Removing the CMD2->CPU->CMD3 bounce regressed: 4.07ms/layer vs 3.70 baseline and 3.99 tok/s vs 4.40. Output still matched the tea prompt.
+HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	4.13	0	5.5	discard	GPU routing softmax+topK removed routing_cpu but increased cmd2_wait: 3.96ms/layer vs 3.84 baseline and 4.13 tok/s vs 4.24.
 HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	4.28	0	5.5	keep	Persistent expert pread pool beats dispatch_apply: tea A/B averaged 3.81ms/layer vs 3.97 baseline and 4.28 tok/s vs 4.09. Output identical ("to use a teapot.").
+HEAD	Qwen3.5-397B-A17B-2bit	397.0	17.0	4.04	0	5.5	discard	Fused GPU final-norm + lm_head tail was mixed and slightly slower overall: 4.01ms/layer vs 3.93 baseline and 4.04 tok/s vs 4.13.
