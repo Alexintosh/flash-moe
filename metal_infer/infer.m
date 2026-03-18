@@ -5935,8 +5935,7 @@ static void serve_loop(
                                    active_session_id[0] != '\0' &&
                                    strcmp(req_session_id, active_session_id) == 0);
 
-            // Save user turn to shared session store
-            if (has_session) server_save_turn(req_session_id, "user", content);
+            // Session persistence is handled by the client (chat.m)
 
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
@@ -6179,10 +6178,6 @@ static void serve_loop(
             sse_send_done(client_fd, request_id);
 
             // ---- Save session state ----
-            // Save assistant response to shared session store
-            if (has_session && gen_resp_len > 0) {
-                server_save_turn(req_session_id, "assistant", gen_response);
-            }
             free(gen_response);
             // The KV caches + linear attention state already contain this conversation.
             // Just record the position so the next request can continue from here.
