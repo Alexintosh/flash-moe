@@ -623,6 +623,88 @@ int main(int argc, char **argv) {
         if (response && strlen(response) > 0) {
             session_save_turn(session_id, "assistant", response);
         }
+
+        // ---- Tool call handling ----
+        // Detect <tool_call>{"name":"bash","arguments":{"command":"..."}}
+        // Execute the command, feed output back as a continuation
+        while (response && strstr(response, "<tool_call>")) {
+            char *tc_start = strstr(response, "<tool_call>");
+            char *tc_end = strstr(tc_start, "</tool_call>");
+            if (!tc_start || !tc_end) break;
+
+            // Extract JSON between tags
+            tc_start += 11;  // skip <tool_call>
+            char tc_json[4096] = {0};
+            int tc_len = (int)(tc_end - tc_start);
+            if (tc_len > 4095) tc_len = 4095;
+            memcpy(tc_json, tc_start, tc_len);
+
+            // Parse command from JSON: find "command":"..."
+            char *cmd_key = strstr(tc_json, "\"command\"");
+            if (!cmd_key) break;
+            cmd_key = strchr(cmd_key + 9, '"');
+            if (!cmd_key) break;
+            cmd_key++;  // skip opening quote
+
+            char command[4096] = {0};
+            int ci = 0;
+            for (int i = 0; cmd_key[i] && cmd_key[i] != '"' && ci < 4095; i++) {
+                if (cmd_key[i] == '\\' && cmd_key[i+1]) {
+                    i++;
+                    switch (cmd_key[i]) {
+                        case 'n': command[ci++] = '\n'; break;
+                        case '"': command[ci++] = '"'; break;
+                        case '\\': command[ci++] = '\\'; break;
+                        default: command[ci++] = cmd_key[i]; break;
+                    }
+                } else {
+                    command[ci++] = cmd_key[i];
+                }
+            }
+
+            if (ci == 0) break;
+
+            // Show the command
+            printf("\033[33m$ %s\033[0m\n", command);
+
+            // Execute
+            FILE *proc = popen(command, "r");
+            char output[65536] = {0};
+            int out_len = 0;
+            if (proc) {
+                while (out_len < 65535) {
+                    int ch = fgetc(proc);
+                    if (ch == EOF) break;
+                    output[out_len++] = (char)ch;
+                }
+                output[out_len] = 0;
+                pclose(proc);
+            }
+
+            // Print output
+            if (out_len > 0) {
+                printf("\033[2m%s\033[0m", output);
+                if (output[out_len-1] != '\n') printf("\n");
+            }
+
+            // Send tool response back to model as a continuation
+            // Format: <tool_response>\n{output}\n</tool_response>
+            char *tool_msg = malloc(out_len + 256);
+            snprintf(tool_msg, out_len + 256, "<tool_response>\n%s</tool_response>", output);
+
+            free(response);
+            sock = send_chat_request(port, tool_msg, max_tokens, session_id);
+            free(tool_msg);
+            if (sock < 0) { response = NULL; break; }
+
+            printf("\n");
+            response = stream_response(sock, show_thinking);
+
+            if (response && strlen(response) > 0) {
+                session_save_turn(session_id, "assistant", response);
+            }
+        }
+
         free(response);
     }
 

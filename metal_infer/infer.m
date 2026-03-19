@@ -5651,8 +5651,49 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     return pt;
 }
 
+// Load custom system prompt from ~/.flash-moe/system.md, or use default
+static char *load_system_prompt(void) {
+    const char *home = getenv("HOME");
+    if (home) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/.flash-moe/system.md", home);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char *buf = malloc(sz + 1);
+            size_t n = fread(buf, 1, sz, f);
+            buf[n] = 0;
+            fclose(f);
+            fprintf(stderr, "[serve] Loaded custom system prompt from %s (%ld bytes)\n", path, sz);
+            return buf;
+        }
+    }
+    return strdup("You are a helpful assistant. /think");
+}
+
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
 static PromptTokens *tokenize_chat_message(const char *user_content) {
+    static char *sys_prompt_text = NULL;
+    if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
+
+    // Build: <|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
+    size_t sys_len = strlen(sys_prompt_text);
+    size_t user_len = strlen(user_content);
+    size_t total = 30 + sys_len + 30 + user_len + 40;  // generous padding for tags
+    char *prompt = malloc(total);
+    if (!prompt) return NULL;
+    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+             sys_prompt_text, user_content);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
+}
+
+// Keep old signature for backward compat (unused but prevents compiler warning)
+__attribute__((unused))
+static PromptTokens *tokenize_chat_message_old(const char *user_content) {
     const char *prefix =
         "<|im_start|>system\nYou are a helpful assistant. /think<|im_end|>\n"
         "<|im_start|>user\n";
