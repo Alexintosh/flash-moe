@@ -141,6 +141,21 @@ typedef struct {
 
 static ModelConfig cfg;
 
+// ---- Tiered expert quantization manifest ----
+// Per-expert metadata: offset in layer file, size, and quant bits (2 or 4)
+typedef struct {
+    size_t offset;   // byte offset in layer_XX.bin
+    size_t size;     // bytes to read (expert_size_4bit or expert_size_2bit)
+    int bits;        // 2 or 4
+} TieredExpertInfo;
+
+// Global tiered manifest: NULL if not using tiered mode
+static TieredExpertInfo *g_tiered_manifest = NULL;  // [num_layers * num_experts]
+static int g_use_tiered = 0;
+
+// Access helper
+#define TIERED(l, e) g_tiered_manifest[(l) * cfg.num_experts + (e)]
+
 static void compute_expert_offsets(ModelConfig *c) {
     int mid = c->moe_intermediate;
     int hid = c->hidden_dim;
@@ -362,6 +377,102 @@ static void load_model_config(const char *model_dir) {
 }
 
 // ============================================================================
+// Tiered manifest loader
+// ============================================================================
+
+static int load_tiered_manifest(const char *model_path) {
+    char manifest_path[1024];
+    snprintf(manifest_path, sizeof(manifest_path),
+             "%s/packed_experts_tiered/tiered_manifest.json", model_path);
+
+    NSData *data = [NSData dataWithContentsOfFile:
+        [NSString stringWithUTF8String:manifest_path]];
+    if (!data) return 0;  // No tiered manifest found
+
+    NSError *err = nil;
+    NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (!root || err) {
+        fprintf(stderr, "[tiered] Failed to parse %s: %s\n",
+                manifest_path, [[err localizedDescription] UTF8String]);
+        return 0;
+    }
+
+    int num_layers = [root[@"num_layers"] intValue];
+    int num_experts = [root[@"num_experts"] intValue];
+
+    if (num_layers != cfg.num_layers || num_experts != cfg.num_experts) {
+        fprintf(stderr, "[tiered] Manifest mismatch: %dx%d vs config %dx%d\n",
+                num_layers, num_experts, cfg.num_layers, cfg.num_experts);
+        return 0;
+    }
+
+    // Validate manifest expert sizes match runtime computation
+    size_t manifest_size_4 = [root[@"expert_size_4bit"] unsignedLongLongValue];
+    size_t manifest_size_2 = [root[@"expert_size_2bit"] unsignedLongLongValue];
+    if (manifest_size_4 && manifest_size_4 != cfg.expert_size_4bit) {
+        fprintf(stderr, "[tiered] expert_size_4bit mismatch: manifest=%zu vs config=%zu\n",
+                manifest_size_4, cfg.expert_size_4bit);
+        return 0;
+    }
+    if (manifest_size_2 && manifest_size_2 != cfg.expert_size_2bit) {
+        fprintf(stderr, "[tiered] expert_size_2bit mismatch: manifest=%zu vs config=%zu\n",
+                manifest_size_2, cfg.expert_size_2bit);
+        return 0;
+    }
+
+    g_tiered_manifest = calloc(num_layers * num_experts, sizeof(TieredExpertInfo));
+
+    NSDictionary *layers = root[@"layers"];
+    int errors = 0;
+    for (int l = 0; l < num_layers; l++) {
+        NSString *lkey = [NSString stringWithFormat:@"%d", l];
+        NSDictionary *layer = layers[lkey];
+        if (!layer) {
+            // Missing layer: default all experts to 4-bit with sequential offsets
+            fprintf(stderr, "[tiered] WARNING: layer %d missing from manifest, defaulting to 4-bit\n", l);
+            for (int e = 0; e < num_experts; e++) {
+                TIERED(l, e).offset = (size_t)e * cfg.expert_size_4bit;
+                TIERED(l, e).size = cfg.expert_size_4bit;
+                TIERED(l, e).bits = 4;
+            }
+            continue;
+        }
+
+        NSArray *experts = layer[@"experts"];
+        for (int e = 0; e < num_experts && e < (int)[experts count]; e++) {
+            NSDictionary *exp = experts[e];
+            int bits = [exp[@"bits"] intValue];
+            if (bits != 2 && bits != 4) {
+                fprintf(stderr, "[tiered] ERROR: layer %d expert %d has invalid bits=%d\n", l, e, bits);
+                errors++;
+                bits = 4;  // fallback
+            }
+            TIERED(l, e).offset = [exp[@"offset"] unsignedLongLongValue];
+            TIERED(l, e).size = [exp[@"size"] unsignedLongLongValue];
+            TIERED(l, e).bits = bits;
+        }
+    }
+
+    if (errors > 0) {
+        fprintf(stderr, "[tiered] WARNING: %d invalid entries found in manifest\n", errors);
+    }
+
+    // Print summary
+    int hot = 0, cold = 0;
+    for (int l = 0; l < num_layers; l++) {
+        for (int e = 0; e < num_experts; e++) {
+            if (TIERED(l, e).bits == 4) hot++;
+            else cold++;
+        }
+    }
+    double threshold = [root[@"threshold"] doubleValue];
+    printf("[tiered] Loaded manifest: %d hot (4-bit) + %d cold (2-bit), threshold=%.0f%%\n",
+           hot, cold, threshold * 100);
+
+    return 1;
+}
+
+// ============================================================================
 // Dynamic tracking arrays (allocated after config is loaded)
 // Declarations here, alloc_tracking_arrays() defined after types below.
 // ============================================================================
@@ -481,6 +592,19 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
     return g_use_2bit ? cfg.expert_size_2bit : cfg.expert_size_4bit;
+}
+
+// Tiered-aware expert offset and size lookup
+static inline void expert_offset_size(int layer, int expert, off_t *out_offset, size_t *out_size) {
+    if (g_use_tiered && g_tiered_manifest) {
+        TieredExpertInfo *ti = &TIERED(layer, expert);
+        *out_offset = (off_t)ti->offset;
+        *out_size = ti->size;
+    } else {
+        size_t esz = active_expert_size();
+        *out_offset = (off_t)expert * esz;
+        *out_size = esz;
+    }
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
@@ -2003,31 +2127,17 @@ static void gpu_encode_experts_batched(
     id<MTLCommandBuffer> cmdbuf,
     int K,                       // number of experts to encode
     const int *valid,            // which experts are valid [MAX_K]
-    id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
+    id<MTLBuffer> __strong *expert_bufs,   // per-expert weight data buffers [MAX_K]
+    int layer_idx,               // layer index (for tiered manifest lookup)
+    const int *expert_indices    // expert indices (for tiered per-expert quant)
 ) {
-    // Select offsets and pipeline based on quantization mode
-    NSUInteger gate_w_off, gate_s_off, gate_b_off;
-    NSUInteger up_w_off, up_s_off, up_b_off;
-    NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = cfg.gate_w_off_2; gate_s_off = cfg.gate_s_off_2; gate_b_off = cfg.gate_b_off_2;
-        up_w_off   = cfg.up_w_off_2;   up_s_off   = cfg.up_s_off_2;   up_b_off   = cfg.up_b_off_2;
-        down_w_off = cfg.down_w_off_2; down_s_off = cfg.down_s_off_2; down_b_off = cfg.down_b_off_2;
-    } else {
-        gate_w_off = cfg.gate_w_off_4; gate_s_off = cfg.gate_s_off_4; gate_b_off = cfg.gate_b_off_4;
-        up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
-        down_w_off = cfg.down_w_off_4;  down_s_off = cfg.down_s_off_4;  down_b_off = cfg.down_b_off_4;
-    }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
-
     uint32_t gate_up_out = cfg.moe_intermediate;
     uint32_t gate_up_in  = cfg.hidden_dim;
     uint32_t down_out    = cfg.hidden_dim;
     uint32_t down_in     = cfg.moe_intermediate;
     uint32_t gs          = cfg.group_size;
-    // 2-bit: packed_cols = in_dim/16, threadgroups = out_dim/8
-    // 4-bit: packed_cols = in_dim/8,  threadgroups = out_dim/8
-    // Threadgroup count is the same (based on out_dim), kernel handles packed_cols internally.
+    // Threadgroup count is the same for 2-bit and 4-bit (based on out_dim).
+    // The kernel handles packed_cols internally.
     uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
     uint32_t down_tgs    = (down_out + 7) / 8;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
@@ -2037,6 +2147,31 @@ static void gpu_encode_experts_batched(
     // Within each encoder, operations serialize (gate then up, SwiGLU then down).
     for (int k = 0; k < K; k++) {
         if (!valid[k]) continue;
+
+        // Per-expert quantization selection (tiered: each expert may differ)
+        int use_2bit_k;
+        if (g_use_tiered && g_tiered_manifest) {
+            use_2bit_k = (TIERED(layer_idx, expert_indices[k]).bits == 2);
+        } else {
+            use_2bit_k = g_use_2bit;
+        }
+
+        NSUInteger gate_w_off, gate_s_off, gate_b_off;
+        NSUInteger up_w_off, up_s_off, up_b_off;
+        NSUInteger down_w_off, down_s_off, down_b_off;
+        id<MTLComputePipelineState> expert_pipe;
+
+        if (use_2bit_k) {
+            gate_w_off = cfg.gate_w_off_2; gate_s_off = cfg.gate_s_off_2; gate_b_off = cfg.gate_b_off_2;
+            up_w_off   = cfg.up_w_off_2;   up_s_off   = cfg.up_s_off_2;   up_b_off   = cfg.up_b_off_2;
+            down_w_off = cfg.down_w_off_2; down_s_off = cfg.down_s_off_2; down_b_off = cfg.down_b_off_2;
+            expert_pipe = ctx->matvec_2bit;
+        } else {
+            gate_w_off = cfg.gate_w_off_4; gate_s_off = cfg.gate_s_off_4; gate_b_off = cfg.gate_b_off_4;
+            up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
+            down_w_off = cfg.down_w_off_4; down_s_off = cfg.down_s_off_4; down_b_off = cfg.down_b_off_4;
+            expert_pipe = ctx->matvec_v3;
+        }
 
         // Encoder A: gate_proj + up_proj (both read same input, write different outputs)
         {
@@ -3034,10 +3169,10 @@ static void moe_forward(
     if (packed_fd >= 0) {
         float *expert_out = malloc(cfg.hidden_dim * sizeof(float));
 
-        size_t esz = active_expert_size();
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            off_t expert_offset; size_t esz;
+            expert_offset_size(layer_idx, eidx, &expert_offset, &esz);
 
             if (g_metal && g_metal->buf_expert_data) {
                 // GPU path: pread directly into Metal buffer, run gate+up+swiglu+down on GPU
@@ -3377,17 +3512,28 @@ typedef struct {
 static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
-                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
+                               int layer_idx) {
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
     g_async_pread.active = 1;
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
+        size_t this_esz;
+        off_t this_offset;
+        if (g_use_tiered && g_tiered_manifest) {
+            TieredExpertInfo *ti = &TIERED(layer_idx, expert_indices[k]);
+            this_esz = ti->size;
+            this_offset = (off_t)ti->offset;
+        } else {
+            this_esz = esz;
+            this_offset = (off_t)expert_indices[k] * esz;
+        }
         g_async_pread.tasks[k].fd = packed_fd;
         g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
-        g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
-        g_async_pread.tasks[k].size = esz;
+        g_async_pread.tasks[k].offset = this_offset;
+        g_async_pread.tasks[k].size = this_esz;
         g_async_pread.tasks[k].result = 0;
     }
 
@@ -3406,7 +3552,7 @@ static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
     for (int k = 0; k < g_async_pread.num_tasks; k++) {
-        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)g_async_pread.tasks[k].size);
     }
     g_async_pread.active = 0;
 }
@@ -3432,15 +3578,26 @@ static int parallel_pread_experts(
     int *expert_indices,
     int K,
     int *valid,  // [MAX_K] output: 1 if expert loaded successfully
-    const void *mmap_base  // mmap'd layer file (NULL to use pread)
+    const void *mmap_base,  // mmap'd layer file (NULL to use pread)
+    int layer_idx  // needed for tiered manifest lookup
 ) {
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
+        size_t this_esz;
+        off_t this_offset;
+        if (g_use_tiered && g_tiered_manifest) {
+            TieredExpertInfo *ti = &TIERED(layer_idx, expert_indices[k]);
+            this_esz = ti->size;
+            this_offset = (off_t)ti->offset;
+        } else {
+            this_esz = esz;
+            this_offset = (off_t)expert_indices[k] * esz;
+        }
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
-        tasks[k].size = esz;
+        tasks[k].offset = this_offset;
+        tasks[k].size = this_esz;
         tasks[k].result = 0;
         tasks[k].mmap_base = mmap_base;
     }
@@ -3449,11 +3606,11 @@ static int parallel_pread_experts(
 
     int loaded = 0;
     for (int k = 0; k < K; k++) {
-        valid[k] = (tasks[k].result == (ssize_t)esz);
+        valid[k] = (tasks[k].result == (ssize_t)tasks[k].size);
         if (valid[k]) loaded++;
         else {
             fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                    expert_indices[k], tasks[k].result, esz);
+                    expert_indices[k], tasks[k].result, tasks[k].size);
         }
     }
     return loaded;
@@ -3468,15 +3625,26 @@ static int parallel_pread_experts_into(
     int *expert_indices,
     int K,
     id<MTLBuffer> __strong *dst_bufs,  // target Metal buffers (set A or B)
-    int *valid  // [MAX_K] output: 1 if expert loaded successfully
+    int *valid,  // [MAX_K] output: 1 if expert loaded successfully
+    int layer_idx  // needed for tiered manifest lookup
 ) {
     size_t esz = active_expert_size();
     InferPreadTask tasks[MAX_K];
     for (int k = 0; k < K; k++) {
+        size_t this_esz;
+        off_t this_offset;
+        if (g_use_tiered && g_tiered_manifest) {
+            TieredExpertInfo *ti = &TIERED(layer_idx, expert_indices[k]);
+            this_esz = ti->size;
+            this_offset = (off_t)ti->offset;
+        } else {
+            this_esz = esz;
+            this_offset = (off_t)expert_indices[k] * esz;
+        }
         tasks[k].fd = packed_fd;
         tasks[k].dst = [dst_bufs[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
-        tasks[k].size = esz;
+        tasks[k].offset = this_offset;
+        tasks[k].size = this_esz;
         tasks[k].result = 0;
     }
 
@@ -3484,11 +3652,11 @@ static int parallel_pread_experts_into(
 
     int loaded = 0;
     for (int k = 0; k < K; k++) {
-        valid[k] = (tasks[k].result == (ssize_t)esz);
+        valid[k] = (tasks[k].result == (ssize_t)tasks[k].size);
         if (valid[k]) loaded++;
         else {
             fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                    expert_indices[k], tasks[k].result, esz);
+                    expert_indices[k], tasks[k].result, tasks[k].size);
         }
     }
     return loaded;
@@ -3825,6 +3993,7 @@ static void malloc_cache_free(MallocExpertCache *cache) {
 typedef struct {
     void *dst[MAX_K];       // raw pointers from [buf contents] (no ARC)
     off_t offset[MAX_K];    // file offsets per expert
+    size_t size[MAX_K];     // bytes to read per expert (may vary in tiered mode)
     int K;                  // number of experts
     int fd;                 // file descriptor for this layer
     int valid[MAX_K];       // output: 1 if pread succeeded
@@ -3856,14 +4025,13 @@ static void *infer_prefetch_thread_fn(void *arg) {
         pthread_mutex_unlock(&pf->mutex);
 
         // Execute parallel pread (pure C, no ARC objects)
-        size_t esz = active_expert_size();
         InferIOPlan *plan = &pf->plan;
         InferPreadTask tasks[MAX_K];
         for (int k = 0; k < plan->K; k++) {
             tasks[k].fd = plan->fd;
             tasks[k].dst = plan->dst[k];
             tasks[k].offset = plan->offset[k];
-            tasks[k].size = esz;
+            tasks[k].size = plan->size[k];
             tasks[k].result = 0;
         }
 
@@ -3871,7 +4039,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
 
         plan->loaded = 0;
         for (int k = 0; k < plan->K; k++) {
-            plan->valid[k] = (tasks[k].result == (ssize_t)esz);
+            plan->valid[k] = (tasks[k].result == (ssize_t)plan->size[k]);
             if (plan->valid[k]) plan->loaded++;
         }
 
@@ -3889,15 +4057,18 @@ static void *infer_prefetch_thread_fn(void *arg) {
 // then signal background prefetch thread.
 static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
                                   int *expert_indices, int K,
-                                  id<MTLBuffer> __strong *dst_bufs) {
+                                  id<MTLBuffer> __strong *dst_bufs,
+                                  int layer_idx) {
     pthread_mutex_lock(&pf->mutex);
-    size_t esz = active_expert_size();
     InferIOPlan *plan = &pf->plan;
     plan->fd = packed_fd;
     plan->K = K;
     for (int k = 0; k < K; k++) {
+        off_t eoff; size_t esz;
+        expert_offset_size(layer_idx, expert_indices[k], &eoff, &esz);
         plan->dst[k] = [dst_bufs[k] contents];
-        plan->offset[k] = (off_t)expert_indices[k] * esz;
+        plan->offset[k] = eoff;
+        plan->size[k] = esz;
         plan->valid[k] = 0;
     }
     plan->loaded = 0;
@@ -4533,7 +4704,8 @@ static void fused_layer_forward(
             g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0) {
             async_pread_start(packed_fd, &PRED_EXPERT(layer_idx, 0),
                               PRED_COUNT(layer_idx),
-                              g_metal->buf_multi_expert_data_B, mmap_base);
+                              g_metal->buf_multi_expert_data_B, mmap_base,
+                              layer_idx);
             pred_started = 1;
         }
         // Set up residual for CMD2 (residual = hidden before this layer's attention)
@@ -4718,7 +4890,6 @@ static void fused_layer_forward(
             g_io_gcd_queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
 
         // Check cache for each predicted expert, start async I/O for misses
-        size_t spec_esz = active_expert_size();
         if (g_malloc_cache) {
             spec_group = dispatch_group_create();
             for (int k = 0; k < spec_K; k++) {
@@ -4730,8 +4901,10 @@ static void fused_layer_forward(
                     if (buf && cidx >= 0) {
                         int fd_copy = packed_fd;
                         void *dst = g_malloc_cache->data[cidx];
-                        off_t offset = (off_t)eidx * spec_esz;
-                        size_t sz = spec_esz;
+                        off_t eoff; size_t esz;
+                        expert_offset_size(layer_idx, eidx, &eoff, &esz);
+                        off_t offset = eoff;
+                        size_t sz = esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
                         });
@@ -4750,8 +4923,10 @@ static void fused_layer_forward(
                     if (buf) {
                         int fd_copy = packed_fd;
                         void *dst = [buf contents];
-                        off_t offset = (off_t)eidx * spec_esz;
-                        size_t sz = spec_esz;
+                        off_t eoff; size_t esz;
+                        expert_offset_size(layer_idx, eidx, &eoff, &esz);
+                        off_t offset = eoff;
+                        size_t sz = esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
                         });
@@ -5436,14 +5611,15 @@ static void fused_layer_forward(
 
             // Phase 2: parallel pread misses directly into cache buffers (zero-copy)
             if (num_misses > 0) {
-                size_t esz = active_expert_size();
                 InferPreadTask tasks[MAX_K];
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     int cidx = miss_cache_idx[m];
+                    off_t eoff; size_t esz;
+                    expert_offset_size(layer_idx, expert_indices[k], &eoff, &esz);
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = g_malloc_cache->data[cidx];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = eoff;
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = NULL;  // always pread for cache population
@@ -5454,10 +5630,10 @@ static void fused_layer_forward(
                 // Mark valid
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
-                    valid[k] = (tasks[m].result == (ssize_t)esz);
+                    valid[k] = (tasks[m].result == (ssize_t)tasks[m].size);
                     if (!valid[k]) {
                         fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                                expert_indices[k], tasks[m].result, esz);
+                                expert_indices[k], tasks[m].result, tasks[m].size);
                     }
                 }
             }
@@ -5492,13 +5668,14 @@ static void fused_layer_forward(
 
             // Phase 2: parallel pread all cache misses
             if (num_misses > 0) {
-                size_t esz = active_expert_size();
                 InferPreadTask tasks[MAX_K];
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
+                    off_t eoff; size_t esz;
+                    expert_offset_size(layer_idx, expert_indices[k], &eoff, &esz);
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = [miss_bufs[m] contents];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = eoff;
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = mmap_base;
@@ -5509,10 +5686,10 @@ static void fused_layer_forward(
                 // Mark successfully loaded misses as valid
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
-                    valid[k] = (tasks[m].result == (ssize_t)esz);
+                    valid[k] = (tasks[m].result == (ssize_t)tasks[m].size);
                     if (!valid[k]) {
                         fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                                expert_indices[k], tasks[m].result, esz);
+                                expert_indices[k], tasks[m].result, tasks[m].size);
                     }
                 }
             }
@@ -5554,23 +5731,25 @@ static void fused_layer_forward(
             // Parallel sync-pread misses into buf_A
             if (miss_count > 0) {
                 InferPreadTask tasks[MAX_K];
-                size_t esz = active_expert_size();
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
+                    off_t eoff; size_t esz;
+                    expert_offset_size(layer_idx, miss_ei[m], &eoff, &esz);
                     tasks[m].fd = packed_fd;
                     tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
-                    tasks[m].offset = (off_t)miss_ei[m] * esz;
+                    tasks[m].offset = eoff;
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                 }
                 io_pool_dispatch(tasks, miss_count);
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
-                    valid[k] = (tasks[m].result == (ssize_t)active_expert_size());
+                    valid[k] = (tasks[m].result == (ssize_t)tasks[m].size);
                 }
             }
         } else if (g_use_lz4 && g_lz4_index[layer_idx]) {
             // ---- LZ4 compressed path: read compressed + decompress via io_pool ----
+            // Note: LZ4 + tiered is not supported (LZ4 path uses its own offsets)
             size_t esz = active_expert_size();
             InferPreadTask tasks[MAX_K];
             for (int k = 0; k < actual_K; k++) {
@@ -5592,7 +5771,8 @@ static void fused_layer_forward(
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
             async_pread_start(packed_fd, expert_indices, actual_K,
-                              g_metal->buf_multi_expert_data, mmap_base);
+                              g_metal->buf_multi_expert_data, mmap_base,
+                              layer_idx);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
@@ -5634,7 +5814,8 @@ static void fused_layer_forward(
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
+        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs,
+                                   layer_idx, expert_indices);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
         // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
@@ -5786,11 +5967,11 @@ static void fused_layer_forward(
 
     } else if (packed_fd >= 0) {
         // CPU fallback for experts
-        size_t esz = active_expert_size();
         float *expert_out_cpu = malloc(cfg.hidden_dim * sizeof(float));
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            off_t expert_offset; size_t esz;
+            expert_offset_size(layer_idx, eidx, &expert_offset, &esz);
             void *expert_data = malloc(esz);
             ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
             if (nread != (ssize_t)esz) {
@@ -5800,16 +5981,19 @@ static void fused_layer_forward(
                 continue;
             }
 
-            // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
+            // CPU fallback offsets — determine quant per expert
+            int use_2bit_k = g_use_2bit;
+            if (g_use_tiered && g_tiered_manifest)
+                use_2bit_k = (TIERED(layer_idx, eidx).bits == 2);
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? cfg.gate_s_off_2 : cfg.gate_s_off_4));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? cfg.gate_b_off_2 : cfg.gate_b_off_4));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? cfg.up_w_off_2 : cfg.up_w_off_4));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? cfg.up_s_off_2 : cfg.up_s_off_4));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? cfg.up_b_off_2 : cfg.up_b_off_4));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? cfg.down_w_off_2 : cfg.down_w_off_4));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? cfg.down_s_off_2 : cfg.down_s_off_4));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? cfg.down_b_off_2 : cfg.down_b_off_4));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.gate_s_off_2 : cfg.gate_s_off_4));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.gate_b_off_2 : cfg.gate_b_off_4));
+            uint32_t *uw = (uint32_t *)((char *)expert_data + (use_2bit_k ? cfg.up_w_off_2 : cfg.up_w_off_4));
+            uint16_t *us_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.up_s_off_2 : cfg.up_s_off_4));
+            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.up_b_off_2 : cfg.up_b_off_4));
+            uint32_t *dw = (uint32_t *)((char *)expert_data + (use_2bit_k ? cfg.down_w_off_2 : cfg.down_w_off_4));
+            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.down_s_off_2 : cfg.down_s_off_4));
+            uint16_t *db_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.down_b_off_2 : cfg.down_b_off_4));
 
             float *gate_proj_out = malloc(cfg.moe_intermediate * sizeof(float));
             float *up_proj_out = malloc(cfg.moe_intermediate * sizeof(float));
@@ -5950,6 +6134,17 @@ static void freq_print_analysis(int K) {
     fprintf(stderr, "Expert size: %zu bytes (%.3f MB), %d layers x %d experts = %d total\n",
             active_expert_size(), (double)active_expert_size() / (1024.0 * 1024.0),
             cfg.num_layers, cfg.num_experts, cfg.num_layers * cfg.num_experts);
+
+    // Raw frequency dump for profile_experts.py
+    fprintf(stderr, "\n--- Raw Frequency Dump (for profile_experts.py) ---\n");
+    for (int l = 0; l < cfg.num_layers; l++) {
+        fprintf(stderr, "FREQ_DUMP layer=%d:", l);
+        for (int e = 0; e < cfg.num_experts; e++) {
+            int f = FREQ(l, e);
+            if (f > 0) fprintf(stderr, " %d:%d", e, f);
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 #ifndef CHAT_MODE
@@ -6836,6 +7031,7 @@ static void print_usage(const char *prog) {
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
+    printf("  --tiered             Use tiered quantization: hot=4-bit, cold=2-bit (packed_experts_tiered/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -6875,6 +7071,7 @@ int main(int argc, char **argv) {
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
+            {"tiered",        no_argument,       0, 'Q'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -6903,6 +7100,7 @@ int main(int argc, char **argv) {
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
+                case 'Q': g_use_tiered = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -6983,7 +7181,10 @@ int main(int argc, char **argv) {
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
-        printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
+        printf("Quant:    %s\n",
+               g_use_tiered ? "tiered (hot=4-bit, cold=2-bit)" :
+               g_use_2bit ? "2-bit experts" :
+               "4-bit experts");
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
@@ -7045,8 +7246,33 @@ int main(int argc, char **argv) {
             printf("\n");
         }
 
+        // ---- Mutual exclusion: --tiered and --2bit cannot coexist ----
+        if (g_use_tiered && g_use_2bit) {
+            fprintf(stderr, "ERROR: --tiered and --2bit are mutually exclusive\n");
+            exit(1);
+        }
+
+        // ---- Auto-detect tiered experts (takes priority over 2-bit auto-detect) ----
+        if (!g_use_2bit && !g_use_tiered) {
+            char probe[1024];
+            snprintf(probe, sizeof(probe), "%s/packed_experts_tiered/tiered_manifest.json", model_path);
+            if (access(probe, F_OK) == 0) {
+                if (load_tiered_manifest(model_path)) {
+                    g_use_tiered = 1;
+                }
+            }
+        }
+
+        // ---- Load tiered manifest if --tiered was explicitly set ----
+        if (g_use_tiered && !g_tiered_manifest) {
+            if (!load_tiered_manifest(model_path)) {
+                fprintf(stderr, "ERROR: --tiered specified but no tiered_manifest.json found in %s/packed_experts_tiered/\n", model_path);
+                exit(1);
+            }
+        }
+
         // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit) {
+        if (!g_use_2bit && !g_use_tiered) {
             char probe[1024];
             snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
@@ -7082,6 +7308,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < cfg.num_layers; i++) {
             char path[1024];
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
+                     g_use_tiered ? "packed_experts_tiered" :
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
