@@ -1,8 +1,6 @@
-# Xcode project (regenerated from project.yml)
-FlashMoE.xcodeproj/
-
 # Build artifacts
 build/
 DerivedData/
 *.xcworkspace
 *.xcuserdata/
+xcuserdata/
