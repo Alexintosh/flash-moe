@@ -457,6 +457,7 @@ kernel void dequant_matvec_2bit(
     float acc = 0.0f;
 
     // Each lane processes strided columns (16 values per uint32)
+    // FMA optimization: (nibble * scale + bias) * x = fma(nibble, scale*x, bias*x)
     for (uint col = simd_lane; col < packed_cols; col += 32) {
         // group_size/16 packed words per group
         uint g = col / (group_size / 16);
@@ -466,23 +467,40 @@ kernel void dequant_matvec_2bit(
         uint32_t packed = w_row[col];
         uint x_base = col * 16;
 
-        // Unroll 16 x 2-bit extractions
-        acc += (float((packed >>  0) & 0x3) * scale + bias) * x_shared[x_base +  0];
-        acc += (float((packed >>  2) & 0x3) * scale + bias) * x_shared[x_base +  1];
-        acc += (float((packed >>  4) & 0x3) * scale + bias) * x_shared[x_base +  2];
-        acc += (float((packed >>  6) & 0x3) * scale + bias) * x_shared[x_base +  3];
-        acc += (float((packed >>  8) & 0x3) * scale + bias) * x_shared[x_base +  4];
-        acc += (float((packed >> 10) & 0x3) * scale + bias) * x_shared[x_base +  5];
-        acc += (float((packed >> 12) & 0x3) * scale + bias) * x_shared[x_base +  6];
-        acc += (float((packed >> 14) & 0x3) * scale + bias) * x_shared[x_base +  7];
-        acc += (float((packed >> 16) & 0x3) * scale + bias) * x_shared[x_base +  8];
-        acc += (float((packed >> 18) & 0x3) * scale + bias) * x_shared[x_base +  9];
-        acc += (float((packed >> 20) & 0x3) * scale + bias) * x_shared[x_base + 10];
-        acc += (float((packed >> 22) & 0x3) * scale + bias) * x_shared[x_base + 11];
-        acc += (float((packed >> 24) & 0x3) * scale + bias) * x_shared[x_base + 12];
-        acc += (float((packed >> 26) & 0x3) * scale + bias) * x_shared[x_base + 13];
-        acc += (float((packed >> 28) & 0x3) * scale + bias) * x_shared[x_base + 14];
-        acc += (float((packed >> 30) & 0x3) * scale + bias) * x_shared[x_base + 15];
+        // Pre-compute scale*x and bias*x for FMA
+        float sx0  = scale * x_shared[x_base +  0];  float bx0  = bias * x_shared[x_base +  0];
+        float sx1  = scale * x_shared[x_base +  1];  float bx1  = bias * x_shared[x_base +  1];
+        float sx2  = scale * x_shared[x_base +  2];  float bx2  = bias * x_shared[x_base +  2];
+        float sx3  = scale * x_shared[x_base +  3];  float bx3  = bias * x_shared[x_base +  3];
+        float sx4  = scale * x_shared[x_base +  4];  float bx4  = bias * x_shared[x_base +  4];
+        float sx5  = scale * x_shared[x_base +  5];  float bx5  = bias * x_shared[x_base +  5];
+        float sx6  = scale * x_shared[x_base +  6];  float bx6  = bias * x_shared[x_base +  6];
+        float sx7  = scale * x_shared[x_base +  7];  float bx7  = bias * x_shared[x_base +  7];
+        float sx8  = scale * x_shared[x_base +  8];  float bx8  = bias * x_shared[x_base +  8];
+        float sx9  = scale * x_shared[x_base +  9];  float bx9  = bias * x_shared[x_base +  9];
+        float sx10 = scale * x_shared[x_base + 10];  float bx10 = bias * x_shared[x_base + 10];
+        float sx11 = scale * x_shared[x_base + 11];  float bx11 = bias * x_shared[x_base + 11];
+        float sx12 = scale * x_shared[x_base + 12];  float bx12 = bias * x_shared[x_base + 12];
+        float sx13 = scale * x_shared[x_base + 13];  float bx13 = bias * x_shared[x_base + 13];
+        float sx14 = scale * x_shared[x_base + 14];  float bx14 = bias * x_shared[x_base + 14];
+        float sx15 = scale * x_shared[x_base + 15];  float bx15 = bias * x_shared[x_base + 15];
+
+        acc += fma(float((packed >>  0) & 0x3), sx0,  bx0);
+        acc += fma(float((packed >>  2) & 0x3), sx1,  bx1);
+        acc += fma(float((packed >>  4) & 0x3), sx2,  bx2);
+        acc += fma(float((packed >>  6) & 0x3), sx3,  bx3);
+        acc += fma(float((packed >>  8) & 0x3), sx4,  bx4);
+        acc += fma(float((packed >> 10) & 0x3), sx5,  bx5);
+        acc += fma(float((packed >> 12) & 0x3), sx6,  bx6);
+        acc += fma(float((packed >> 14) & 0x3), sx7,  bx7);
+        acc += fma(float((packed >> 16) & 0x3), sx8,  bx8);
+        acc += fma(float((packed >> 18) & 0x3), sx9,  bx9);
+        acc += fma(float((packed >> 20) & 0x3), sx10, bx10);
+        acc += fma(float((packed >> 22) & 0x3), sx11, bx11);
+        acc += fma(float((packed >> 24) & 0x3), sx12, bx12);
+        acc += fma(float((packed >> 26) & 0x3), sx13, bx13);
+        acc += fma(float((packed >> 28) & 0x3), sx14, bx14);
+        acc += fma(float((packed >> 30) & 0x3), sx15, bx15);
     }
 
     float sum = simd_sum(acc);
