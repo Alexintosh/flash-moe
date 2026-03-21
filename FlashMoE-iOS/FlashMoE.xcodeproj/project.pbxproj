@@ -14,6 +14,10 @@
 		5F7FD44C4FF2E97505EDAB58 /* FlashMoEBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 749C35B05B7C71B73796EEE6 /* FlashMoEBridge.swift */; };
 		86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */; };
 		A40E8D436A3EEDB8B04CDC44 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DEE08D3053B24D1E206627F9 /* Assets.xcassets */; };
+		AA1111111111111111111111 /* ModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA2222222222222222222222 /* ModelCatalog.swift */; };
+		BB1111111111111111111111 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB2222222222222222222222 /* DownloadManager.swift */; };
+		CC1111111111111111111111 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC2222222222222222222222 /* AppDelegate.swift */; };
+		DD1111111111111111111111 /* ModelDownloadRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2222222222222222222222 /* ModelDownloadRow.swift */; };
 		D2F140EBFBCC62B37BDBCB7F /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3321AD5929C6B6D4FAD446C8 /* Foundation.framework */; };
 		D8242F5999552BC228A650CE /* shaders.metal in Resources */ = {isa = PBXBuildFile; fileRef = EEC822B6F9CE0BABA49E989B /* shaders.metal */; };
 		E73BB005AD9F878023B7F75E /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51FB34EBC20226BA8269877A /* Accelerate.framework */; };
@@ -28,7 +32,7 @@
 		50DF36AC37579556033D375F /* FlashMoEEngine.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = FlashMoEEngine.m; sourceTree = "<group>"; };
 		51FB34EBC20226BA8269877A /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		575B85659731B0C7F170E59E /* tokenizer.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = tokenizer.h; sourceTree = "<group>"; };
-		64E904A15D9438F2D9B365F5 /* FlashMoE.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = FlashMoE.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		64E904A15D9438F2D9B365F5 /* FlashMoE.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FlashMoE.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		749C35B05B7C71B73796EEE6 /* FlashMoEBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlashMoEBridge.swift; sourceTree = "<group>"; };
 		82BDA279F2267A8FD313D3C3 /* FlashMoE.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FlashMoE.entitlements; sourceTree = "<group>"; };
 		8A8F6936F5C735B8856277A2 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
@@ -37,6 +41,10 @@
 		DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelListView.swift; sourceTree = "<group>"; };
 		DEE08D3053B24D1E206627F9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EEC822B6F9CE0BABA49E989B /* shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = shaders.metal; sourceTree = "<group>"; };
+		AA2222222222222222222222 /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
+		BB2222222222222222222222 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
+		CC2222222222222222222222 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		DD2222222222222222222222 /* ModelDownloadRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloadRow.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -109,9 +117,26 @@
 		7DC3D96AAD773F68496A645B /* App */ = {
 			isa = PBXGroup;
 			children = (
+				CC2222222222222222222222 /* AppDelegate.swift */,
 				8EAF41B16BD4314D3642DC53 /* FlashMoEApp.swift */,
 			);
 			path = App;
+			sourceTree = "<group>";
+		};
+		AA3333333333333333333333 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				AA2222222222222222222222 /* ModelCatalog.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		BB3333333333333333333333 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				BB2222222222222222222222 /* DownloadManager.swift */,
+			);
+			path = Services;
 			sourceTree = "<group>";
 		};
 		9072059C570A7ED56A540CBE = {
@@ -121,7 +146,9 @@
 				18638B2F96B8C1EB7D55C874 /* Bridge */,
 				EDA325EB4F586262787DC634 /* FlashMoEEngine */,
 				436D67F159A3C0FA4F05317F /* metal_infer */,
+				AA3333333333333333333333 /* Models */,
 				5A512650C4615EA193374D2F /* Resources */,
+				BB3333333333333333333333 /* Services */,
 				42B268D8ECA1DA8E59B4F599 /* ViewModels */,
 				993DF219F89AA4229E9A43D2 /* Views */,
 				7066FB671F127A31C9768B99 /* Frameworks */,
@@ -134,6 +161,7 @@
 			children = (
 				BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */,
 				2AEBDCE15020A40A8451CB5A /* ContentView.swift */,
+				DD2222222222222222222222 /* ModelDownloadRow.swift */,
 				DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */,
 			);
 			path = Views;
@@ -178,8 +206,6 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1600;
-				TargetAttributes = {
-				};
 			};
 			buildConfigurationList = 716F6ADA7E507FC5C74161A0 /* Build configuration list for PBXProject "FlashMoE" */;
 			developmentRegion = en;
@@ -217,11 +243,15 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CC1111111111111111111111 /* AppDelegate.swift in Sources */,
 				86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */,
 				15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */,
+				BB1111111111111111111111 /* DownloadManager.swift in Sources */,
 				0BA5B28A95E8C0616CCA6A3D /* FlashMoEApp.swift in Sources */,
 				5F7FD44C4FF2E97505EDAB58 /* FlashMoEBridge.swift in Sources */,
 				F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */,
+				AA1111111111111111111111 /* ModelCatalog.swift in Sources */,
+				DD1111111111111111111111 /* ModelDownloadRow.swift in Sources */,
 				23E305445AFD3D5FB1A5E5FC /* ModelListView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -276,14 +306,14 @@
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
-				SWIFT_VERSION = 5.9;
+				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
@@ -341,7 +371,7 @@
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -349,7 +379,7 @@
 				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
-				SWIFT_VERSION = 5.9;
+				SWIFT_VERSION = 6.0;
 				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
@@ -363,6 +393,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
+				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/FlashMoEEngine",
 					"$(SRCROOT)/../metal_infer",
@@ -375,11 +406,18 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_CFLAGS = "-DCHAT_MODE=1 -DACCELERATE_NEW_LAPACK";
+				OTHER_CFLAGS = (
+					"-DCHAT_MODE=1",
+					"-DACCELERATE_NEW_LAPACK",
+				);
 				OTHER_LDFLAGS = "-lcompression";
 				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
 				PRODUCT_NAME = FlashMoE;
 				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Bridge/FlashMoE-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -394,6 +432,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
+				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/FlashMoEEngine",
 					"$(SRCROOT)/../metal_infer",
@@ -406,11 +445,18 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_CFLAGS = "-DCHAT_MODE=1 -DACCELERATE_NEW_LAPACK";
+				OTHER_CFLAGS = (
+					"-DCHAT_MODE=1",
+					"-DACCELERATE_NEW_LAPACK",
+				);
 				OTHER_LDFLAGS = "-lcompression";
 				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
 				PRODUCT_NAME = FlashMoE;
 				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Bridge/FlashMoE-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

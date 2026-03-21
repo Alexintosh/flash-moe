@@ -2,14 +2,14 @@ name: FlashMoE
 options:
   bundleIdPrefix: com.flashmoe
   deploymentTarget:
-    iOS: "17.0"
-  xcodeVersion: "16.0"
+    iOS: "18.0"
+  xcodeVersion: "26.0"
   generateEmptyDirectories: true
 
 settings:
   base:
-    SWIFT_VERSION: "5.9"
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
     TARGETED_DEVICE_FAMILY: "1"  # iPhone only
     INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
     INFOPLIST_KEY_UIFileSharingEnabled: YES

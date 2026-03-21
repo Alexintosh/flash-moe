@@ -172,8 +172,9 @@ final class FlashMoEEngine: @unchecked Sendable {
             }
 
             // Set up cancellation
+            nonisolated(unsafe) let ctxForCancel = ctx
             continuation.onTermination = { @Sendable _ in
-                flashmoe_cancel(ctx)
+                flashmoe_cancel(ctxForCancel)
             }
 
             engineQueue.async { [weak self] in

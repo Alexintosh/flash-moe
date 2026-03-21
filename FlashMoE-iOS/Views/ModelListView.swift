@@ -30,6 +30,7 @@ struct ModelListView: View {
     @State private var isScanning = true
     @State private var loadError: String?
     @State private var selectedModel: LocalModel?
+    private let downloadManager = DownloadManager.shared
 
     var body: some View {
         List {
@@ -51,18 +52,38 @@ struct ModelListView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No models found")
                             .font(.headline)
-                        Text("Transfer a Flash-MoE model to the app's Documents directory using Files.app or iTunes File Sharing.")
+                        Text("Download a model below, or transfer one via Files.app.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 4)
                 }
             } else {
-                Section("Available Models") {
+                Section("On Device") {
                     ForEach(localModels) { model in
                         ModelRow(model: model, isLoading: engine.state == .loading && selectedModel?.id == model.id)
                             .onTapGesture { loadModel(model) }
                     }
+                }
+            }
+
+            // Download section
+            Section("Download from HuggingFace") {
+                ForEach(availableCatalogEntries) { entry in
+                    ModelDownloadRow(
+                        entry: entry,
+                        downloadManager: downloadManager,
+                        isDownloaded: downloadManager.isModelDownloaded(entry.id)
+                    )
+                }
+            }
+
+            if let error = downloadManager.error,
+               downloadManager.activeDownload == nil {
+                Section {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                        .font(.caption)
                 }
             }
 
@@ -77,6 +98,18 @@ struct ModelListView: View {
         .navigationTitle("Flash-MoE")
         .onAppear { scanForModels() }
         .refreshable { scanForModels() }
+        .onChange(of: downloadManager.activeDownload?.status) { _, newStatus in
+            if newStatus == .complete {
+                scanForModels()
+            }
+        }
+    }
+
+    private var availableCatalogEntries: [CatalogEntry] {
+        let localNames = Set(localModels.map { $0.name })
+        return ModelCatalog.models.filter { entry in
+            !localNames.contains(entry.id)
+        }
     }
 
     private var headerView: some View {
