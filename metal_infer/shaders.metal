@@ -271,14 +271,12 @@ kernel void dequant_matvec_4bit_v3(
     // ---- Cache input vector in threadgroup shared memory ----
     // Max in_dim = 4096, so we need 4096 floats = 16KB shared memory
     // This is well within the 32KB threadgroup memory limit on M3
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[4096];
 
-    // Cooperative load: 256 threads load 4096 floats (16 per thread)
-    // ALL threads must participate in this load + barrier, even if their
-    // row is out of bounds. Early return before the barrier causes only
-    // partial loading of x_shared, corrupting results for valid rows.
+    // Cooperative load: 256 threads load 4096 values (16 per thread)
+    // Store as half to halve shared memory (8KB vs 16KB) for better occupancy
     for (uint i = lid; i < in_dim; i += 256) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -311,14 +309,18 @@ kernel void dequant_matvec_4bit_v3(
         // Rearranged: (nibble * scale + bias) * x = nibble * (scale*x) + bias*x
         // Pre-compute scale*x and bias*x, then use FMA for dequant+multiply in one op.
         // This reduces per-nibble from (convert + mul + add + mul + add) to (convert + FMA + add).
-        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
-        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
-        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
-        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
-        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+        float x0 = float(x_shared[x_base + 0]), x1 = float(x_shared[x_base + 1]);
+        float x2 = float(x_shared[x_base + 2]), x3 = float(x_shared[x_base + 3]);
+        float x4 = float(x_shared[x_base + 4]), x5 = float(x_shared[x_base + 5]);
+        float x6 = float(x_shared[x_base + 6]), x7 = float(x_shared[x_base + 7]);
+        float sx0 = scale * x0;  float bx0 = bias * x0;
+        float sx1 = scale * x1;  float bx1 = bias * x1;
+        float sx2 = scale * x2;  float bx2 = bias * x2;
+        float sx3 = scale * x3;  float bx3 = bias * x3;
+        float sx4 = scale * x4;  float bx4 = bias * x4;
+        float sx5 = scale * x5;  float bx5 = bias * x5;
+        float sx6 = scale * x6;  float bx6 = bias * x6;
+        float sx7 = scale * x7;  float bx7 = bias * x7;
 
         acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
         acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
@@ -443,9 +445,9 @@ kernel void dequant_matvec_2bit(
     uint packed_cols = in_dim / 16;  // 16 values per uint32 for 2-bit
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (row >= out_dim) return;
@@ -457,8 +459,8 @@ kernel void dequant_matvec_2bit(
     float acc = 0.0f;
 
     // Each lane processes strided columns (16 values per uint32)
+    // FMA optimization with half-precision x_shared
     for (uint col = simd_lane; col < packed_cols; col += 32) {
-        // group_size/16 packed words per group
         uint g = col / (group_size / 16);
         float scale = bf16_to_f32(s_row[g]);
         float bias  = bf16_to_f32(b_row[g]);
@@ -466,23 +468,48 @@ kernel void dequant_matvec_2bit(
         uint32_t packed = w_row[col];
         uint x_base = col * 16;
 
-        // Unroll 16 x 2-bit extractions
-        acc += (float((packed >>  0) & 0x3) * scale + bias) * x_shared[x_base +  0];
-        acc += (float((packed >>  2) & 0x3) * scale + bias) * x_shared[x_base +  1];
-        acc += (float((packed >>  4) & 0x3) * scale + bias) * x_shared[x_base +  2];
-        acc += (float((packed >>  6) & 0x3) * scale + bias) * x_shared[x_base +  3];
-        acc += (float((packed >>  8) & 0x3) * scale + bias) * x_shared[x_base +  4];
-        acc += (float((packed >> 10) & 0x3) * scale + bias) * x_shared[x_base +  5];
-        acc += (float((packed >> 12) & 0x3) * scale + bias) * x_shared[x_base +  6];
-        acc += (float((packed >> 14) & 0x3) * scale + bias) * x_shared[x_base +  7];
-        acc += (float((packed >> 16) & 0x3) * scale + bias) * x_shared[x_base +  8];
-        acc += (float((packed >> 18) & 0x3) * scale + bias) * x_shared[x_base +  9];
-        acc += (float((packed >> 20) & 0x3) * scale + bias) * x_shared[x_base + 10];
-        acc += (float((packed >> 22) & 0x3) * scale + bias) * x_shared[x_base + 11];
-        acc += (float((packed >> 24) & 0x3) * scale + bias) * x_shared[x_base + 12];
-        acc += (float((packed >> 26) & 0x3) * scale + bias) * x_shared[x_base + 13];
-        acc += (float((packed >> 28) & 0x3) * scale + bias) * x_shared[x_base + 14];
-        acc += (float((packed >> 30) & 0x3) * scale + bias) * x_shared[x_base + 15];
+        // Load x values from half shared mem and pre-compute scale*x, bias*x for FMA
+        float xv0  = float(x_shared[x_base +  0]), xv1  = float(x_shared[x_base +  1]);
+        float xv2  = float(x_shared[x_base +  2]), xv3  = float(x_shared[x_base +  3]);
+        float xv4  = float(x_shared[x_base +  4]), xv5  = float(x_shared[x_base +  5]);
+        float xv6  = float(x_shared[x_base +  6]), xv7  = float(x_shared[x_base +  7]);
+        float xv8  = float(x_shared[x_base +  8]), xv9  = float(x_shared[x_base +  9]);
+        float xv10 = float(x_shared[x_base + 10]), xv11 = float(x_shared[x_base + 11]);
+        float xv12 = float(x_shared[x_base + 12]), xv13 = float(x_shared[x_base + 13]);
+        float xv14 = float(x_shared[x_base + 14]), xv15 = float(x_shared[x_base + 15]);
+        float sx0  = scale * xv0;   float bx0  = bias * xv0;
+        float sx1  = scale * xv1;   float bx1  = bias * xv1;
+        float sx2  = scale * xv2;   float bx2  = bias * xv2;
+        float sx3  = scale * xv3;   float bx3  = bias * xv3;
+        float sx4  = scale * xv4;   float bx4  = bias * xv4;
+        float sx5  = scale * xv5;   float bx5  = bias * xv5;
+        float sx6  = scale * xv6;   float bx6  = bias * xv6;
+        float sx7  = scale * xv7;   float bx7  = bias * xv7;
+        float sx8  = scale * xv8;   float bx8  = bias * xv8;
+        float sx9  = scale * xv9;   float bx9  = bias * xv9;
+        float sx10 = scale * xv10;  float bx10 = bias * xv10;
+        float sx11 = scale * xv11;  float bx11 = bias * xv11;
+        float sx12 = scale * xv12;  float bx12 = bias * xv12;
+        float sx13 = scale * xv13;  float bx13 = bias * xv13;
+        float sx14 = scale * xv14;  float bx14 = bias * xv14;
+        float sx15 = scale * xv15;  float bx15 = bias * xv15;
+
+        acc += fma(float((packed >>  0) & 0x3), sx0,  bx0);
+        acc += fma(float((packed >>  2) & 0x3), sx1,  bx1);
+        acc += fma(float((packed >>  4) & 0x3), sx2,  bx2);
+        acc += fma(float((packed >>  6) & 0x3), sx3,  bx3);
+        acc += fma(float((packed >>  8) & 0x3), sx4,  bx4);
+        acc += fma(float((packed >> 10) & 0x3), sx5,  bx5);
+        acc += fma(float((packed >> 12) & 0x3), sx6,  bx6);
+        acc += fma(float((packed >> 14) & 0x3), sx7,  bx7);
+        acc += fma(float((packed >> 16) & 0x3), sx8,  bx8);
+        acc += fma(float((packed >> 18) & 0x3), sx9,  bx9);
+        acc += fma(float((packed >> 20) & 0x3), sx10, bx10);
+        acc += fma(float((packed >> 22) & 0x3), sx11, bx11);
+        acc += fma(float((packed >> 24) & 0x3), sx12, bx12);
+        acc += fma(float((packed >> 26) & 0x3), sx13, bx13);
+        acc += fma(float((packed >> 28) & 0x3), sx14, bx14);
+        acc += fma(float((packed >> 30) & 0x3), sx15, bx15);
     }
 
     float sum = simd_sum(acc);
@@ -1136,43 +1163,31 @@ kernel void rms_norm_qk(
     uint tid [[thread_position_in_threadgroup]]
 ) {
     uint base = head * key_dim;
+    uint simd_lane = tid % 32;
+    uint simd_group = tid / 32;
 
-    // RMS norm for q
-    threadgroup float q_sum_sq;
-    if (tid == 0) q_sum_sq = 0;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    // RMS norm for q — SIMD-accelerated reduction
     float qval = (tid < key_dim) ? q[base + tid] : 0;
-    // Use threadgroup atomic add for sum of squares
-    float q_sq_local = qval * qval;
-    // Simple reduction: thread 0 accumulates (key_dim=128, fits in one pass)
-    threadgroup float q_partial[128];
-    q_partial[tid] = q_sq_local;
+    float q_sq = qval * qval;
+    float q_simd = simd_sum(q_sq);
+    threadgroup float q_shared[4];  // 128 threads = 4 SIMD groups
+    if (simd_lane == 0) q_shared[simd_group] = q_simd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < key_dim; i++) s += q_partial[i];
-        q_sum_sq = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float q_inv_rms = rsqrt(q_sum_sq / float(key_dim) + 1e-6f);
+    float q_total = q_shared[0] + q_shared[1] + q_shared[2] + q_shared[3];
+    float q_inv_rms = rsqrt(q_total / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
-        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;  // q gets extra scale
+        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;
     }
 
-    // RMS norm for k
-    threadgroup float k_sum_sq;
+    // RMS norm for k — SIMD-accelerated reduction
     float kval = (tid < key_dim) ? k[base + tid] : 0;
-    threadgroup float k_partial[128];
-    k_partial[tid] = kval * kval;
+    float k_sq = kval * kval;
+    float k_simd = simd_sum(k_sq);
+    threadgroup float k_shared[4];
+    if (simd_lane == 0) k_shared[simd_group] = k_simd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < key_dim; i++) s += k_partial[i];
-        k_sum_sq = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float k_inv_rms = rsqrt(k_sum_sq / float(key_dim) + 1e-6f);
+    float k_total = k_shared[0] + k_shared[1] + k_shared[2] + k_shared[3];
+    float k_inv_rms = rsqrt(k_total / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
         k[base + tid] = kval * k_inv_rms * inv_scale;
     }
@@ -1223,18 +1238,17 @@ kernel void gated_rms_norm(
     uint base = head * value_dim;
 
     float val = (tid < value_dim) ? values[base + tid] : 0;
+    uint simd_lane = tid % 32;
+    uint simd_group = tid / 32;
 
-    // RMS norm reduction
-    threadgroup float partial[128];
-    partial[tid] = val * val;
+    // RMS norm reduction — SIMD-accelerated
+    float sq = val * val;
+    float simd_s = simd_sum(sq);
+    threadgroup float partial[4];  // 128 threads = 4 SIMD groups
+    if (simd_lane == 0) partial[simd_group] = simd_s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < value_dim; i++) s += partial[i];
-        partial[0] = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_rms = rsqrt(partial[0] / float(value_dim) + eps);
+    float total = partial[0] + partial[1] + partial[2] + partial[3];
+    float inv_rms = rsqrt(total / float(value_dim) + eps);
 
     if (tid < value_dim) {
         float normed = val * inv_rms;
