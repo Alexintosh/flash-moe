@@ -61,8 +61,7 @@ struct ChatView: View {
                     tokensPerSecond: engine.tokensPerSecond,
                     tokensGenerated: engine.tokensGenerated,
                     isGenerating: isGenerating,
-                    ttftMs: engine.timeToFirstToken,
-                    thermalState: ProcessInfo.processInfo.thermalState
+                    ttftMs: engine.timeToFirstToken
                 )
             }
 
@@ -104,6 +103,7 @@ struct ChatView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: showProfiler)
         .navigationTitle("Flash-MoE")
+#if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -123,11 +123,48 @@ struct ChatView: View {
                     Button("Show Stats", systemImage: "chart.bar") {
                         showStats.toggle()
                     }
+                    Divider()
+                    Button("Models & Settings", systemImage: "gearshape") {
+                        messages.removeAll()
+                        engine.reset()
+                        engine.unloadModel()
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
             }
         }
+#else
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button(action: { showModelInfo = true }) {
+                    Image(systemName: "cpu")
+                }
+            }
+            ToolbarItem(placement: .automatic) {
+                Menu {
+                    Button("New Chat", systemImage: "plus.message") {
+                        messages.removeAll()
+                        engine.reset()
+                    }
+                    Button(showProfiler ? "Hide Profiler" : "Profiler", systemImage: "gauge.with.dots.needle.50percent") {
+                        showProfiler.toggle()
+                    }
+                    Button("Show Stats", systemImage: "chart.bar") {
+                        showStats.toggle()
+                    }
+                    Divider()
+                    Button("Models & Settings", systemImage: "gearshape") {
+                        messages.removeAll()
+                        engine.reset()
+                        engine.unloadModel()
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+            }
+        }
+#endif
         .sheet(isPresented: $showModelInfo) {
             ModelInfoSheet(info: engine.modelInfo)
         }
@@ -258,7 +295,11 @@ struct MessageBubble: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 6)
+                    #if os(iOS)
                     .background(Color(.systemGray6))
+                    #else
+                    .background(.thinMaterial)
+                    #endif
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                 }
 
@@ -269,7 +310,11 @@ struct MessageBubble: View {
                         .textSelection(.enabled)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
+                        #if os(iOS)
                         .background(message.role == .user ? Color.blue : Color(.systemGray5))
+                        #else
+                        .background(message.role == .user ? Color.blue : Color.secondary)
+                        #endif
                         .foregroundStyle(message.role == .user ? .white : .primary)
                         .clipShape(RoundedRectangle(cornerRadius: 18))
                 }
@@ -278,7 +323,11 @@ struct MessageBubble: View {
                     ThinkingIndicator()
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
+                        #if os(iOS)
                         .background(Color(.systemGray5))
+                        #else
+                        .background(.quaternary)
+                        #endif
                         .clipShape(RoundedRectangle(cornerRadius: 18))
                 }
             }
@@ -317,7 +366,6 @@ struct StatsBar: View {
     let tokensGenerated: Int
     let isGenerating: Bool
     var ttftMs: Double = 0
-    var thermalState: ProcessInfo.ThermalState = .nominal
 
     private var ttftText: String {
         if ttftMs <= 0 { return "" }
@@ -330,23 +378,13 @@ struct StatsBar: View {
         }
     }
 
-    private var thermalIcon: String {
-        switch thermalState {
-        case .nominal: return "thermometer.low"
-        case .fair: return "thermometer.medium"
-        case .serious: return "thermometer.high"
-        case .critical: return "thermometer.sun.fill"
-        @unknown default: return "thermometer.medium"
-        }
-    }
-
-    private var thermalColor: Color {
-        switch thermalState {
-        case .nominal: return .green
-        case .fair: return .yellow
-        case .serious: return .orange
-        case .critical: return .red
-        @unknown default: return .gray
+    private var thermalLabel: String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:  return "\u{1F7E2} Cool"
+        case .fair:     return "\u{1F7E1} Warm"
+        case .serious:  return "\u{1F7E0} Hot"
+        case .critical: return "\u{1F534} Critical"
+        @unknown default: return "\u{2753} Unknown"
         }
     }
 
@@ -366,9 +404,9 @@ struct StatsBar: View {
                     .foregroundStyle(.secondary)
             }
 
-            Image(systemName: thermalIcon)
+            Text(thermalLabel)
                 .font(.caption)
-                .foregroundStyle(thermalColor)
+                .foregroundStyle(.secondary)
 
             Spacer()
 
@@ -410,7 +448,9 @@ struct ModelInfoSheet: View {
                 Text("No model loaded")
             }
         }
+#if os(iOS)
         .presentationDetents([.medium])
+#endif
     }
 }
 
@@ -428,3 +468,4 @@ struct InfoRow: View {
         }
     }
 }
+

@@ -569,6 +569,7 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
+static int g_cache_io_split = 1;  // >1: split each routed expert pread into N page-aligned chunks (fanout)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
@@ -899,9 +900,6 @@ static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
 typedef struct {
     void *data;
     size_t size;
-    void *data2;       // second chunk for split weight files (NULL if single file)
-    size_t size2;
-    size_t split_offset; // byte offset where chunk 2 starts in the logical layout
     TensorManifest *manifest;
 } WeightFile;
 
@@ -948,37 +946,7 @@ static void *get_tensor_ptr(WeightFile *wf, const char *name) {
         fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
         return NULL;
     }
-    // Split weight files: tensors above split_offset are in chunk 2
-    if (wf->data2 && t->offset >= wf->split_offset) {
-        return (char *)wf->data2 + (t->offset - wf->split_offset);
-    }
     return (char *)wf->data + t->offset;
-}
-
-// Attach a second weight chunk to an existing WeightFile (for >4GB split models)
-static int open_weights2(WeightFile *wf, const char *bin2_path, size_t split_offset) {
-    int fd = open(bin2_path, O_RDONLY);
-    if (fd < 0) return 0;  // no chunk 2, that's OK
-
-    struct stat st;
-    fstat(fd, &st);
-    size_t size2 = st.st_size;
-
-    void *data2 = mmap(NULL, size2, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (data2 == MAP_FAILED) {
-        fprintf(stderr, "WARNING: mmap chunk 2 failed: %s\n", strerror(errno));
-        return 0;
-    }
-
-    madvise(data2, size2, MADV_SEQUENTIAL);
-    wf->data2 = data2;
-    wf->size2 = size2;
-    wf->split_offset = split_offset;
-
-    printf("[weights] mmap'd chunk 2: %.2f GB from %s (split at offset %zu)\n",
-           size2 / 1e9, bin2_path, split_offset);
-    return 1;
 }
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
@@ -1398,12 +1366,20 @@ typedef struct {
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
-    id<MTLBuffer> wf_buf;        // the mmap'd weight file as a Metal buffer (chunk 0)
-    id<MTLBuffer> wf_buf2;       // second chunk for split weight files (>4GB models)
-    void *wf_data;               // base pointer of chunk 0 mmap
-    size_t wf_size;              // size of chunk 0
-    void *wf_data2;              // base pointer of chunk 1 mmap (NULL if single file)
-    size_t wf_size2;             // size of chunk 1
+    id<MTLBuffer> wf_buf;        // the mmap'd weight file as a Metal buffer (first chunk or sole)
+    // Split weight file into multiple Metal buffers for files > 4GB (Metal limit on iOS)
+    #define MAX_WF_CHUNKS 4
+    id<MTLBuffer> wf_chunks[MAX_WF_CHUNKS];
+    size_t wf_chunk_offsets[MAX_WF_CHUNKS]; // byte offset of each chunk from mmap base
+    size_t wf_chunk_sizes[MAX_WF_CHUNKS];
+    int wf_num_chunks;
+    void *wf_mmap_base;         // base of mmap'd weight file
+    size_t wf_mmap_size;        // size of mmap'd weight file
+    // iOS staging mode: when wf_num_chunks == 0, GPU dispatches copy tensor data
+    // into this reusable staging buffer instead of using zero-copy Metal buffers.
+    // This avoids Metal tracking the full 5.5GB weight file as GPU memory.
+    id<MTLBuffer> wf_staging;   // reusable staging buffer (~50MB, iOS only)
+    size_t wf_staging_used;     // bytes currently packed into staging buffer
     // Batched matmul output slots (preallocated, reused across dispatches)
     id<MTLBuffer> batch_out[MAX_BATCH_SLOTS];
     // Reusable buffers for expert computation (avoids per-expert alloc)
@@ -1738,80 +1714,47 @@ static void reset_delta_net_state(void) {
     }
 }
 
-// Wrap the mmap'd weight file as a Metal buffer (zero-copy on unified memory)
-// mmap returns page-aligned addresses, Metal requires the same.
-// On Apple Silicon, page size is 16KB.
+// Wrap the mmap'd weight file as Metal buffer(s) (zero-copy on unified memory).
+// Metal enforces a hard 4GB per-buffer limit. Files >4GB get two overlapping buffers.
+#define METAL_MAX_BUF ((size_t)4096 * 1024 * 1024 - 16384)  // 4GB - 1 page
+#define WF_STAGING_SIZE ((size_t)50 * 1024 * 1024)  // legacy, kept for compile compat
 static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
-    // Round size up to page boundary (16KB)
     size_t page_size = 16384;
+    ctx->wf_mmap_base = data;
+    ctx->wf_mmap_size = size;
+    ctx->wf_num_chunks = 0;
+    ctx->wf_staging = nil;
+    ctx->wf_staging_used = 0;
+    ctx->wf_buf = nil;
+
     size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
 
-    ctx->wf_data = data;
-    ctx->wf_size = size;
-    ctx->wf_data2 = NULL;
-    ctx->wf_size2 = 0;
-
-    ctx->wf_buf = [ctx->device newBufferWithBytesNoCopy:data
-                                                 length:aligned_size
-                                                options:MTLResourceStorageModeShared
-                                            deallocator:nil];
-    if (!ctx->wf_buf) {
-        fprintf(stderr, "WARNING: Cannot wrap weight file as Metal buffer (size=%.2f GB)\n",
-                size / 1e9);
-        fprintf(stderr, "  data=%p, aligned_size=%zu -- GPU matmul will fall back to CPU\n",
-                data, aligned_size);
+    if (size <= METAL_MAX_BUF) {
+        // Fits in one buffer — zero-copy wrap
+        ctx->wf_buf = [ctx->device newBufferWithBytesNoCopy:data
+                                                     length:aligned_size
+                                                    options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+        if (ctx->wf_buf) {
+            ctx->wf_chunks[0] = ctx->wf_buf;
+            ctx->wf_chunk_offsets[0] = 0;
+            ctx->wf_chunk_sizes[0] = aligned_size;
+            ctx->wf_num_chunks = 1;
+            printf("[metal] Weight file wrapped as single Metal buffer (%.2f GB)\n", size / 1e9);
+        } else {
+            fprintf(stderr, "WARNING: Cannot wrap weight file (%.2f GB) — CPU fallback\n", size / 1e9);
+        }
     } else {
-        printf("[metal] Weight file wrapped as Metal buffer (%.2f GB)\n",
-               aligned_size / 1e9);
+        // >4GB: too large for Metal buffers on memory-constrained devices.
+        // CPU fallback for non-expert matmuls. The mmap is still used — just no Metal wrapper.
+        // All guards (g_metal->wf_buf, wf_num_chunks > 0) will route to CPU path.
+        printf("[metal] Weight file %.2f GB exceeds 4GB Metal buffer limit.\n", size / 1e9);
+        printf("[metal]   wf_buf=%s wf_num_chunks=%d — CPU fallback for non-expert matmuls.\n",
+               ctx->wf_buf ? "SET" : "nil", ctx->wf_num_chunks);
     }
+    printf("[metal] metal_set_weights done: wf_buf=%s wf_num_chunks=%d\n",
+           ctx->wf_buf ? "SET" : "nil", ctx->wf_num_chunks);
 }
-
-// Set second weight chunk for split weight files (>4GB models like 397B)
-static void metal_set_weights2(MetalCtx *ctx, void *data, size_t size) {
-    size_t page_size = 16384;
-    size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
-
-    ctx->wf_data2 = data;
-    ctx->wf_size2 = size;
-
-    ctx->wf_buf2 = [ctx->device newBufferWithBytesNoCopy:data
-                                                  length:aligned_size
-                                                 options:MTLResourceStorageModeShared
-                                             deallocator:nil];
-    if (!ctx->wf_buf2) {
-        fprintf(stderr, "WARNING: Cannot wrap weight chunk 2 as Metal buffer (size=%.2f GB)\n",
-                size / 1e9);
-    } else {
-        printf("[metal] Weight chunk 2 wrapped as Metal buffer (%.2f GB)\n",
-               aligned_size / 1e9);
-    }
-}
-
-// Resolve a pointer (into mmap'd weight data) to (Metal buffer, byte offset).
-// Handles split weight files: checks chunk 0 first, then chunk 1.
-static inline void wf_resolve(MetalCtx *ctx, const void *ptr,
-                               id<MTLBuffer> *out_buf, NSUInteger *out_off) {
-    const char *p = (const char *)ptr;
-    const char *base = (const char *)ctx->wf_data;
-    if (p >= base && p < base + ctx->wf_size) {
-        *out_buf = ctx->wf_buf;
-        *out_off = (NSUInteger)(p - base);
-    } else if (ctx->wf_data2) {
-        const char *base2 = (const char *)ctx->wf_data2;
-        *out_buf = ctx->wf_buf2;
-        *out_off = (NSUInteger)(p - base2);
-    } else {
-        // Shouldn't happen — pointer not in any weight buffer
-        *out_buf = ctx->wf_buf;
-        *out_off = (NSUInteger)(p - base);
-    }
-}
-
-// Convenience macros for resolving weight pointers in fused_layer_forward.
-// These declare local variables _wf_buf_X and _wf_off_X for a given pointer.
-#define WF_RESOLVE_1(ctx, ptr, suffix) \
-    id<MTLBuffer> _wf_buf_##suffix; NSUInteger _wf_off_##suffix; \
-    wf_resolve(ctx, ptr, &_wf_buf_##suffix, &_wf_off_##suffix)
 
 // GPU dequant matvec: out[out_dim] = W_4bit * x[in_dim]
 // W_packed, scales, biases are pointers into mmap'd weight file
@@ -1820,6 +1763,87 @@ static inline void wf_resolve(MetalCtx *ctx, const void *ptr,
 // We wrap the ENTIRE mmap'd weight file as a single Metal buffer and use
 // byte offsets to point each shader argument at the right tensor.
 // This avoids per-tensor buffer creation and the page-alignment constraint.
+
+// ============================================================================
+// Weight buffer resolution: chunk mode (macOS) vs staging mode (iOS)
+// ============================================================================
+
+// Reset staging buffer offset — call at start of each command buffer encode
+static inline void metal_staging_reset(MetalCtx *ctx) {
+    ctx->wf_staging_used = 0;
+}
+
+// Stage a tensor into the staging buffer. Returns buffer + offset within staging.
+// Tensors are packed sequentially; call metal_staging_reset() between command buffers.
+static inline void metal_stage(MetalCtx *ctx, const void *ptr, size_t size,
+                                id<MTLBuffer> *out_buf, NSUInteger *out_offset) {
+    if (ctx->wf_staging_used + size > WF_STAGING_SIZE) {
+        fprintf(stderr, "ERROR: staging buffer overflow: used=%zu + size=%zu > %zu\n",
+                ctx->wf_staging_used, size, (size_t)WF_STAGING_SIZE);
+        // Reset and overwrite from beginning (data corruption but won't crash)
+        ctx->wf_staging_used = 0;
+    }
+    memcpy((char *)[ctx->wf_staging contents] + ctx->wf_staging_used, ptr, size);
+    *out_buf = ctx->wf_staging;
+    *out_offset = (NSUInteger)ctx->wf_staging_used;
+    ctx->wf_staging_used += size;
+    // Align to 16 bytes for Metal buffer offset requirements
+    ctx->wf_staging_used = (ctx->wf_staging_used + 15) & ~(size_t)15;
+}
+
+// Find which Metal buffer chunk contains a given pointer, return the buffer and offset within it.
+// In staging mode (wf_num_chunks == 0, iOS), copies tensor data into staging buffer.
+// The `size` parameter is only used in staging mode — pass 0 on macOS chunk path.
+static inline void metal_find_chunk_sized(MetalCtx *ctx, const void *ptr, size_t size,
+                                           id<MTLBuffer> *out_buf, NSUInteger *out_offset) {
+    // No Metal weight buffers (>4GB on iOS) — should not be called
+    if (ctx->wf_num_chunks == 0 && !ctx->wf_staging) {
+        fprintf(stderr, "BUG: metal_find_chunk called with no weight buffers! Using buf_input as dummy.\n");
+        *out_buf = ctx->buf_input;
+        *out_offset = 0;
+        return;
+    }
+    // Staging mode (iOS): copy tensor into staging buffer
+    if (ctx->wf_staging && ctx->wf_num_chunks == 0) {
+        metal_stage(ctx, ptr, size, out_buf, out_offset);
+        return;
+    }
+    // Chunk mode: find the zero-copy Metal buffer containing this pointer
+    size_t abs_off = (const char *)ptr - (const char *)ctx->wf_mmap_base;
+    for (int i = ctx->wf_num_chunks - 1; i >= 0; i--) {
+        if (abs_off >= ctx->wf_chunk_offsets[i]) {
+            NSUInteger local_off = (NSUInteger)(abs_off - ctx->wf_chunk_offsets[i]);
+            if (local_off < [ctx->wf_chunks[i] length]) {
+                *out_buf = ctx->wf_chunks[i];
+                *out_offset = local_off;
+                return;
+            }
+        }
+    }
+    fprintf(stderr, "ERROR: metal_find_chunk: ptr offset %zu (%.2f GB) not in any chunk!\n",
+            abs_off, abs_off / 1e9);
+    for (int i = 0; i < ctx->wf_num_chunks; i++) {
+        fprintf(stderr, "  chunk %d: offset=%zu size=%zu\n",
+                i, ctx->wf_chunk_offsets[i], ctx->wf_chunk_sizes[i]);
+    }
+    *out_buf = ctx->wf_chunks[0];
+    *out_offset = (NSUInteger)abs_off;
+}
+
+// Legacy wrapper — used by sites that don't know tensor size (macOS only, chunk mode)
+static inline void metal_find_chunk(MetalCtx *ctx, const void *ptr,
+                                     id<MTLBuffer> *out_buf, NSUInteger *out_offset) {
+    metal_find_chunk_sized(ctx, ptr, 0, out_buf, out_offset);
+}
+
+// Convenience macros for macOS chunk mode (no size needed)
+#define WF_OFF(ctx, ptr) ({ \
+    id<MTLBuffer> _b; NSUInteger _o; \
+    metal_find_chunk((ctx), (ptr), &_b, &_o); _o; })
+#define WF_BUF(ctx, ptr) ({ \
+    id<MTLBuffer> _b; NSUInteger _o; \
+    metal_find_chunk((ctx), (ptr), &_b, &_o); _b; })
+
 static void gpu_dequant_matvec(
     MetalCtx *ctx,
     const void *W_packed, const void *scales, const void *biases,
@@ -1831,12 +1855,16 @@ static void gpu_dequant_matvec(
 
     size_t o_size = (size_t)out_dim * sizeof(float);
 
-    // Resolve weight pointers to (Metal buffer, offset) pairs
+    // Find correct Metal buffer chunk and offset for each tensor
     id<MTLBuffer> w_buf, s_buf, b_buf;
     NSUInteger w_off, s_off, b_off;
-    wf_resolve(ctx, W_packed, &w_buf, &w_off);
-    wf_resolve(ctx, scales,   &s_buf, &s_off);
-    wf_resolve(ctx, biases,   &b_buf, &b_off);
+    size_t w_size = (size_t)out_dim * in_dim / 8;  // 4-bit packed
+    size_t num_groups = (in_dim + group_size - 1) / group_size;
+    size_t sb_size = (size_t)out_dim * num_groups * sizeof(uint16_t);
+    metal_staging_reset(ctx);
+    metal_find_chunk_sized(ctx, W_packed, w_size, &w_buf, &w_off);
+    metal_find_chunk_sized(ctx, scales, sb_size, &s_buf, &s_off);
+    metal_find_chunk_sized(ctx, biases, sb_size, &b_buf, &b_off);
 
     // Ensure output buffer is large enough
     id<MTLBuffer> o_buf = ctx->buf_output;
@@ -1851,9 +1879,9 @@ static void gpu_dequant_matvec(
     // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_v3 = (in_dim <= 4096);
     [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-    [enc setBuffer:w_buf  offset:w_off atIndex:0];
-    [enc setBuffer:s_buf  offset:s_off atIndex:1];
-    [enc setBuffer:b_buf  offset:b_off atIndex:2];
+    [enc setBuffer:w_buf        offset:w_off atIndex:0];
+    [enc setBuffer:s_buf        offset:s_off atIndex:1];
+    [enc setBuffer:b_buf        offset:b_off atIndex:2];
     [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
     [enc setBuffer:o_buf        offset:0     atIndex:4];
     [enc setBytes:&out_dim      length:4     atIndex:5];
@@ -1885,7 +1913,18 @@ static void fast_dequant_matvec(
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
-    if (g_metal && g_metal->wf_buf) {
+    int use_gpu = g_metal && (g_metal->wf_num_chunks > 0 || g_metal->wf_staging);
+    if (use_gpu) {
+        // In staging mode, check if tensors fit in staging buffer.
+        // LM head (~500MB) won't fit — fall back to CPU for that.
+        size_t w_size = (size_t)out_dim * in_dim / 8;
+        size_t num_groups = ((unsigned)in_dim + group_size - 1) / group_size;
+        size_t sb_size = (size_t)out_dim * num_groups * sizeof(uint16_t);
+        size_t total = w_size + sb_size + sb_size;
+        if (g_metal->wf_staging && g_metal->wf_num_chunks == 0 && total > WF_STAGING_SIZE) {
+            cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+            return;
+        }
         gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
@@ -1921,22 +1960,29 @@ static void gpu_batch_matvec(
 
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
+    // Reset staging ONCE before the loop — all specs pack into the same staging buffer.
+    // Each spec's data must remain valid until the command buffer completes.
+    metal_staging_reset(ctx);
+
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
         id<MTLBuffer> w_buf, s_buf, b_buf;
         NSUInteger w_off, s_off, b_off;
-        wf_resolve(ctx, s->W,      &w_buf, &w_off);
-        wf_resolve(ctx, s->scales,  &s_buf, &s_off);
-        wf_resolve(ctx, s->biases,  &b_buf, &b_off);
+        size_t w_size = (size_t)s->out_dim * s->in_dim / 8;
+        size_t num_groups = (s->in_dim + s->group_size - 1) / s->group_size;
+        size_t sb_size = (size_t)s->out_dim * num_groups * sizeof(uint16_t);
+        metal_find_chunk_sized(ctx, s->W, w_size, &w_buf, &w_off);
+        metal_find_chunk_sized(ctx, s->scales, sb_size, &s_buf, &s_off);
+        metal_find_chunk_sized(ctx, s->biases, sb_size, &b_buf, &b_off);
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
         [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:w_buf  offset:w_off atIndex:0];
-        [enc setBuffer:s_buf  offset:s_off atIndex:1];
-        [enc setBuffer:b_buf  offset:b_off atIndex:2];
+        [enc setBuffer:w_buf        offset:w_off atIndex:0];
+        [enc setBuffer:s_buf        offset:s_off atIndex:1];
+        [enc setBuffer:b_buf        offset:b_off atIndex:2];
         [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
         [enc setBuffer:o_buf        offset:0     atIndex:4];
         [enc setBytes:&s->out_dim   length:4     atIndex:5];
@@ -1977,22 +2023,29 @@ static void gpu_encode_batch_matvec(
     id<MTLCommandBuffer> cmdbuf,
     BatchMatvecSpec *specs, int num_specs
 ) {
+    // Reset staging ONCE — all specs accumulate in the same staging buffer.
+    // The caller's command buffer reads all staged data after commit.
+    metal_staging_reset(ctx);
+
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
         id<MTLBuffer> w_buf, s_buf, b_buf;
         NSUInteger w_off, s_off, b_off;
-        wf_resolve(ctx, s->W,      &w_buf, &w_off);
-        wf_resolve(ctx, s->scales,  &s_buf, &s_off);
-        wf_resolve(ctx, s->biases,  &b_buf, &b_off);
+        size_t w_size = (size_t)s->out_dim * s->in_dim / 8;
+        size_t num_groups = (s->in_dim + s->group_size - 1) / s->group_size;
+        size_t sb_size = (size_t)s->out_dim * num_groups * sizeof(uint16_t);
+        metal_find_chunk_sized(ctx, s->W, w_size, &w_buf, &w_off);
+        metal_find_chunk_sized(ctx, s->scales, sb_size, &s_buf, &s_off);
+        metal_find_chunk_sized(ctx, s->biases, sb_size, &b_buf, &b_off);
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
         [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:w_buf  offset:w_off atIndex:0];
-        [enc setBuffer:s_buf  offset:s_off atIndex:1];
-        [enc setBuffer:b_buf  offset:b_off atIndex:2];
+        [enc setBuffer:w_buf        offset:w_off atIndex:0];
+        [enc setBuffer:s_buf        offset:s_off atIndex:1];
+        [enc setBuffer:b_buf        offset:b_off atIndex:2];
         [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
         [enc setBuffer:o_buf        offset:0     atIndex:4];
         [enc setBytes:&s->out_dim   length:4     atIndex:5];
@@ -2033,9 +2086,13 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 ) {
     id<MTLBuffer> w_buf, s_buf, b_buf;
     NSUInteger w_off, s_off, b_off;
-    wf_resolve(ctx, W,      &w_buf, &w_off);
-    wf_resolve(ctx, scales,  &s_buf, &s_off);
-    wf_resolve(ctx, biases,  &b_buf, &b_off);
+    size_t w_size = (size_t)out_dim * in_dim / 8;  // 4-bit packed
+    size_t num_groups = (in_dim + group_size - 1) / group_size;
+    size_t sb_size = (size_t)out_dim * num_groups * sizeof(uint16_t);
+    metal_staging_reset(ctx);
+    metal_find_chunk_sized(ctx, W, w_size, &w_buf, &w_off);
+    metal_find_chunk_sized(ctx, scales, sb_size, &s_buf, &s_off);
+    metal_find_chunk_sized(ctx, biases, sb_size, &b_buf, &b_off);
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     int use_v3 = (in_dim <= 4096);
@@ -2456,7 +2513,7 @@ static void fast_batch_matvec(
     const float *x, uint32_t x_dim,
     BatchMatvecSpec *specs, int num_specs
 ) {
-    if (g_metal && g_metal->wf_buf) {
+    if (g_metal && (g_metal->wf_num_chunks > 0 || g_metal->wf_staging)) {
         gpu_batch_matvec(g_metal, x, x_dim, specs, num_specs);
     } else {
         for (int i = 0; i < num_specs; i++) {
@@ -3554,6 +3611,7 @@ typedef struct {
     int num_tasks;
     int tasks_completed;
     int generation;          // incremented each dispatch — workers wait for new gen
+    int completed_generation;
     volatile int shutdown;
 } IOThreadPool;
 
@@ -3596,8 +3654,10 @@ static void *io_pool_worker(void *arg) {
 
         pthread_mutex_lock(&g_io_pool.mutex);
         g_io_pool.tasks_completed++;
-        if (g_io_pool.tasks_completed == NUM_IO_THREADS)
+        if (g_io_pool.tasks_completed == NUM_IO_THREADS) {
+            g_io_pool.completed_generation = my_gen;
             pthread_cond_signal(&g_io_pool.work_done);
+        }
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
     return NULL;
@@ -3610,6 +3670,7 @@ static void io_pool_init(void) {
     pthread_cond_init(&g_io_pool.work_done, NULL);
     g_io_pool.shutdown = 0;
     g_io_pool.generation = 0;
+    g_io_pool.completed_generation = 0;
     g_io_pool.tasks = NULL;
     for (int i = 0; i < NUM_IO_THREADS; i++)
         pthread_create(&g_io_pool.threads[i], NULL, io_pool_worker, (void*)(intptr_t)i);
@@ -3618,27 +3679,64 @@ static void io_pool_init(void) {
 
 static dispatch_queue_t g_io_gcd_queue = NULL;
 
-static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
-    if (num_tasks == 0) return;
+// Async start — returns generation number for later wait
+static int io_pool_start(InferPreadTask *tasks, int num_tasks) {
+    if (num_tasks == 0) return 0;
     pthread_mutex_lock(&g_io_pool.mutex);
     g_io_pool.tasks = tasks;
     g_io_pool.num_tasks = num_tasks;
     g_io_pool.tasks_completed = 0;
     g_io_pool.generation++;
+    int gen = g_io_pool.generation;
     pthread_cond_broadcast(&g_io_pool.work_ready);
-    while (g_io_pool.tasks_completed < NUM_IO_THREADS) {
+    pthread_mutex_unlock(&g_io_pool.mutex);
+    return gen;
+}
+
+// Wait for a specific generation to complete
+static void io_pool_wait_generation(int target_gen) {
+    if (target_gen <= 0) return;
+    pthread_mutex_lock(&g_io_pool.mutex);
+    while (g_io_pool.completed_generation < target_gen) {
         pthread_cond_wait(&g_io_pool.work_done, &g_io_pool.mutex);
     }
     pthread_mutex_unlock(&g_io_pool.mutex);
 }
 
+// Synchronous dispatch — start + wait
+static void io_pool_dispatch(InferPreadTask *tasks, int num_tasks) {
+    if (num_tasks == 0) return;
+    int my_gen = io_pool_start(tasks, num_tasks);
+    io_pool_wait_generation(my_gen);
+}
+
 // ---- Async expert pread pipeline ----
-// Starts pread on background GCD threads immediately after routing.
-// The pread overlaps with shared expert prep + next layer's CMD1+attn+CMD2.
-// Wait for completion right before CMD3 needs the expert data.
+// Uses GCD dispatch_group for truly async start+wait (no generation conflicts
+// with the persistent io_pool). When cache_io_split > 1, each expert blob is
+// split into N page-aligned chunks for parallel SSD reads.
+#define MAX_CACHE_IO_SPLIT 8
+
+static inline int active_cache_io_split(size_t esz) {
+    int chunks = g_cache_io_split;
+    if (chunks < 1) chunks = 1;
+    if (chunks > MAX_CACHE_IO_SPLIT) chunks = MAX_CACHE_IO_SPLIT;
+
+    // Expert blobs are page-cache-backed. Keep chunk boundaries page aligned
+    // so fanout mode still matches the underlying VM layout.
+    const size_t page_bytes = 16 * 1024;
+    if (esz == 0 || (esz % page_bytes) != 0) return 1;
+
+    size_t pages = esz / page_bytes;
+    if ((size_t)chunks > pages) chunks = (int)pages;
+    if (chunks < 1) chunks = 1;
+    return chunks;
+}
+
 typedef struct {
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K * MAX_CACHE_IO_SPLIT];
     int num_tasks;
+    int num_experts;
+    int chunks_per_expert;
     int valid[MAX_K];
     dispatch_group_t group;
     int active;
@@ -3648,12 +3746,19 @@ static AsyncPreadState g_async_pread = {0};
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
                                int layer_idx) {
+    (void)mmap_base;
     size_t esz = active_expert_size();
-    g_async_pread.num_tasks = K;
+    int chunks = active_cache_io_split(esz);
+    const size_t page_bytes = 16 * 1024;
+
+    g_async_pread.num_experts = K;
+    g_async_pread.chunks_per_expert = chunks;
+    g_async_pread.num_tasks = K * chunks;
     g_async_pread.active = 1;
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
+        // Per-expert offset and size (tiered: variable, uniform: computed from index)
         size_t this_esz;
         off_t this_offset;
         if (g_use_tiered && g_tiered_manifest) {
@@ -3664,18 +3769,40 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
             this_esz = esz;
             this_offset = (off_t)expert_indices[k] * esz;
         }
-        g_async_pread.tasks[k].fd = packed_fd;
-        g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
-        g_async_pread.tasks[k].offset = this_offset;
-        g_async_pread.tasks[k].size = this_esz;
-        g_async_pread.tasks[k].result = 0;
+
+        size_t total_pages = (chunks > 1) ? (this_esz / page_bytes) : 0;
+        char *dst_base = (char *)[dst_bufs[k] contents];
+        size_t page_cursor = 0;
+        for (int c = 0; c < chunks; c++) {
+            size_t chunk_off = 0;
+            size_t chunk_sz = this_esz;
+            if (chunks > 1) {
+                size_t pages_this_chunk = total_pages / (size_t)chunks;
+                if ((size_t)c < (total_pages % (size_t)chunks)) pages_this_chunk++;
+                chunk_off = page_cursor * page_bytes;
+                chunk_sz = pages_this_chunk * page_bytes;
+                page_cursor += pages_this_chunk;
+            }
+
+            int task_idx = k * chunks + c;
+            g_async_pread.tasks[task_idx].fd = packed_fd;
+            g_async_pread.tasks[task_idx].dst = dst_base + chunk_off;
+            g_async_pread.tasks[task_idx].offset = this_offset + (off_t)chunk_off;
+            g_async_pread.tasks[task_idx].size = chunk_sz;
+            g_async_pread.tasks[task_idx].result = 0;
+            g_async_pread.tasks[task_idx].mmap_base = NULL;
+            g_async_pread.tasks[task_idx].lz4_comp_buf = NULL;
+            g_async_pread.tasks[task_idx].lz4_comp_size = 0;
+        }
     }
 
-    // Fire off parallel preads on GCD — returns immediately
+    // Fire off parallel preads on GCD — dispatch_group guarantees all blocks
+    // complete before dispatch_group_wait returns (no generation counter race).
     static dispatch_queue_t io_q = NULL;
     if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
-    for (int k = 0; k < K; k++) {
-        InferPreadTask *t = &g_async_pread.tasks[k];
+    int total_tasks = g_async_pread.num_tasks;
+    for (int i = 0; i < total_tasks; i++) {
+        InferPreadTask *t = &g_async_pread.tasks[i];
         dispatch_group_async(g_async_pread.group, io_q, ^{
             t->result = pread(t->fd, t->dst, t->size, t->offset);
         });
@@ -3685,8 +3812,18 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
-    for (int k = 0; k < g_async_pread.num_tasks; k++) {
-        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)g_async_pread.tasks[k].size);
+    // Validate each chunk against its OWN expected size (not uniform esz).
+    // Critical for tiered mode where cold 2-bit experts are smaller than hot 4-bit.
+    for (int k = 0; k < g_async_pread.num_experts; k++) {
+        int ok = 1;
+        for (int c = 0; c < g_async_pread.chunks_per_expert; c++) {
+            int task_idx = k * g_async_pread.chunks_per_expert + c;
+            if (g_async_pread.tasks[task_idx].result != (ssize_t)g_async_pread.tasks[task_idx].size) {
+                ok = 0;
+                break;
+            }
+        }
+        g_async_pread.valid[k] = ok;
     }
     g_async_pread.active = 0;
 }
@@ -4726,15 +4863,20 @@ static void fused_layer_forward(
         if (can_gpu_linear && num_attn_specs == 4) {
             // batch_out[0]=qkv(12288), [1]=z(8192), [2]=beta(64), [3]=alpha(64)
             uint32_t conv_dim = cfg.linear_conv_dim;
-            id<MTLBuffer> conv_w_buf; NSUInteger conv_w_off; wf_resolve(g_metal, lc->conv1d_w, &conv_w_buf, &conv_w_off);
-
             // Enc L1: conv1d_step — input=batch_out[0], weights=conv1d_w, state=buf_conv_state, output=buf_conv_output
+            // NOTE: staging was already reset by gpu_encode_batch_matvec above.
+            // All tensors below accumulate into the same staging buffer — no resets
+            // until cmd1 is committed, to avoid overwriting data the GPU hasn't read yet.
             {
+                id<MTLBuffer> conv1d_w_buf; NSUInteger conv1d_w_off;
+                metal_find_chunk_sized(g_metal, lc->conv1d_w,
+                    (size_t)cfg.linear_conv_dim * cfg.linear_conv_dim * 2,
+                    &conv1d_w_buf, &conv1d_w_off);
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->conv1d_step];
                 [enc setBuffer:g_metal->buf_conv_state[linear_layer_idx] offset:0 atIndex:0];
                 [enc setBuffer:g_metal->batch_out[0]    offset:0            atIndex:1]; // qkv projection output
-                [enc setBuffer:conv_w_buf  offset:conv_w_off atIndex:2]; // conv weights (bf16)
+                [enc setBuffer:conv1d_w_buf offset:conv1d_w_off atIndex:2]; // conv weights (bf16)
                 [enc setBuffer:g_metal->buf_conv_output offset:0            atIndex:3]; // conv output
                 [enc setBytes:&conv_dim length:4 atIndex:4];
                 uint32_t tgs = (conv_dim + 255) / 256;
@@ -4760,14 +4902,17 @@ static void fused_layer_forward(
 
             // Enc L3: compute_decay_beta — alpha=batch_out[3], beta=batch_out[2], A_log+dt_bias from wf_buf
             {
-                id<MTLBuffer> a_log_buf; NSUInteger a_log_off; wf_resolve(g_metal, lc->A_log, &a_log_buf, &a_log_off);
-                id<MTLBuffer> dt_bias_buf; NSUInteger dt_bias_off; wf_resolve(g_metal, lc->dt_bias, &dt_bias_buf, &dt_bias_off);
+                id<MTLBuffer> alog_buf, dtb_buf; NSUInteger alog_off, dtb_off;
+                metal_find_chunk_sized(g_metal, lc->A_log,
+                    (size_t)cfg.linear_num_v_heads * 4, &alog_buf, &alog_off);  // float
+                metal_find_chunk_sized(g_metal, lc->dt_bias,
+                    (size_t)cfg.linear_num_v_heads * 2, &dtb_buf, &dtb_off);    // bf16
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->compute_decay_beta];
                 [enc setBuffer:g_metal->batch_out[3]       offset:0          atIndex:0]; // alpha
                 [enc setBuffer:g_metal->batch_out[2]       offset:0          atIndex:1]; // beta
-                [enc setBuffer:a_log_buf  offset:a_log_off atIndex:2]; // A_log
-                [enc setBuffer:dt_bias_buf  offset:dt_bias_off atIndex:3]; // dt_bias (bf16)
+                [enc setBuffer:alog_buf  offset:alog_off  atIndex:2]; // A_log
+                [enc setBuffer:dtb_buf   offset:dtb_off   atIndex:3]; // dt_bias (bf16)
                 [enc setBuffer:g_metal->buf_delta_g_decay  offset:0          atIndex:4]; // g_decay output
                 [enc setBuffer:g_metal->buf_delta_beta     offset:0          atIndex:5]; // beta_gate output
                 [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -4795,14 +4940,16 @@ static void fused_layer_forward(
 
             // Enc L5: gated_rms_norm — normalize+gate delta-net output -> batch_out[6] for CMD2 o_proj
             {
-                id<MTLBuffer> gnorm_w_buf; NSUInteger gnorm_w_off; wf_resolve(g_metal, lc->gated_norm_w, &gnorm_w_buf, &gnorm_w_off);
+                id<MTLBuffer> gnw_buf; NSUInteger gnw_off;
+                metal_find_chunk_sized(g_metal, lc->gated_norm_w,
+                    (size_t)cfg.linear_total_value * 2, &gnw_buf, &gnw_off);  // bf16
                 uint32_t value_dim = cfg.linear_value_dim;  // 128
                 float eps = cfg.rms_norm_eps;
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->gated_rms_norm];
                 [enc setBuffer:g_metal->buf_delta_output offset:0          atIndex:0]; // values [8192]
                 [enc setBuffer:g_metal->batch_out[1]     offset:0          atIndex:1]; // z (z projection output) [8192]
-                [enc setBuffer:gnorm_w_buf  offset:gnorm_w_off atIndex:2]; // weight (bf16)
+                [enc setBuffer:gnw_buf offset:gnw_off atIndex:2]; // weight (bf16)
                 [enc setBuffer:g_metal->batch_out[6]     offset:0          atIndex:3]; // output -> batch_out[6] for CMD2
                 [enc setBytes:&value_dim length:4 atIndex:4];
                 [enc setBytes:&eps       length:4 atIndex:5];
@@ -4876,15 +5023,19 @@ static void fused_layer_forward(
             // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
             if (can_gpu_linear && num_attn_specs == 4) {
                 uint32_t conv_dim = cfg.linear_conv_dim;
-                id<MTLBuffer> conv_w_buf; NSUInteger conv_w_off; wf_resolve(g_metal, lc->conv1d_w, &conv_w_buf, &conv_w_off);
 
                 // Enc L1: conv1d_step
+                // NOTE: staging was reset by gpu_encode_batch_matvec — don't reset again
                 {
+                    id<MTLBuffer> conv1d_w_buf; NSUInteger conv1d_w_off;
+                    metal_find_chunk_sized(g_metal, lc->conv1d_w,
+                        (size_t)cfg.linear_conv_dim * cfg.linear_conv_dim * 2,
+                        &conv1d_w_buf, &conv1d_w_off);
                     id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                     [enc setComputePipelineState:g_metal->conv1d_step];
                     [enc setBuffer:g_metal->buf_conv_state[linear_layer_idx] offset:0 atIndex:0];
                     [enc setBuffer:g_metal->batch_out[0]    offset:0            atIndex:1];
-                    [enc setBuffer:conv_w_buf  offset:conv_w_off atIndex:2];
+                    [enc setBuffer:conv1d_w_buf offset:conv1d_w_off atIndex:2];
                     [enc setBuffer:g_metal->buf_conv_output offset:0            atIndex:3];
                     [enc setBytes:&conv_dim length:4 atIndex:4];
                     uint32_t tgs = (conv_dim + 255) / 256;
@@ -4910,14 +5061,17 @@ static void fused_layer_forward(
 
                 // Enc L3: compute_decay_beta
                 {
-                    id<MTLBuffer> a_log_buf; NSUInteger a_log_off; wf_resolve(g_metal, lc->A_log, &a_log_buf, &a_log_off);
-                    id<MTLBuffer> dt_bias_buf; NSUInteger dt_bias_off; wf_resolve(g_metal, lc->dt_bias, &dt_bias_buf, &dt_bias_off);
+                    id<MTLBuffer> alog_buf, dtb_buf; NSUInteger alog_off, dtb_off;
+                    metal_find_chunk_sized(g_metal, lc->A_log,
+                        (size_t)cfg.linear_num_v_heads * 4, &alog_buf, &alog_off);  // float
+                    metal_find_chunk_sized(g_metal, lc->dt_bias,
+                        (size_t)cfg.linear_num_v_heads * 2, &dtb_buf, &dtb_off);    // bf16
                     id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                     [enc setComputePipelineState:g_metal->compute_decay_beta];
                     [enc setBuffer:g_metal->batch_out[3]       offset:0          atIndex:0];
                     [enc setBuffer:g_metal->batch_out[2]       offset:0          atIndex:1];
-                    [enc setBuffer:a_log_buf  offset:a_log_off atIndex:2];
-                    [enc setBuffer:dt_bias_buf  offset:dt_bias_off atIndex:3];
+                    [enc setBuffer:alog_buf  offset:alog_off  atIndex:2];
+                    [enc setBuffer:dtb_buf   offset:dtb_off   atIndex:3];
                     [enc setBuffer:g_metal->buf_delta_g_decay  offset:0          atIndex:4];
                     [enc setBuffer:g_metal->buf_delta_beta     offset:0          atIndex:5];
                     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -4945,14 +5099,16 @@ static void fused_layer_forward(
 
                 // Enc L5: gated_rms_norm -> batch_out[6]
                 {
-                    id<MTLBuffer> gnorm_w_buf; NSUInteger gnorm_w_off; wf_resolve(g_metal, lc->gated_norm_w, &gnorm_w_buf, &gnorm_w_off);
+                    id<MTLBuffer> gnw_buf; NSUInteger gnw_off;
+                    metal_find_chunk_sized(g_metal, lc->gated_norm_w,
+                        (size_t)cfg.linear_total_value * 2, &gnw_buf, &gnw_off);  // bf16
                     uint32_t value_dim = cfg.linear_value_dim;
                     float eps = cfg.rms_norm_eps;
                     id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                     [enc setComputePipelineState:g_metal->gated_rms_norm];
                     [enc setBuffer:g_metal->buf_delta_output offset:0          atIndex:0];
                     [enc setBuffer:g_metal->batch_out[1]     offset:0          atIndex:1];
-                    [enc setBuffer:gnorm_w_buf  offset:gnorm_w_off atIndex:2];
+                    [enc setBuffer:gnw_buf offset:gnw_off atIndex:2];
                     [enc setBuffer:g_metal->batch_out[6]     offset:0          atIndex:3];
                     [enc setBytes:&value_dim length:4 atIndex:4];
                     [enc setBytes:&eps       length:4 atIndex:5];
@@ -5524,22 +5680,27 @@ static void fused_layer_forward(
 
         // ---- o_proj matvec ----
         {
-            id<MTLBuffer> w_buf; NSUInteger w_off; wf_resolve(g_metal, oproj_w, &w_buf, &w_off);
-            id<MTLBuffer> s_buf; NSUInteger s_off; wf_resolve(g_metal, oproj_s, &s_buf, &s_off);
-            id<MTLBuffer> b_buf; NSUInteger b_off; wf_resolve(g_metal, oproj_b, &b_buf, &b_off);
-
             // For GPU attention: o_proj reads from buf_attn_out
             // For CPU attention: o_proj reads from batch_out[6]
             id<MTLBuffer> oproj_input = gpu_attn_fuse ? g_metal->buf_attn_out : g_metal->batch_out[6];
 
-            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t o_out_dim = cfg.hidden_dim;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = cfg.group_size;
+            id<MTLBuffer> ow_buf, os_buf, ob_buf;
+            NSUInteger ow_off, os_off, ob_off;
+            size_t oproj_w_size = (size_t)o_out_dim * o_in_dim / 8;  // 4-bit packed
+            size_t oproj_ng = (o_in_dim + o_gs - 1) / o_gs;
+            size_t oproj_sb_size = (size_t)o_out_dim * oproj_ng * sizeof(uint16_t);
+            metal_staging_reset(g_metal);
+            metal_find_chunk_sized(g_metal, oproj_w, oproj_w_size, &ow_buf, &ow_off);
+            metal_find_chunk_sized(g_metal, oproj_s, oproj_sb_size, &os_buf, &os_off);
+            metal_find_chunk_sized(g_metal, oproj_b, oproj_sb_size, &ob_buf, &ob_off);
+            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             [enc setComputePipelineState:g_metal->matvec_fast];
-            [enc setBuffer:w_buf  offset:w_off atIndex:0];
-            [enc setBuffer:s_buf  offset:s_off atIndex:1];
-            [enc setBuffer:b_buf  offset:b_off atIndex:2];
+            [enc setBuffer:ow_buf offset:ow_off atIndex:0];
+            [enc setBuffer:os_buf offset:os_off atIndex:1];
+            [enc setBuffer:ob_buf offset:ob_off atIndex:2];
             [enc setBuffer:oproj_input      offset:0    atIndex:3];
             [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
             [enc setBytes:&o_out_dim  length:4 atIndex:5];
@@ -5580,13 +5741,16 @@ static void fused_layer_forward(
 
         // ---- Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
         {
-            id<MTLBuffer> norm_buf; NSUInteger norm_off; wf_resolve(g_metal, lc->post_attn_norm_w, &norm_buf, &norm_off);
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+            id<MTLBuffer> panw_buf; NSUInteger panw_off;
+            // Don't reset staging — o_proj data is still being read by earlier encoders in cmd_fused
+            metal_find_chunk_sized(g_metal, lc->post_attn_norm_w,
+                (size_t)cfg.hidden_dim * 2, &panw_buf, &panw_off);  // bf16
             uint32_t dim = cfg.hidden_dim;
             float eps = cfg.rms_norm_eps;
             [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
             [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];  // x
-            [enc setBuffer:norm_buf  offset:norm_off atIndex:1]; // weight (bf16)
+            [enc setBuffer:panw_buf offset:panw_off atIndex:1]; // weight (bf16)
             [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];  // sum_sq
             [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];  // out = h_post
             [enc setBytes:&dim length:4 atIndex:4];
@@ -5970,10 +6134,20 @@ static void fused_layer_forward(
 
         // Shared down_proj dispatch
         if (sdw && sds && sdb) {
-            gpu_encode_dequant_matvec_with_io_bufs(
-                g_metal, cmd_experts, sdw, sds, sdb,
-                g_metal->buf_shared_act, g_metal->buf_shared_out,
-                cfg.hidden_dim, cfg.shared_intermediate, cfg.group_size);
+            if (g_metal->wf_num_chunks > 0) {
+                // GPU path: weight data accessible via Metal buffer
+                gpu_encode_dequant_matvec_with_io_bufs(
+                    g_metal, cmd_experts, sdw, sds, sdb,
+                    g_metal->buf_shared_act, g_metal->buf_shared_out,
+                    cfg.hidden_dim, cfg.shared_intermediate, cfg.group_size);
+            } else {
+                // CPU fallback: weight file too large for Metal buffers
+                float *shared_act_cpu = (float *)[g_metal->buf_shared_act contents];
+                float *shared_out_cpu = (float *)[g_metal->buf_shared_out contents];
+                cpu_dequant_matvec((const uint32_t *)sdw, (const uint16_t *)sds,
+                                   (const uint16_t *)sdb, shared_act_cpu, shared_out_cpu,
+                                   cfg.hidden_dim, cfg.shared_intermediate, cfg.group_size);
+            }
         }
 
         // Step 4: GPU-side combine + residual + norm (if not last layer)
@@ -6048,13 +6222,16 @@ static void fused_layer_forward(
             // Enc C3: rms_norm_apply_bf16 (buf_moe_hidden + next_norm_w -> buf_input)
             {
                 uint16_t *next_norm_w = layer_cache[layer_idx + 1].input_norm_w;
-                id<MTLBuffer> norm_buf; NSUInteger norm_off; wf_resolve(g_metal, next_norm_w, &norm_buf, &norm_off);
+                id<MTLBuffer> nnw_buf; NSUInteger nnw_off;
+                metal_staging_reset(g_metal);
+                metal_find_chunk_sized(g_metal, next_norm_w,
+                    (size_t)cfg.hidden_dim * 2, &nnw_buf, &nnw_off);  // bf16
                 id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
                 uint32_t dim = cfg.hidden_dim;
                 float eps = cfg.rms_norm_eps;
                 [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
                 [enc setBuffer:g_metal->buf_moe_hidden  offset:0       atIndex:0]; // x
-                [enc setBuffer:norm_buf  offset:norm_off atIndex:1]; // weight (bf16)
+                [enc setBuffer:nnw_buf offset:nnw_off atIndex:1]; // weight (bf16)
                 [enc setBuffer:g_metal->buf_cmd3_sum_sq offset:0       atIndex:2]; // sum_sq
                 [enc setBuffer:g_metal->buf_input       offset:0       atIndex:3]; // out = normed
                 [enc setBytes:&dim length:4 atIndex:4];
@@ -7383,39 +7560,9 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        // ---- Auto-detect split weight files ----
-        // If model_weights_1.bin exists alongside model_weights.bin, load it as chunk 2
-        {
-            // Derive chunk 2 path from chunk 0 path
-            char weights2_path[1024];
-            // Replace .bin with _1.bin
-            const char *dot = strrchr(weights_path, '.');
-            if (dot) {
-                size_t prefix_len = dot - weights_path;
-                snprintf(weights2_path, sizeof(weights2_path), "%.*s_1.bin",
-                         (int)prefix_len, weights_path);
-            } else {
-                snprintf(weights2_path, sizeof(weights2_path), "%s_1", weights_path);
-            }
-
-            if (access(weights2_path, R_OK) == 0) {
-                // The split_offset is stored in the manifest as "split_offset"
-                size_t split_off = wf->size;  // default: chunk 1 starts right after chunk 0
-                // Check manifest for explicit split_offset
-                // (extract_weights.py writes this when --split is used)
-                // For now, just use chunk 0 size
-                if (open_weights2(wf, weights2_path, split_off)) {
-                    printf("[weights] Split weight files detected\n");
-                }
-            }
-        }
-
-        // Wrap weight file(s) for Metal GPU access
+        // Wrap weight file for Metal GPU access
         if (g_metal) {
             metal_set_weights(g_metal, wf->data, wf->size);
-            if (wf->data2) {
-                metal_set_weights2(g_metal, wf->data2, wf->size2);
-            }
         }
 
         // ---- Load vocabulary ----
@@ -7530,19 +7677,37 @@ int main(int argc, char **argv) {
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
-                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
+#if TARGET_OS_IPHONE || TARGET_OS_IOS
+                    // iOS: never mmap expert files. The async pread path (GCD dispatch_group)
+                    // doesn't use mmap, and mmap'ing ~18GB+ of expert layer files exhausts
+                    // iOS virtual address space (limited even with extended-virtual-addressing).
+                    (void)st;
+#else
+                    if (g_cache_io_split <= 1) {
+                        // macOS: mmap when fanout is disabled. With cache-io-split the
+                        // pread fanout path is used exclusively and mmap just wastes
+                        // virtual address space and adds VM overhead.
+                        layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
+                    }
+#endif
                     if (layer_mmaps[i] != MAP_FAILED) {
                         layer_mmap_sizes[i] = st.st_size;
-                        // No madvise: kernel default is best.
-                        // MADV_RANDOM disables readahead (tested: hurts).
-                        // MADV_SEQUENTIAL doesn't reduce I/O fragmentation (tested: no effect).
-                        // The kernel fragments 3.9MB preads into ~5.7 disk ops regardless
-                        // of hints — this is inherent to the page cache's physical page layout.
                     }
                 }
             }
         }
-        printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, cfg.num_layers);
+        const char *io_mode;
+#if TARGET_OS_IPHONE || TARGET_OS_IOS
+        io_mode = g_cache_io_split > 1 ? "pread fanout" : "pread (no mmap)";
+#else
+        io_mode = g_cache_io_split > 1 ? "pread fanout" : "mmap'd";
+#endif
+        printf("[experts] %d/%d packed layer files available (%s)\n",
+               expert_layers_available, cfg.num_layers, io_mode);
+        if (g_cache_io_split > 1) {
+            printf("[fanout] cache-io-split=%d → %d page-aligned chunks per expert\n",
+                   g_cache_io_split, active_cache_io_split(active_expert_size()));
+        }
 
         // ---- LZ4 compressed experts: auto-detect and load ----
         {

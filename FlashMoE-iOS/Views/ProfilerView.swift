@@ -46,7 +46,39 @@ final class SystemMetrics: @unchecked Sendable {
     }
 
     private static func getAvailableMemory() -> Double {
-        Double(os_proc_available_memory()) / (1024 * 1024)
+        #if os(iOS)
+        // iOS: use os_proc_available_memory()
+        return Double(os_proc_available_memory()) / (1024 * 1024)
+        #elseif os(macOS)
+        // macOS: estimate available memory using host_statistics64 and page counts
+        var vmStats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        var size: vm_size_t = 0
+        let host = mach_host_self()
+
+        // Get page size
+        let kerrPage = host_page_size(host, &size)
+        guard kerrPage == KERN_SUCCESS else { return 0 }
+
+        // Fetch VM statistics
+        let result: kern_return_t = withUnsafeMutablePointer(to: &vmStats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                host_statistics64(host, HOST_VM_INFO64, intPtr, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+
+        // Consider free + inactive pages as "available"
+        let freePages = UInt64(vmStats.free_count)
+        let inactivePages = UInt64(vmStats.inactive_count)
+        let speculativePages = UInt64(vmStats.speculative_count)
+
+        let availableBytes = (freePages + inactivePages + speculativePages) * UInt64(size)
+        return Double(availableBytes) / (1024 * 1024)
+        #else
+        // Other platforms: not available — return 0
+        return 0
+        #endif
     }
 
     // MARK: - CPU
@@ -154,7 +186,9 @@ struct ProfilerView: View {
                     icon: "timer",
                     label: "TTFT",
                     value: engine.timeToFirstToken > 0
-                        ? String(format: "%.0f ms", engine.timeToFirstToken)
+                        ? (engine.timeToFirstToken > 500_000
+                            ? String(format: "%.1f min", engine.timeToFirstToken / 60_000)
+                            : String(format: "%.0f ms", engine.timeToFirstToken))
                         : "--"
                 )
             }
@@ -237,3 +271,4 @@ struct ProfilerView: View {
         timer = nil
     }
 }
+
