@@ -199,7 +199,7 @@ struct ModelListView: View {
             }
             Button("Cancel", role: .cancel) { modelToDelete = nil }
         } message: {
-            Text("Delete \"\(modelToDelete?.name ?? "")\" (\(String(format: "%.1f GB", modelToDelete?.sizeGB ?? 0)))? This cannot be undone.")
+            Text("Delete \"\(modelToDelete?.name ?? "")\" (\(String(format: "%.1f GB", modelToDelete?.sizeGB ?? 0.0)))? This cannot be undone.")
         }
         .sheet(item: $modelToExport) { model in
             FolderExportPicker(sourceURL: URL(fileURLWithPath: model.path)) { destURL in
