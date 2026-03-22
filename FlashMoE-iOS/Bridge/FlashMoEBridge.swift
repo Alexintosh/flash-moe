@@ -73,8 +73,11 @@ final class FlashMoEEngine: @unchecked Sendable {
     // MARK: - Model Loading
 
     /// Load a model from the given path. Runs on a background thread.
+    /// Load a model. Set `activeExpertsK` to reduce expert count for large models on small devices.
+    /// For example, K=4 on a K=10 model cuts I/O by 60%.
     func loadModel(at path: String, maxContext: Int = 0, thinkBudget: Int = 2048,
-                   useTiered: Bool = false, verbose: Bool = false) async throws {
+                   useTiered: Bool = false, activeExpertsK: Int = 0,
+                   verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
         }
@@ -105,6 +108,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.max_context = Int32(maxContext)
                 config.think_budget = Int32(thinkBudget)
                 config.use_tiered = useTiered ? 1 : 0
+                config.active_experts_k = Int32(activeExpertsK)
                 config.verbose = verbose ? 1 : 0
 
                 // Load

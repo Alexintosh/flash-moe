@@ -7174,34 +7174,59 @@ int main(int argc, char **argv) {
         alloc_tracking_arrays();
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
 
-        // Build default paths
+        // Build default paths — check model directory first, then relative paths
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
 
-        // Try to find files relative to the executable
         if (!weights_path) {
-            snprintf(default_weights, sizeof(default_weights),
-                     "metal_infer/model_weights.bin");
-            if (access(default_weights, R_OK) != 0) {
+            // 1. Try <model_path>/model_weights.bin
+            if (model_path) {
                 snprintf(default_weights, sizeof(default_weights),
-                         "model_weights.bin");
+                         "%s/model_weights.bin", model_path);
+                if (access(default_weights, R_OK) != 0)
+                    default_weights[0] = '\0';
+            }
+            // 2. Try relative paths
+            if (!default_weights[0]) {
+                snprintf(default_weights, sizeof(default_weights),
+                         "metal_infer/model_weights.bin");
+                if (access(default_weights, R_OK) != 0) {
+                    snprintf(default_weights, sizeof(default_weights),
+                             "model_weights.bin");
+                }
             }
             weights_path = default_weights;
         }
         if (!manifest_path) {
-            snprintf(default_manifest, sizeof(default_manifest),
-                     "metal_infer/model_weights.json");
-            if (access(default_manifest, R_OK) != 0) {
+            if (model_path) {
                 snprintf(default_manifest, sizeof(default_manifest),
-                         "model_weights.json");
+                         "%s/model_weights.json", model_path);
+                if (access(default_manifest, R_OK) != 0)
+                    default_manifest[0] = '\0';
+            }
+            if (!default_manifest[0]) {
+                snprintf(default_manifest, sizeof(default_manifest),
+                         "metal_infer/model_weights.json");
+                if (access(default_manifest, R_OK) != 0) {
+                    snprintf(default_manifest, sizeof(default_manifest),
+                             "model_weights.json");
+                }
             }
             manifest_path = default_manifest;
         }
         if (!vocab_path) {
-            snprintf(default_vocab, sizeof(default_vocab),
-                     "metal_infer/vocab.bin");
-            if (access(default_vocab, R_OK) != 0) {
+            if (model_path) {
                 snprintf(default_vocab, sizeof(default_vocab),
-                         "vocab.bin");
+                         "%s/vocab.bin", model_path);
+                if (access(default_vocab, R_OK) != 0)
+                    default_vocab[0] = '\0';
+            }
+            if (!default_vocab[0]) {
+                snprintf(default_vocab, sizeof(default_vocab),
+                         "metal_infer/vocab.bin");
+                if (access(default_vocab, R_OK) != 0) {
+                    snprintf(default_vocab, sizeof(default_vocab),
+                             "vocab.bin");
+                }
             }
             vocab_path = default_vocab;
         }

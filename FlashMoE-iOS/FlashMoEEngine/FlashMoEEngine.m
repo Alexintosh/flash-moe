@@ -147,7 +147,19 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         g_use_2bit = 0;
 
         // K = experts per token from config
-        ctx->K = cfg.num_experts_per_tok;
+        // K override: allow reducing active experts for memory-constrained devices.
+        // Lower K = less I/O per token (linear reduction). Quality degrades gracefully
+        // because the router still picks the best K experts from the full vocabulary.
+        if (config->active_experts_k > 0 && config->active_experts_k <= cfg.num_experts_per_tok) {
+            ctx->K = config->active_experts_k;
+            if (config->verbose) {
+                NSLog(@"[FlashMoE] K override: %d (model default: %d) — %.0f%% I/O reduction",
+                      ctx->K, cfg.num_experts_per_tok,
+                      (1.0 - (double)ctx->K / cfg.num_experts_per_tok) * 100);
+            }
+        } else {
+            ctx->K = cfg.num_experts_per_tok;
+        }
 
         // ---- Build file paths ----
         char weights_path[1024], manifest_path[1024], vocab_path[1024];

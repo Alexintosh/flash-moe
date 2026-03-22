@@ -139,11 +139,27 @@ struct ModelListView: View {
         guard engine.state != .loading && engine.state != .generating else { return }
         selectedModel = model
 
+        // Check if this model has a catalog entry with K-reduction recommendation
+        let catalogEntry = ModelCatalog.models.first { entry in
+            model.path.contains(entry.id) || model.name.contains(entry.id)
+        }
+        let recommendedK = catalogEntry?.recommendedK ?? 0
+
+        // Auto-apply K-reduction based on device RAM
+        let deviceRAM = ProcessInfo.processInfo.physicalMemory / (1024 * 1024 * 1024)  // GB
+        let activeK: Int
+        if recommendedK > 0 && deviceRAM <= 16 {
+            activeK = recommendedK
+        } else {
+            activeK = 0  // use model default
+        }
+
         Task {
             do {
                 try await engine.loadModel(
                     at: model.path,
                     useTiered: model.hasTiered,
+                    activeExpertsK: activeK,
                     verbose: true
                 )
             } catch {
