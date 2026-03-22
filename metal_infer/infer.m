@@ -899,6 +899,9 @@ static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
 typedef struct {
     void *data;
     size_t size;
+    void *data2;       // second chunk for split weight files (NULL if single file)
+    size_t size2;
+    size_t split_offset; // byte offset where chunk 2 starts in the logical layout
     TensorManifest *manifest;
 } WeightFile;
 
@@ -945,7 +948,37 @@ static void *get_tensor_ptr(WeightFile *wf, const char *name) {
         fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
         return NULL;
     }
+    // Split weight files: tensors above split_offset are in chunk 2
+    if (wf->data2 && t->offset >= wf->split_offset) {
+        return (char *)wf->data2 + (t->offset - wf->split_offset);
+    }
     return (char *)wf->data + t->offset;
+}
+
+// Attach a second weight chunk to an existing WeightFile (for >4GB split models)
+static int open_weights2(WeightFile *wf, const char *bin2_path, size_t split_offset) {
+    int fd = open(bin2_path, O_RDONLY);
+    if (fd < 0) return 0;  // no chunk 2, that's OK
+
+    struct stat st;
+    fstat(fd, &st);
+    size_t size2 = st.st_size;
+
+    void *data2 = mmap(NULL, size2, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data2 == MAP_FAILED) {
+        fprintf(stderr, "WARNING: mmap chunk 2 failed: %s\n", strerror(errno));
+        return 0;
+    }
+
+    madvise(data2, size2, MADV_SEQUENTIAL);
+    wf->data2 = data2;
+    wf->size2 = size2;
+    wf->split_offset = split_offset;
+
+    printf("[weights] mmap'd chunk 2: %.2f GB from %s (split at offset %zu)\n",
+           size2 / 1e9, bin2_path, split_offset);
+    return 1;
 }
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
@@ -1365,7 +1398,12 @@ typedef struct {
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
-    id<MTLBuffer> wf_buf;        // the mmap'd weight file as a Metal buffer
+    id<MTLBuffer> wf_buf;        // the mmap'd weight file as a Metal buffer (chunk 0)
+    id<MTLBuffer> wf_buf2;       // second chunk for split weight files (>4GB models)
+    void *wf_data;               // base pointer of chunk 0 mmap
+    size_t wf_size;              // size of chunk 0
+    void *wf_data2;              // base pointer of chunk 1 mmap (NULL if single file)
+    size_t wf_size2;             // size of chunk 1
     // Batched matmul output slots (preallocated, reused across dispatches)
     id<MTLBuffer> batch_out[MAX_BATCH_SLOTS];
     // Reusable buffers for expert computation (avoids per-expert alloc)
@@ -1708,6 +1746,11 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
     size_t page_size = 16384;
     size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
 
+    ctx->wf_data = data;
+    ctx->wf_size = size;
+    ctx->wf_data2 = NULL;
+    ctx->wf_size2 = 0;
+
     ctx->wf_buf = [ctx->device newBufferWithBytesNoCopy:data
                                                  length:aligned_size
                                                 options:MTLResourceStorageModeShared
@@ -1722,6 +1765,53 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
                aligned_size / 1e9);
     }
 }
+
+// Set second weight chunk for split weight files (>4GB models like 397B)
+static void metal_set_weights2(MetalCtx *ctx, void *data, size_t size) {
+    size_t page_size = 16384;
+    size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
+
+    ctx->wf_data2 = data;
+    ctx->wf_size2 = size;
+
+    ctx->wf_buf2 = [ctx->device newBufferWithBytesNoCopy:data
+                                                  length:aligned_size
+                                                 options:MTLResourceStorageModeShared
+                                             deallocator:nil];
+    if (!ctx->wf_buf2) {
+        fprintf(stderr, "WARNING: Cannot wrap weight chunk 2 as Metal buffer (size=%.2f GB)\n",
+                size / 1e9);
+    } else {
+        printf("[metal] Weight chunk 2 wrapped as Metal buffer (%.2f GB)\n",
+               aligned_size / 1e9);
+    }
+}
+
+// Resolve a pointer (into mmap'd weight data) to (Metal buffer, byte offset).
+// Handles split weight files: checks chunk 0 first, then chunk 1.
+static inline void wf_resolve(MetalCtx *ctx, const void *ptr,
+                               id<MTLBuffer> *out_buf, NSUInteger *out_off) {
+    const char *p = (const char *)ptr;
+    const char *base = (const char *)ctx->wf_data;
+    if (p >= base && p < base + ctx->wf_size) {
+        *out_buf = ctx->wf_buf;
+        *out_off = (NSUInteger)(p - base);
+    } else if (ctx->wf_data2) {
+        const char *base2 = (const char *)ctx->wf_data2;
+        *out_buf = ctx->wf_buf2;
+        *out_off = (NSUInteger)(p - base2);
+    } else {
+        // Shouldn't happen — pointer not in any weight buffer
+        *out_buf = ctx->wf_buf;
+        *out_off = (NSUInteger)(p - base);
+    }
+}
+
+// Convenience macros for resolving weight pointers in fused_layer_forward.
+// These declare local variables _wf_buf_X and _wf_off_X for a given pointer.
+#define WF_RESOLVE_1(ctx, ptr, suffix) \
+    id<MTLBuffer> _wf_buf_##suffix; NSUInteger _wf_off_##suffix; \
+    wf_resolve(ctx, ptr, &_wf_buf_##suffix, &_wf_off_##suffix)
 
 // GPU dequant matvec: out[out_dim] = W_4bit * x[in_dim]
 // W_packed, scales, biases are pointers into mmap'd weight file
@@ -1741,10 +1831,12 @@ static void gpu_dequant_matvec(
 
     size_t o_size = (size_t)out_dim * sizeof(float);
 
-    // Compute offsets into the mmap'd weight buffer
-    NSUInteger w_off = (NSUInteger)((const char *)W_packed - (const char *)[ctx->wf_buf contents]);
-    NSUInteger s_off = (NSUInteger)((const char *)scales   - (const char *)[ctx->wf_buf contents]);
-    NSUInteger b_off = (NSUInteger)((const char *)biases   - (const char *)[ctx->wf_buf contents]);
+    // Resolve weight pointers to (Metal buffer, offset) pairs
+    id<MTLBuffer> w_buf, s_buf, b_buf;
+    NSUInteger w_off, s_off, b_off;
+    wf_resolve(ctx, W_packed, &w_buf, &w_off);
+    wf_resolve(ctx, scales,   &s_buf, &s_off);
+    wf_resolve(ctx, biases,   &b_buf, &b_off);
 
     // Ensure output buffer is large enough
     id<MTLBuffer> o_buf = ctx->buf_output;
@@ -1759,9 +1851,9 @@ static void gpu_dequant_matvec(
     // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_v3 = (in_dim <= 4096);
     [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-    [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-    [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-    [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
+    [enc setBuffer:w_buf  offset:w_off atIndex:0];
+    [enc setBuffer:s_buf  offset:s_off atIndex:1];
+    [enc setBuffer:b_buf  offset:b_off atIndex:2];
     [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
     [enc setBuffer:o_buf        offset:0     atIndex:4];
     [enc setBytes:&out_dim      length:4     atIndex:5];
@@ -1831,18 +1923,20 @@ static void gpu_batch_matvec(
 
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
-        NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
-        NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        id<MTLBuffer> w_buf, s_buf, b_buf;
+        NSUInteger w_off, s_off, b_off;
+        wf_resolve(ctx, s->W,      &w_buf, &w_off);
+        wf_resolve(ctx, s->scales,  &s_buf, &s_off);
+        wf_resolve(ctx, s->biases,  &b_buf, &b_off);
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
         [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-        [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-        [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
+        [enc setBuffer:w_buf  offset:w_off atIndex:0];
+        [enc setBuffer:s_buf  offset:s_off atIndex:1];
+        [enc setBuffer:b_buf  offset:b_off atIndex:2];
         [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
         [enc setBuffer:o_buf        offset:0     atIndex:4];
         [enc setBytes:&s->out_dim   length:4     atIndex:5];
@@ -1885,18 +1979,20 @@ static void gpu_encode_batch_matvec(
 ) {
     for (int i = 0; i < num_specs; i++) {
         BatchMatvecSpec *s = &specs[i];
-        NSUInteger w_off = (NSUInteger)((const char *)s->W      - (const char *)[ctx->wf_buf contents]);
-        NSUInteger s_off = (NSUInteger)((const char *)s->scales  - (const char *)[ctx->wf_buf contents]);
-        NSUInteger b_off = (NSUInteger)((const char *)s->biases  - (const char *)[ctx->wf_buf contents]);
+        id<MTLBuffer> w_buf, s_buf, b_buf;
+        NSUInteger w_off, s_off, b_off;
+        wf_resolve(ctx, s->W,      &w_buf, &w_off);
+        wf_resolve(ctx, s->scales,  &s_buf, &s_off);
+        wf_resolve(ctx, s->biases,  &b_buf, &b_off);
 
         id<MTLBuffer> o_buf = ctx->batch_out[s->batch_slot];
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
         [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-        [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-        [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-        [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
+        [enc setBuffer:w_buf  offset:w_off atIndex:0];
+        [enc setBuffer:s_buf  offset:s_off atIndex:1];
+        [enc setBuffer:b_buf  offset:b_off atIndex:2];
         [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
         [enc setBuffer:o_buf        offset:0     atIndex:4];
         [enc setBytes:&s->out_dim   length:4     atIndex:5];
@@ -1935,16 +2031,18 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     id<MTLBuffer> in_buf, id<MTLBuffer> out_buf,
     uint32_t out_dim, uint32_t in_dim, uint32_t group_size
 ) {
-    NSUInteger w_off = (NSUInteger)((const char *)W      - (const char *)[ctx->wf_buf contents]);
-    NSUInteger s_off = (NSUInteger)((const char *)scales  - (const char *)[ctx->wf_buf contents]);
-    NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
+    id<MTLBuffer> w_buf, s_buf, b_buf;
+    NSUInteger w_off, s_off, b_off;
+    wf_resolve(ctx, W,      &w_buf, &w_off);
+    wf_resolve(ctx, scales,  &s_buf, &s_off);
+    wf_resolve(ctx, biases,  &b_buf, &b_off);
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     int use_v3 = (in_dim <= 4096);
     [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
-    [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
-    [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
-    [enc setBuffer:ctx->wf_buf offset:b_off atIndex:2];
+    [enc setBuffer:w_buf offset:w_off atIndex:0];
+    [enc setBuffer:s_buf offset:s_off atIndex:1];
+    [enc setBuffer:b_buf offset:b_off atIndex:2];
     [enc setBuffer:in_buf      offset:0     atIndex:3];
     [enc setBuffer:out_buf     offset:0     atIndex:4];
     [enc setBytes:&out_dim     length:4     atIndex:5];
@@ -4628,7 +4726,7 @@ static void fused_layer_forward(
         if (can_gpu_linear && num_attn_specs == 4) {
             // batch_out[0]=qkv(12288), [1]=z(8192), [2]=beta(64), [3]=alpha(64)
             uint32_t conv_dim = cfg.linear_conv_dim;
-            NSUInteger conv_w_off = (NSUInteger)((const char *)lc->conv1d_w - (const char *)[g_metal->wf_buf contents]);
+            id<MTLBuffer> conv_w_buf; NSUInteger conv_w_off; wf_resolve(g_metal, lc->conv1d_w, &conv_w_buf, &conv_w_off);
 
             // Enc L1: conv1d_step — input=batch_out[0], weights=conv1d_w, state=buf_conv_state, output=buf_conv_output
             {
@@ -4636,7 +4734,7 @@ static void fused_layer_forward(
                 [enc setComputePipelineState:g_metal->conv1d_step];
                 [enc setBuffer:g_metal->buf_conv_state[linear_layer_idx] offset:0 atIndex:0];
                 [enc setBuffer:g_metal->batch_out[0]    offset:0            atIndex:1]; // qkv projection output
-                [enc setBuffer:g_metal->wf_buf          offset:conv_w_off   atIndex:2]; // conv weights (bf16)
+                [enc setBuffer:conv_w_buf  offset:conv_w_off atIndex:2]; // conv weights (bf16)
                 [enc setBuffer:g_metal->buf_conv_output offset:0            atIndex:3]; // conv output
                 [enc setBytes:&conv_dim length:4 atIndex:4];
                 uint32_t tgs = (conv_dim + 255) / 256;
@@ -4662,14 +4760,14 @@ static void fused_layer_forward(
 
             // Enc L3: compute_decay_beta — alpha=batch_out[3], beta=batch_out[2], A_log+dt_bias from wf_buf
             {
-                NSUInteger a_log_off   = (NSUInteger)((const char *)lc->A_log   - (const char *)[g_metal->wf_buf contents]);
-                NSUInteger dt_bias_off = (NSUInteger)((const char *)lc->dt_bias  - (const char *)[g_metal->wf_buf contents]);
+                id<MTLBuffer> a_log_buf; NSUInteger a_log_off; wf_resolve(g_metal, lc->A_log, &a_log_buf, &a_log_off);
+                id<MTLBuffer> dt_bias_buf; NSUInteger dt_bias_off; wf_resolve(g_metal, lc->dt_bias, &dt_bias_buf, &dt_bias_off);
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->compute_decay_beta];
                 [enc setBuffer:g_metal->batch_out[3]       offset:0          atIndex:0]; // alpha
                 [enc setBuffer:g_metal->batch_out[2]       offset:0          atIndex:1]; // beta
-                [enc setBuffer:g_metal->wf_buf             offset:a_log_off  atIndex:2]; // A_log
-                [enc setBuffer:g_metal->wf_buf             offset:dt_bias_off atIndex:3]; // dt_bias (bf16)
+                [enc setBuffer:a_log_buf  offset:a_log_off atIndex:2]; // A_log
+                [enc setBuffer:dt_bias_buf  offset:dt_bias_off atIndex:3]; // dt_bias (bf16)
                 [enc setBuffer:g_metal->buf_delta_g_decay  offset:0          atIndex:4]; // g_decay output
                 [enc setBuffer:g_metal->buf_delta_beta     offset:0          atIndex:5]; // beta_gate output
                 [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -4697,14 +4795,14 @@ static void fused_layer_forward(
 
             // Enc L5: gated_rms_norm — normalize+gate delta-net output -> batch_out[6] for CMD2 o_proj
             {
-                NSUInteger gnorm_w_off = (NSUInteger)((const char *)lc->gated_norm_w - (const char *)[g_metal->wf_buf contents]);
+                id<MTLBuffer> gnorm_w_buf; NSUInteger gnorm_w_off; wf_resolve(g_metal, lc->gated_norm_w, &gnorm_w_buf, &gnorm_w_off);
                 uint32_t value_dim = cfg.linear_value_dim;  // 128
                 float eps = cfg.rms_norm_eps;
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->gated_rms_norm];
                 [enc setBuffer:g_metal->buf_delta_output offset:0          atIndex:0]; // values [8192]
                 [enc setBuffer:g_metal->batch_out[1]     offset:0          atIndex:1]; // z (z projection output) [8192]
-                [enc setBuffer:g_metal->wf_buf           offset:gnorm_w_off atIndex:2]; // weight (bf16)
+                [enc setBuffer:gnorm_w_buf  offset:gnorm_w_off atIndex:2]; // weight (bf16)
                 [enc setBuffer:g_metal->batch_out[6]     offset:0          atIndex:3]; // output -> batch_out[6] for CMD2
                 [enc setBytes:&value_dim length:4 atIndex:4];
                 [enc setBytes:&eps       length:4 atIndex:5];
@@ -4778,7 +4876,7 @@ static void fused_layer_forward(
             // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
             if (can_gpu_linear && num_attn_specs == 4) {
                 uint32_t conv_dim = cfg.linear_conv_dim;
-                NSUInteger conv_w_off = (NSUInteger)((const char *)lc->conv1d_w - (const char *)[g_metal->wf_buf contents]);
+                id<MTLBuffer> conv_w_buf; NSUInteger conv_w_off; wf_resolve(g_metal, lc->conv1d_w, &conv_w_buf, &conv_w_off);
 
                 // Enc L1: conv1d_step
                 {
@@ -4786,7 +4884,7 @@ static void fused_layer_forward(
                     [enc setComputePipelineState:g_metal->conv1d_step];
                     [enc setBuffer:g_metal->buf_conv_state[linear_layer_idx] offset:0 atIndex:0];
                     [enc setBuffer:g_metal->batch_out[0]    offset:0            atIndex:1];
-                    [enc setBuffer:g_metal->wf_buf          offset:conv_w_off   atIndex:2];
+                    [enc setBuffer:conv_w_buf  offset:conv_w_off atIndex:2];
                     [enc setBuffer:g_metal->buf_conv_output offset:0            atIndex:3];
                     [enc setBytes:&conv_dim length:4 atIndex:4];
                     uint32_t tgs = (conv_dim + 255) / 256;
@@ -4812,14 +4910,14 @@ static void fused_layer_forward(
 
                 // Enc L3: compute_decay_beta
                 {
-                    NSUInteger a_log_off   = (NSUInteger)((const char *)lc->A_log   - (const char *)[g_metal->wf_buf contents]);
-                    NSUInteger dt_bias_off = (NSUInteger)((const char *)lc->dt_bias  - (const char *)[g_metal->wf_buf contents]);
+                    id<MTLBuffer> a_log_buf; NSUInteger a_log_off; wf_resolve(g_metal, lc->A_log, &a_log_buf, &a_log_off);
+                    id<MTLBuffer> dt_bias_buf; NSUInteger dt_bias_off; wf_resolve(g_metal, lc->dt_bias, &dt_bias_buf, &dt_bias_off);
                     id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                     [enc setComputePipelineState:g_metal->compute_decay_beta];
                     [enc setBuffer:g_metal->batch_out[3]       offset:0          atIndex:0];
                     [enc setBuffer:g_metal->batch_out[2]       offset:0          atIndex:1];
-                    [enc setBuffer:g_metal->wf_buf             offset:a_log_off  atIndex:2];
-                    [enc setBuffer:g_metal->wf_buf             offset:dt_bias_off atIndex:3];
+                    [enc setBuffer:a_log_buf  offset:a_log_off atIndex:2];
+                    [enc setBuffer:dt_bias_buf  offset:dt_bias_off atIndex:3];
                     [enc setBuffer:g_metal->buf_delta_g_decay  offset:0          atIndex:4];
                     [enc setBuffer:g_metal->buf_delta_beta     offset:0          atIndex:5];
                     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -4847,14 +4945,14 @@ static void fused_layer_forward(
 
                 // Enc L5: gated_rms_norm -> batch_out[6]
                 {
-                    NSUInteger gnorm_w_off = (NSUInteger)((const char *)lc->gated_norm_w - (const char *)[g_metal->wf_buf contents]);
+                    id<MTLBuffer> gnorm_w_buf; NSUInteger gnorm_w_off; wf_resolve(g_metal, lc->gated_norm_w, &gnorm_w_buf, &gnorm_w_off);
                     uint32_t value_dim = cfg.linear_value_dim;
                     float eps = cfg.rms_norm_eps;
                     id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
                     [enc setComputePipelineState:g_metal->gated_rms_norm];
                     [enc setBuffer:g_metal->buf_delta_output offset:0          atIndex:0];
                     [enc setBuffer:g_metal->batch_out[1]     offset:0          atIndex:1];
-                    [enc setBuffer:g_metal->wf_buf           offset:gnorm_w_off atIndex:2];
+                    [enc setBuffer:gnorm_w_buf  offset:gnorm_w_off atIndex:2];
                     [enc setBuffer:g_metal->batch_out[6]     offset:0          atIndex:3];
                     [enc setBytes:&value_dim length:4 atIndex:4];
                     [enc setBytes:&eps       length:4 atIndex:5];
@@ -5426,9 +5524,9 @@ static void fused_layer_forward(
 
         // ---- o_proj matvec ----
         {
-            NSUInteger w_off = (NSUInteger)((const char *)oproj_w - (const char *)[g_metal->wf_buf contents]);
-            NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
-            NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
+            id<MTLBuffer> w_buf; NSUInteger w_off; wf_resolve(g_metal, oproj_w, &w_buf, &w_off);
+            id<MTLBuffer> s_buf; NSUInteger s_off; wf_resolve(g_metal, oproj_s, &s_buf, &s_off);
+            id<MTLBuffer> b_buf; NSUInteger b_off; wf_resolve(g_metal, oproj_b, &b_buf, &b_off);
 
             // For GPU attention: o_proj reads from buf_attn_out
             // For CPU attention: o_proj reads from batch_out[6]
@@ -5439,9 +5537,9 @@ static void fused_layer_forward(
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = cfg.group_size;
             [enc setComputePipelineState:g_metal->matvec_fast];
-            [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
-            [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
-            [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
+            [enc setBuffer:w_buf  offset:w_off atIndex:0];
+            [enc setBuffer:s_buf  offset:s_off atIndex:1];
+            [enc setBuffer:b_buf  offset:b_off atIndex:2];
             [enc setBuffer:oproj_input      offset:0    atIndex:3];
             [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
             [enc setBytes:&o_out_dim  length:4 atIndex:5];
@@ -5482,14 +5580,13 @@ static void fused_layer_forward(
 
         // ---- Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
         {
-            NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w -
-                                               (const char *)[g_metal->wf_buf contents]);
+            id<MTLBuffer> norm_buf; NSUInteger norm_off; wf_resolve(g_metal, lc->post_attn_norm_w, &norm_buf, &norm_off);
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t dim = cfg.hidden_dim;
             float eps = cfg.rms_norm_eps;
             [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
             [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];  // x
-            [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1]; // weight (bf16)
+            [enc setBuffer:norm_buf  offset:norm_off atIndex:1]; // weight (bf16)
             [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];  // sum_sq
             [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];  // out = h_post
             [enc setBytes:&dim length:4 atIndex:4];
@@ -5951,14 +6048,13 @@ static void fused_layer_forward(
             // Enc C3: rms_norm_apply_bf16 (buf_moe_hidden + next_norm_w -> buf_input)
             {
                 uint16_t *next_norm_w = layer_cache[layer_idx + 1].input_norm_w;
-                NSUInteger norm_off = (NSUInteger)((const char *)next_norm_w -
-                                                   (const char *)[g_metal->wf_buf contents]);
+                id<MTLBuffer> norm_buf; NSUInteger norm_off; wf_resolve(g_metal, next_norm_w, &norm_buf, &norm_off);
                 id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
                 uint32_t dim = cfg.hidden_dim;
                 float eps = cfg.rms_norm_eps;
                 [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
                 [enc setBuffer:g_metal->buf_moe_hidden  offset:0       atIndex:0]; // x
-                [enc setBuffer:g_metal->wf_buf          offset:norm_off atIndex:1]; // weight (bf16)
+                [enc setBuffer:norm_buf  offset:norm_off atIndex:1]; // weight (bf16)
                 [enc setBuffer:g_metal->buf_cmd3_sum_sq offset:0       atIndex:2]; // sum_sq
                 [enc setBuffer:g_metal->buf_input       offset:0       atIndex:3]; // out = normed
                 [enc setBytes:&dim length:4 atIndex:4];
@@ -7287,9 +7383,39 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        // Wrap weight file for Metal GPU access
+        // ---- Auto-detect split weight files ----
+        // If model_weights_1.bin exists alongside model_weights.bin, load it as chunk 2
+        {
+            // Derive chunk 2 path from chunk 0 path
+            char weights2_path[1024];
+            // Replace .bin with _1.bin
+            const char *dot = strrchr(weights_path, '.');
+            if (dot) {
+                size_t prefix_len = dot - weights_path;
+                snprintf(weights2_path, sizeof(weights2_path), "%.*s_1.bin",
+                         (int)prefix_len, weights_path);
+            } else {
+                snprintf(weights2_path, sizeof(weights2_path), "%s_1", weights_path);
+            }
+
+            if (access(weights2_path, R_OK) == 0) {
+                // The split_offset is stored in the manifest as "split_offset"
+                size_t split_off = wf->size;  // default: chunk 1 starts right after chunk 0
+                // Check manifest for explicit split_offset
+                // (extract_weights.py writes this when --split is used)
+                // For now, just use chunk 0 size
+                if (open_weights2(wf, weights2_path, split_off)) {
+                    printf("[weights] Split weight files detected\n");
+                }
+            }
+        }
+
+        // Wrap weight file(s) for Metal GPU access
         if (g_metal) {
             metal_set_weights(g_metal, wf->data, wf->size);
+            if (wf->data2) {
+                metal_set_weights2(g_metal, wf->data2, wf->size2);
+            }
         }
 
         // ---- Load vocabulary ----
