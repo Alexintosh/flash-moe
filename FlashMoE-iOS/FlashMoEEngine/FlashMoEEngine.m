@@ -173,6 +173,11 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             ctx->K = cfg.num_experts_per_tok;
         }
 
+        // Expert I/O fanout (stored for future use in pread chunking)
+        if (config->cache_io_split > 1 && config->verbose) {
+            NSLog(@"[FlashMoE] Expert I/O fanout: %d chunks per expert read", config->cache_io_split);
+        }
+
         // Safety: cap K to MAX_K to prevent buffer overflow on multi-expert buffers
         if (ctx->K > MAX_K) {
             NSLog(@"[FlashMoE] WARNING: K=%d exceeds MAX_K=%d, capping to %d", ctx->K, MAX_K, MAX_K);
