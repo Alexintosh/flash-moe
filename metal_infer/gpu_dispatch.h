@@ -49,7 +49,13 @@ static void gpu_batch_matvec(
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        id<MTLComputePipelineState> pipe;
+        if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+            pipe = ctx->matvec_v3_fp16;
+        } else {
+            pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+        }
+        [enc setComputePipelineState:pipe];
         [enc setBuffer:w_buf        offset:w_off atIndex:0];
         [enc setBuffer:s_buf        offset:s_off atIndex:1];
         [enc setBuffer:b_buf        offset:b_off atIndex:2];
@@ -112,7 +118,13 @@ static void gpu_encode_batch_matvec(
 
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int use_v3 = (s->in_dim <= 4096);
-        [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+        id<MTLComputePipelineState> pipe;
+        if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+            pipe = ctx->matvec_v3_fp16;
+        } else {
+            pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+        }
+        [enc setComputePipelineState:pipe];
         [enc setBuffer:w_buf        offset:w_off atIndex:0];
         [enc setBuffer:s_buf        offset:s_off atIndex:1];
         [enc setBuffer:b_buf        offset:b_off atIndex:2];
@@ -166,7 +178,13 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    id<MTLComputePipelineState> pipe;
+    if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+        pipe = ctx->matvec_v3_fp16;
+    } else {
+        pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+    }
+    [enc setComputePipelineState:pipe];
     [enc setBuffer:w_buf offset:w_off atIndex:0];
     [enc setBuffer:s_buf offset:s_off atIndex:1];
     [enc setBuffer:b_buf offset:b_off atIndex:2];
@@ -207,7 +225,12 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
         down_w_off = cfg.down_w_off_4;  down_s_off = cfg.down_s_off_4;  down_b_off = cfg.down_b_off_4;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe;
+    if (g_use_2bit) {
+        expert_pipe = (g_use_fp16_accum && ctx->matvec_2bit_fp16) ? ctx->matvec_2bit_fp16 : ctx->matvec_2bit;
+    } else {
+        expert_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16) ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
+    }
 
     uint32_t gate_up_out = cfg.moe_intermediate;
     uint32_t gate_up_in  = cfg.hidden_dim;
@@ -222,7 +245,9 @@ static void gpu_encode_expert_forward_slot(
     if (!g_use_2bit && g_fused_expert_enabled && ctx->fused_gate_up) {
         // fused_gate_up_swiglu: data[k] -> act[k] directly
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->fused_gate_up];
+        id<MTLComputePipelineState> fused_pipe = (g_use_fp16_accum && ctx->fused_gate_up_fp16)
+            ? ctx->fused_gate_up_fp16 : ctx->fused_gate_up;
+        [enc setComputePipelineState:fused_pipe];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_multi_expert_data[k]  offset:gate_b_off  atIndex:2];
@@ -325,7 +350,12 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
         down_w_off = cfg.down_w_off_4;  down_s_off = cfg.down_s_off_4;  down_b_off = cfg.down_b_off_4;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe;
+    if (g_use_2bit) {
+        expert_pipe = (g_use_fp16_accum && ctx->matvec_2bit_fp16) ? ctx->matvec_2bit_fp16 : ctx->matvec_2bit;
+    } else {
+        expert_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16) ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
+    }
 
     uint32_t gate_up_out = cfg.moe_intermediate;
     uint32_t gate_up_in  = cfg.hidden_dim;
@@ -340,7 +370,9 @@ static void gpu_encode_expert_forward_slot_buf(
     if (!g_use_2bit && g_fused_expert_enabled && ctx->fused_gate_up) {
         // fused_gate_up_swiglu: data_buf -> act[k] directly
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->fused_gate_up];
+        id<MTLComputePipelineState> fused_pipe = (g_use_fp16_accum && ctx->fused_gate_up_fp16)
+            ? ctx->fused_gate_up_fp16 : ctx->fused_gate_up;
+        [enc setComputePipelineState:fused_pipe];
         [enc setBuffer:data_buf                        offset:gate_w_off  atIndex:0];
         [enc setBuffer:data_buf                        offset:gate_s_off  atIndex:1];
         [enc setBuffer:data_buf                        offset:gate_b_off  atIndex:2];
@@ -469,12 +501,12 @@ static void gpu_encode_experts_batched(
             gate_w_off = cfg.gate_w_off_2; gate_s_off = cfg.gate_s_off_2; gate_b_off = cfg.gate_b_off_2;
             up_w_off   = cfg.up_w_off_2;   up_s_off   = cfg.up_s_off_2;   up_b_off   = cfg.up_b_off_2;
             down_w_off = cfg.down_w_off_2; down_s_off = cfg.down_s_off_2; down_b_off = cfg.down_b_off_2;
-            expert_pipe = ctx->matvec_2bit;
+            expert_pipe = (g_use_fp16_accum && ctx->matvec_2bit_fp16) ? ctx->matvec_2bit_fp16 : ctx->matvec_2bit;
         } else {
             gate_w_off = cfg.gate_w_off_4; gate_s_off = cfg.gate_s_off_4; gate_b_off = cfg.gate_b_off_4;
             up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
             down_w_off = cfg.down_w_off_4; down_s_off = cfg.down_s_off_4; down_b_off = cfg.down_b_off_4;
-            expert_pipe = ctx->matvec_v3;
+            expert_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16) ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
         }
 
         // 4-bit path: fused gate+up+SwiGLU kernel (1 dispatch instead of 3)
@@ -485,7 +517,9 @@ static void gpu_encode_experts_batched(
             // NOT ROWS_PER_TG=8 rows per threadgroup (like matvec_v3).
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-                [enc setComputePipelineState:ctx->fused_gate_up];
+                id<MTLComputePipelineState> fused_pipe = (g_use_fp16_accum && ctx->fused_gate_up_fp16)
+                    ? ctx->fused_gate_up_fp16 : ctx->fused_gate_up;
+                [enc setComputePipelineState:fused_pipe];
                 [enc setBuffer:expert_bufs[k]                  offset:gate_w_off  atIndex:0];
                 [enc setBuffer:expert_bufs[k]                  offset:gate_s_off  atIndex:1];
                 [enc setBuffer:expert_bufs[k]                  offset:gate_b_off  atIndex:2];
@@ -605,7 +639,9 @@ static void gpu_encode_expert_forward(
     if (g_fused_expert_enabled && ctx->fused_gate_up) {
         // fused_gate_up_swiglu: expert_data -> expert_act directly
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->fused_gate_up];
+        id<MTLComputePipelineState> fused_pipe = (g_use_fp16_accum && ctx->fused_gate_up_fp16)
+            ? ctx->fused_gate_up_fp16 : ctx->fused_gate_up;
+        [enc setComputePipelineState:fused_pipe];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data  offset:gate_b_off  atIndex:2];
@@ -621,10 +657,11 @@ static void gpu_encode_expert_forward(
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     } else {
+        id<MTLComputePipelineState> mv_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16) ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
         // gate_proj
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            [enc setComputePipelineState:ctx->matvec_v3];
+            [enc setComputePipelineState:mv_pipe];
             [enc setBuffer:ctx->buf_expert_data  offset:gate_w_off  atIndex:0];
             [enc setBuffer:ctx->buf_expert_data  offset:gate_s_off  atIndex:1];
             [enc setBuffer:ctx->buf_expert_data  offset:gate_b_off  atIndex:2];
@@ -640,7 +677,7 @@ static void gpu_encode_expert_forward(
         // up_proj
         {
             id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            [enc setComputePipelineState:ctx->matvec_v3];
+            [enc setComputePipelineState:mv_pipe];
             [enc setBuffer:ctx->buf_expert_data  offset:up_w_off  atIndex:0];
             [enc setBuffer:ctx->buf_expert_data  offset:up_s_off  atIndex:1];
             [enc setBuffer:ctx->buf_expert_data  offset:up_b_off  atIndex:2];
@@ -670,7 +707,8 @@ static void gpu_encode_expert_forward(
     // down_proj
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->matvec_v3];
+        id<MTLComputePipelineState> down_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16) ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
+        [enc setComputePipelineState:down_pipe];
         [enc setBuffer:ctx->buf_expert_data offset:down_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_expert_data offset:down_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_expert_data offset:down_b_off  atIndex:2];
@@ -732,7 +770,12 @@ static void gpu_expert_forward(
         up_w_off   = cfg.up_w_off_4;   up_s_off   = cfg.up_s_off_4;   up_b_off   = cfg.up_b_off_4;
         down_w_off = cfg.down_w_off_4;  down_s_off = cfg.down_s_off_4;  down_b_off = cfg.down_b_off_4;
     }
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe;
+    if (g_use_2bit) {
+        expert_pipe = (g_use_fp16_accum && ctx->matvec_2bit_fp16) ? ctx->matvec_2bit_fp16 : ctx->matvec_2bit;
+    } else {
+        expert_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16) ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
+    }
 
     // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {

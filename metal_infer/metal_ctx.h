@@ -24,6 +24,10 @@ typedef struct {
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
     id<MTLComputePipelineState> fused_gate_up;  // fused gate+up+SwiGLU kernel (4-bit only)
+    // FP16 accumulation variants (experimental — toggled via g_use_fp16_accum)
+    id<MTLComputePipelineState> matvec_v3_fp16;   // fp16 accumulation variant of v3
+    id<MTLComputePipelineState> matvec_2bit_fp16;  // fp16 accumulation variant of 2-bit
+    id<MTLComputePipelineState> fused_gate_up_fp16; // fp16 accumulation variant of fused gate+up
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
@@ -214,6 +218,13 @@ static MetalCtx *metal_setup(void) {
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->fused_gate_up = makePipe(@"fused_gate_up_swiglu");
+    // FP16 accumulation variants (optional — float path is fallback)
+    ctx->matvec_v3_fp16    = makePipe(@"dequant_matvec_4bit_v3_fp16");
+    ctx->matvec_2bit_fp16  = makePipe(@"dequant_matvec_2bit_fp16");
+    ctx->fused_gate_up_fp16 = makePipe(@"fused_gate_up_swiglu_fp16");
+    if (!ctx->matvec_v3_fp16)    fprintf(stderr, "[metal] WARNING: fp16 matvec_v3 pipeline failed (float fallback)\n");
+    if (!ctx->matvec_2bit_fp16)  fprintf(stderr, "[metal] WARNING: fp16 matvec_2bit pipeline failed (float fallback)\n");
+    if (!ctx->fused_gate_up_fp16) fprintf(stderr, "[metal] WARNING: fp16 fused_gate_up pipeline failed (float fallback)\n");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
@@ -787,7 +798,13 @@ static void gpu_dequant_matvec(
     // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
     // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_v3 = (in_dim <= 4096);
-    [enc setComputePipelineState: use_v3 ? ctx->matvec_v3 : ctx->matvec_fast];
+    id<MTLComputePipelineState> dq_pipe;
+    if (g_use_fp16_accum && use_v3 && ctx->matvec_v3_fp16) {
+        dq_pipe = ctx->matvec_v3_fp16;
+    } else {
+        dq_pipe = use_v3 ? ctx->matvec_v3 : ctx->matvec_fast;
+    }
+    [enc setComputePipelineState:dq_pipe];
     [enc setBuffer:w_buf        offset:w_off atIndex:0];
     [enc setBuffer:s_buf        offset:s_off atIndex:1];
     [enc setBuffer:b_buf        offset:b_off atIndex:2];

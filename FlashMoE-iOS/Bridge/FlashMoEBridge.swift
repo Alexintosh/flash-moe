@@ -79,6 +79,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                    useTiered: Bool = false, activeExpertsK: Int = 0, cacheIOSplit: Int = 1,
                    cmdMerge: Bool = true, fusedAttention: Bool = false,
                    expertPrefetch: Bool = false, fusedExpert: Bool = true,
+                   fp16Accumulation: Bool = false,
                    verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
@@ -116,6 +117,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.fused_attention = fusedAttention ? 1 : 0
                 config.expert_prefetch = expertPrefetch ? 1 : 0
                 config.fused_expert = fusedExpert ? 1 : 0
+                config.fp16_accumulation = fp16Accumulation ? 1 : 0
                 config.verbose = verbose ? 1 : 0
 
                 // Load

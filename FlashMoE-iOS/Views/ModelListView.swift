@@ -42,6 +42,7 @@ struct ModelListView: View {
     @AppStorage("thinkBudget") private var thinkBudget: Int = 2048
     @AppStorage("expertPrefetch") private var expertPrefetch: Bool = false
     @AppStorage("fusedExpert") private var fusedExpert: Bool = true
+    @AppStorage("fp16Accumulation") private var fp16Accumulation: Bool = false
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
@@ -208,6 +209,13 @@ struct ModelListView: View {
                 Text(expertPrefetch
                      ? "Cross-layer prefetch: loads next layer's predicted experts during GPU compute. Hides I/O behind execution."
                      : "Disabled — experts loaded on-demand only. No overlap with GPU compute.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("FP16 Accumulation", isOn: $fp16Accumulation)
+                Text(fp16Accumulation
+                     ? "Uses half-precision math in weight matmuls. ~5-10% faster but may reduce output quality."
+                     : "Standard float32 accumulation. Maximum precision.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -451,6 +459,7 @@ struct ModelListView: View {
                     fusedAttention: fusedAttention,
                     expertPrefetch: expertPrefetch,
                     fusedExpert: fusedExpert,
+                    fp16Accumulation: fp16Accumulation,
                     verbose: true
                 )
             } catch {

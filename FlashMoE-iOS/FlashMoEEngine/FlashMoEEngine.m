@@ -406,6 +406,7 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         g_layer_mmap_sizes_global = ctx->layer_mmap_sizes;
         g_expert_prefetch_enabled = config->expert_prefetch;
         g_fused_expert_enabled = config->fused_expert;
+        g_use_fp16_accum = config->fp16_accumulation;
         g_prefetch_active = 0;
         g_prefetch_layer = -1;
         g_prefetch_hits_total = 0;
@@ -630,6 +631,9 @@ void flashmoe_unload(FlashMoEContext *ctx) {
             g_metal->residual_add = nil;
             g_metal->swiglu = nil;
             g_metal->fused_gate_up = nil;
+            g_metal->matvec_v3_fp16 = nil;
+            g_metal->matvec_2bit_fp16 = nil;
+            g_metal->fused_gate_up_fp16 = nil;
             g_metal->attn_scores_pipe = nil;
             g_metal->attn_softmax_pipe = nil;
             g_metal->attn_values_pipe = nil;

@@ -1024,6 +1024,7 @@ static void print_usage(const char *prog) {
     printf("  --no-prefetch        Disable cross-layer expert prefetch (default: ON)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
+    printf("  --fp16               Use half-precision accumulation in dequant kernels (experimental)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
@@ -1066,12 +1067,13 @@ int main(int argc, char **argv) {
             {"predict",       no_argument,       0, 'D'},
             {"no-prefetch",   no_argument,       0, 'X'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"fp16",          no_argument,       0, 'H'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GHh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -1093,6 +1095,7 @@ int main(int argc, char **argv) {
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'X': g_expert_prefetch_enabled = 0; break;
+                case 'H': g_use_fp16_accum = 1; break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {

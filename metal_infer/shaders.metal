@@ -1898,3 +1898,224 @@ kernel void moe_combine_residual(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+
+// ============================================================================
+// FP16 ACCUMULATION VARIANTS — Experimental half-precision inner loops
+// ============================================================================
+// These kernels accumulate dot products in half precision for ~2x ALU throughput
+// on Apple Silicon fp16 units. Output buffers remain float32.
+// Default OFF — toggled via g_use_fp16_accum / --fp16 flag.
+
+// ---- fp16 variant of dequant_matvec_4bit_v3 ----
+kernel void dequant_matvec_4bit_v3_fp16(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_size  [[threads_per_simdgroup]]
+) {
+    uint rows_per_tg = 256 / simd_size;
+    uint row = tgid * rows_per_tg + simd_group;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup half x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    half acc = 0.0h;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        half scale = half(bf16_to_f32(s_row[g]));
+        half bias  = half(bf16_to_f32(b_row[g]));
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        half sx0 = scale * x_shared[x_base + 0];  half bx0 = bias * x_shared[x_base + 0];
+        half sx1 = scale * x_shared[x_base + 1];  half bx1 = bias * x_shared[x_base + 1];
+        half sx2 = scale * x_shared[x_base + 2];  half bx2 = bias * x_shared[x_base + 2];
+        half sx3 = scale * x_shared[x_base + 3];  half bx3 = bias * x_shared[x_base + 3];
+        half sx4 = scale * x_shared[x_base + 4];  half bx4 = bias * x_shared[x_base + 4];
+        half sx5 = scale * x_shared[x_base + 5];  half bx5 = bias * x_shared[x_base + 5];
+        half sx6 = scale * x_shared[x_base + 6];  half bx6 = bias * x_shared[x_base + 6];
+        half sx7 = scale * x_shared[x_base + 7];  half bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(half((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(half((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(half((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(half((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(half((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(half((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(half((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(half((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    // Promote to float for SIMD reduction and output write
+    float sum = float(simd_sum(acc));
+
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ---- fp16 variant of dequant_matvec_2bit ----
+kernel void dequant_matvec_2bit_fp16(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_size  [[threads_per_simdgroup]]
+) {
+    uint row = tgid * (256 / simd_size) + simd_group;
+    uint packed_cols = in_dim / 16;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup half x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    half acc = 0.0h;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 16);
+        half scale = half(bf16_to_f32(s_row[g]));
+        half bias  = half(bf16_to_f32(b_row[g]));
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 16;
+
+        half sx0  = scale * x_shared[x_base +  0];  half bx0  = bias * x_shared[x_base +  0];
+        half sx1  = scale * x_shared[x_base +  1];  half bx1  = bias * x_shared[x_base +  1];
+        half sx2  = scale * x_shared[x_base +  2];  half bx2  = bias * x_shared[x_base +  2];
+        half sx3  = scale * x_shared[x_base +  3];  half bx3  = bias * x_shared[x_base +  3];
+        half sx4  = scale * x_shared[x_base +  4];  half bx4  = bias * x_shared[x_base +  4];
+        half sx5  = scale * x_shared[x_base +  5];  half bx5  = bias * x_shared[x_base +  5];
+        half sx6  = scale * x_shared[x_base +  6];  half bx6  = bias * x_shared[x_base +  6];
+        half sx7  = scale * x_shared[x_base +  7];  half bx7  = bias * x_shared[x_base +  7];
+        half sx8  = scale * x_shared[x_base +  8];  half bx8  = bias * x_shared[x_base +  8];
+        half sx9  = scale * x_shared[x_base +  9];  half bx9  = bias * x_shared[x_base +  9];
+        half sx10 = scale * x_shared[x_base + 10];  half bx10 = bias * x_shared[x_base + 10];
+        half sx11 = scale * x_shared[x_base + 11];  half bx11 = bias * x_shared[x_base + 11];
+        half sx12 = scale * x_shared[x_base + 12];  half bx12 = bias * x_shared[x_base + 12];
+        half sx13 = scale * x_shared[x_base + 13];  half bx13 = bias * x_shared[x_base + 13];
+        half sx14 = scale * x_shared[x_base + 14];  half bx14 = bias * x_shared[x_base + 14];
+        half sx15 = scale * x_shared[x_base + 15];  half bx15 = bias * x_shared[x_base + 15];
+
+        acc += fma(half((packed >>  0) & 0x3), sx0,  bx0);
+        acc += fma(half((packed >>  2) & 0x3), sx1,  bx1);
+        acc += fma(half((packed >>  4) & 0x3), sx2,  bx2);
+        acc += fma(half((packed >>  6) & 0x3), sx3,  bx3);
+        acc += fma(half((packed >>  8) & 0x3), sx4,  bx4);
+        acc += fma(half((packed >> 10) & 0x3), sx5,  bx5);
+        acc += fma(half((packed >> 12) & 0x3), sx6,  bx6);
+        acc += fma(half((packed >> 14) & 0x3), sx7,  bx7);
+        acc += fma(half((packed >> 16) & 0x3), sx8,  bx8);
+        acc += fma(half((packed >> 18) & 0x3), sx9,  bx9);
+        acc += fma(half((packed >> 20) & 0x3), sx10, bx10);
+        acc += fma(half((packed >> 22) & 0x3), sx11, bx11);
+        acc += fma(half((packed >> 24) & 0x3), sx12, bx12);
+        acc += fma(half((packed >> 26) & 0x3), sx13, bx13);
+        acc += fma(half((packed >> 28) & 0x3), sx14, bx14);
+        acc += fma(half((packed >> 30) & 0x3), sx15, bx15);
+    }
+
+    float sum = float(simd_sum(acc));
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ---- fp16 variant of fused_gate_up_swiglu ----
+// NOTE: Only dot product accumulation is fp16. SiLU activation stays float32
+// to avoid exp() overflow in half precision.
+kernel void fused_gate_up_swiglu_fp16(
+    device const uint32_t* gate_W    [[buffer(0)]],
+    device const uint16_t* gate_s    [[buffer(1)]],
+    device const uint16_t* gate_b    [[buffer(2)]],
+    device const uint32_t* up_W      [[buffer(3)]],
+    device const uint16_t* up_s      [[buffer(4)]],
+    device const uint16_t* up_b      [[buffer(5)]],
+    device const float*    x         [[buffer(6)]],
+    device float*          out       [[buffer(7)]],
+    constant uint&         out_dim   [[buffer(8)]],
+    constant uint&         in_dim    [[buffer(9)]],
+    constant uint&         group_size [[buffer(10)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_size  [[threads_per_simdgroup]]
+) {
+    if (tgid >= out_dim) return;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* gr = gate_W + tgid * packed_cols;
+    device const uint16_t* gs = gate_s + tgid * num_groups;
+    device const uint16_t* gb = gate_b + tgid * num_groups;
+    device const uint32_t* ur = up_W   + tgid * packed_cols;
+    device const uint16_t* us = up_s   + tgid * num_groups;
+    device const uint16_t* ub = up_b   + tgid * num_groups;
+    half ga = 0.0h, ua = 0.0h;
+    for (uint g = lid; g < num_groups; g += tg_size) {
+        half gsc = half(bf16_to_f32(gs[g])), gbi = half(bf16_to_f32(gb[g]));
+        half usc = half(bf16_to_f32(us[g])), ubi = half(bf16_to_f32(ub[g]));
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t gp = gr[bp+p], up = ur[bp+p];
+            for (uint i = 0; i < 8; i++) {
+                half xv = half(x[bx + p*8 + i]);
+                ga += (half((gp>>(i*4))&0xF)*gsc+gbi)*xv;
+                ua += (half((up>>(i*4))&0xF)*usc+ubi)*xv;
+            }
+        }
+    }
+    // Reduction using dynamic SIMD width
+    uint num_simd_groups = tg_size / simd_size;
+    threadgroup float sg[32], su[32];
+    // Promote to float for reduction — SiLU MUST be computed in float32
+    float rg = float(simd_sum(ga)), ru = float(simd_sum(ua));
+    if (simd_lane == 0) { sg[simd_group] = rg; su[simd_group] = ru; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float vg = simd_sum(sg[simd_lane]), vu = simd_sum(su[simd_lane]);
+        // SiLU activation in float32 to avoid exp() overflow in half
+        if (simd_lane == 0) out[tgid] = (vg / (1.0f + exp(-vg))) * vu;
+    }
+}
