@@ -555,12 +555,39 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
             fprintf(stderr, "WARNING: Cannot wrap weight file (%.2f GB) — CPU fallback\n", size / 1e9);
         }
     } else {
-        // >4GB: too large for Metal buffers on memory-constrained devices.
-        // CPU fallback for non-expert matmuls. The mmap is still used — just no Metal wrapper.
-        // All guards (g_metal->wf_buf, wf_num_chunks > 0) will route to CPU path.
-        printf("[metal] Weight file %.2f GB exceeds 4GB Metal buffer limit.\n", size / 1e9);
-        printf("[metal]   wf_buf=%s wf_num_chunks=%d — CPU fallback for non-expert matmuls.\n",
-               ctx->wf_buf ? "SET" : "nil", ctx->wf_num_chunks);
+        // >4GB: split into two Metal buffers at the page boundary nearest the midpoint.
+        // Each chunk must be < 4GB. The split point aligns to page_size.
+        size_t half = (size / 2) & ~(page_size - 1);  // page-aligned midpoint
+        size_t size0 = half;
+        size_t size1_raw = size - half;
+        size_t size1 = (size1_raw + page_size - 1) & ~(page_size - 1);
+
+        printf("[metal] Weight file %.2f GB — splitting into 2 Metal buffers: %.2f + %.2f GB\n",
+               size / 1e9, size0 / 1e9, size1_raw / 1e9);
+
+        ctx->wf_chunks[0] = [ctx->device newBufferWithBytesNoCopy:data
+                                                           length:size0
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+        ctx->wf_chunks[1] = [ctx->device newBufferWithBytesNoCopy:(char *)data + half
+                                                           length:size1
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+
+        if (ctx->wf_chunks[0] && ctx->wf_chunks[1]) {
+            ctx->wf_buf = ctx->wf_chunks[0];  // primary buffer (for guards)
+            ctx->wf_chunk_offsets[0] = 0;
+            ctx->wf_chunk_sizes[0] = size0;
+            ctx->wf_chunk_offsets[1] = half;
+            ctx->wf_chunk_sizes[1] = size1;
+            ctx->wf_num_chunks = 2;
+            printf("[metal] Split weight buffers created: chunk0=%.2f GB, chunk1=%.2f GB\n",
+                   size0 / 1e9, size1_raw / 1e9);
+        } else {
+            fprintf(stderr, "WARNING: Cannot create split Metal buffers (%.2f GB) — CPU fallback\n", size / 1e9);
+            ctx->wf_chunks[0] = nil;
+            ctx->wf_chunks[1] = nil;
+        }
     }
     printf("[metal] metal_set_weights done: wf_buf=%s wf_num_chunks=%d\n",
            ctx->wf_buf ? "SET" : "nil", ctx->wf_num_chunks);

@@ -1226,9 +1226,14 @@ int flashmoe_validate_model(const char *model_path) {
     snprintf(path, sizeof(path), "%s/config.json", model_path);
     if (access(path, R_OK) != 0) return -1;
 
-    // Check model_weights.bin
+    // Check model_weights.bin (or split: model_weights_0.bin + model_weights_1.bin)
     snprintf(path, sizeof(path), "%s/model_weights.bin", model_path);
-    if (access(path, R_OK) != 0) return -1;
+    if (access(path, R_OK) != 0) {
+        char path0[1024], path1[1024];
+        snprintf(path0, sizeof(path0), "%s/model_weights_0.bin", model_path);
+        snprintf(path1, sizeof(path1), "%s/model_weights_1.bin", model_path);
+        if (access(path0, R_OK) != 0 || access(path1, R_OK) != 0) return -1;
+    }
 
     // Check model_weights.json
     snprintf(path, sizeof(path), "%s/model_weights.json", model_path);
