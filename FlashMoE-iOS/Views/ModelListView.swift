@@ -49,6 +49,8 @@ struct ModelListView: View {
     @State private var pendingImportURL: URL? = nil
     @State private var importProgress: String? = nil
     @State private var modelToDelete: LocalModel? = nil
+    @State private var customRepoURL: String = ""
+    @State private var showCustomURLError: String? = nil
     private let downloadManager = DownloadManager.shared
 
     var body: some View {
@@ -105,6 +107,34 @@ struct ModelListView: View {
                             }
                     }
                 }
+            }
+
+            // Custom URL download
+            Section("Add Model from URL") {
+                HStack {
+                    TextField("HuggingFace repo (user/model)", text: $customRepoURL)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                        #endif
+                    Button {
+                        startCustomDownload()
+                    } label: {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.title3)
+                    }
+                    .disabled(customRepoURL.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                if let error = showCustomURLError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                Text("Enter a HuggingFace repo ID (e.g. alexintosh/Qwen3.5-35B-A3B-Q4-FlashMoE) or full URL.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             // Download section
@@ -425,6 +455,118 @@ struct ModelListView: View {
                 )
             } catch {
                 // Error state is set by the engine
+            }
+        }
+    }
+
+    // MARK: - Custom URL Download
+
+    private func startCustomDownload() {
+        showCustomURLError = nil
+        var input = customRepoURL.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Accept full URLs or repo IDs
+        // https://huggingface.co/user/repo → user/repo
+        if input.hasPrefix("https://huggingface.co/") {
+            input = String(input.dropFirst("https://huggingface.co/".count))
+        }
+        if input.hasPrefix("http://huggingface.co/") {
+            input = String(input.dropFirst("http://huggingface.co/".count))
+        }
+        // Remove trailing slashes and tree/main suffix
+        input = input.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if input.hasSuffix("/tree/main") {
+            input = String(input.dropLast("/tree/main".count))
+        }
+
+        let parts = input.split(separator: "/")
+        guard parts.count >= 2 else {
+            showCustomURLError = "Invalid format. Use 'user/model' or a HuggingFace URL."
+            return
+        }
+        let repoId = "\(parts[0])/\(parts[1])"
+        let modelName = String(parts[1])
+
+        // Query HuggingFace API for file list
+        let apiURL = URL(string: "https://huggingface.co/api/models/\(repoId)")!
+        Task {
+            do {
+                let (data, response) = try await URLSession.shared.data(from: apiURL)
+                guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                    await MainActor.run { showCustomURLError = "Repository not found: \(repoId)" }
+                    return
+                }
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let siblings = json["siblings"] as? [[String: Any]] else {
+                    await MainActor.run { showCustomURLError = "Failed to parse repository metadata." }
+                    return
+                }
+
+                var files: [RepoFile] = []
+                var totalSize: UInt64 = 0
+                var expertLayers = 0
+
+                for sibling in siblings {
+                    guard let filename = sibling["rfilename"] as? String else { continue }
+                    // Skip README, .gitattributes, etc.
+                    let lower = filename.lowercased()
+                    if lower.hasSuffix(".md") || lower.hasSuffix(".gitattributes") || lower.hasPrefix(".") { continue }
+
+                    // Get file size from LFS info or default to 0
+                    let size: UInt64
+                    if let lfs = sibling["lfs"] as? [String: Any], let s = lfs["size"] as? UInt64 {
+                        size = s
+                    } else if let s = sibling["size"] as? UInt64 {
+                        size = s
+                    } else {
+                        size = 0
+                    }
+
+                    files.append(RepoFile(filename: filename, sizeBytes: size))
+                    totalSize += size
+
+                    if filename.contains("packed_experts") && filename.hasSuffix(".bin") && filename.contains("layer_") {
+                        expertLayers += 1
+                    }
+                }
+
+                guard !files.isEmpty else {
+                    await MainActor.run { showCustomURLError = "No files found in repository." }
+                    return
+                }
+
+                // Check for required files
+                let hasConfig = files.contains { $0.filename == "config.json" }
+                let hasWeights = files.contains { $0.filename == "model_weights.bin" }
+                    || files.contains { $0.filename == "model_weights_0.bin" }
+                guard hasConfig && hasWeights else {
+                    await MainActor.run {
+                        showCustomURLError = "Not a Flash-MoE model (missing config.json or model_weights.bin)."
+                    }
+                    return
+                }
+
+                let entry = CatalogEntry(
+                    id: "custom-\(modelName.lowercased())",
+                    displayName: modelName,
+                    repoId: repoId,
+                    description: "Custom model from \(repoId)",
+                    totalSizeBytes: totalSize,
+                    quantization: "unknown",
+                    expertLayers: expertLayers,
+                    defaultK: 0,
+                    recommendedK: 0,
+                    minRAMGB: 0,
+                    files: files
+                )
+
+                await MainActor.run {
+                    customRepoURL = ""
+                    showCustomURLError = nil
+                    downloadManager.startDownload(entry: entry)
+                }
+            } catch {
+                await MainActor.run { showCustomURLError = "Network error: \(error.localizedDescription)" }
             }
         }
     }
