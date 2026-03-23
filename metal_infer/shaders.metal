@@ -245,8 +245,10 @@ kernel void fused_gate_up_swiglu(
 //   - Each thread processes 1024/32 = 32 input elements = 4 uint32 packed words
 //     = 1 uint4 load per thread per row
 
-// Number of output rows per threadgroup = number of SIMD groups (256/32 = 8)
-#define ROWS_PER_TG 8
+// Number of output rows per threadgroup = number of SIMD groups.
+// On current Apple Silicon SIMD width is always 32, so 256/32 = 8.
+// Using [[threads_per_simdgroup]] for future-proofing.
+#define ROWS_PER_TG 8  // compile-time default for array sizing
 
 kernel void dequant_matvec_4bit_v3(
     device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
@@ -260,10 +262,12 @@ kernel void dequant_matvec_4bit_v3(
     uint tgid   [[threadgroup_position_in_grid]],     // which tile of rows
     uint lid    [[thread_position_in_threadgroup]],    // 0..255
     uint simd_lane  [[thread_index_in_simdgroup]],    // 0..31
-    uint simd_group [[simdgroup_index_in_threadgroup]] // 0..7
+    uint simd_group [[simdgroup_index_in_threadgroup]], // 0..7
+    uint simd_size  [[threads_per_simdgroup]]          // 32 on Apple Silicon
 ) {
-    // Which output row this SIMD group handles
-    uint row = tgid * ROWS_PER_TG + simd_group;
+    // Which output row this SIMD group handles (dynamic SIMD width)
+    uint rows_per_tg = 256 / simd_size;
+    uint row = tgid * rows_per_tg + simd_group;
 
     uint packed_cols = in_dim / 8;      // uint32 columns per row
     uint num_groups  = in_dim / group_size;
@@ -439,9 +443,10 @@ kernel void dequant_matvec_2bit(
     uint tgid       [[threadgroup_position_in_grid]],
     uint lid        [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_size  [[threads_per_simdgroup]]
 ) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint row = tgid * (256 / simd_size) + simd_group;
     uint packed_cols = in_dim / 16;  // 16 values per uint32 for 2-bit
     uint num_groups  = in_dim / group_size;
 
@@ -543,9 +548,10 @@ kernel void dequant_matvec_4bit_v4(
     uint tgid   [[threadgroup_position_in_grid]],
     uint lid    [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_size  [[threads_per_simdgroup]]
 ) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint row = tgid * (256 / simd_size) + simd_group;
 
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
@@ -636,12 +642,13 @@ kernel void dequant_matvec_4bit_batched(
     uint tgid_flat [[threadgroup_position_in_grid]],  // linearized (row_tile + expert * num_row_tiles)
     uint lid       [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_size  [[threads_per_simdgroup]]
 ) {
     // De-linearize: tgid_flat = row_tile + expert_k * num_row_tiles
     uint expert_k = tgid_flat / num_row_tiles;
     uint row_tile = tgid_flat % num_row_tiles;
-    uint row = row_tile * ROWS_PER_TG + simd_group;
+    uint row = row_tile * (256 / simd_size) + simd_group;
     if (row >= out_dim) return;
 
     uint packed_cols = in_dim / 8;
