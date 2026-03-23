@@ -1671,7 +1671,8 @@ static void fused_layer_forward(
         // can be encoded directly into CMD1, eliminating one commit+wait cycle.
         // buf_moe_hidden (from CMD3(N-1)) is used as the residual source on GPU —
         // serial queue ordering guarantees CMD3(N-1) completes before CMD1 starts.
-        if (gpu_linear_attn && g_metal->wf_buf &&
+        // TODO: CMD1+CMD2 merge needs validation — disabled until verified
+        if (0 && gpu_linear_attn && g_metal->wf_buf &&
             lc->gate_w && lc->gate_s && lc->gate_b &&
             lc->sg_w && lc->sg_s && lc->sg_b &&
             lc->su_w && lc->su_s && lc->su_b &&
