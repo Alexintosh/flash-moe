@@ -4740,6 +4740,7 @@ static int s_spec_indices[MAX_K];         // speculative routing predicted exper
 static int s_spec_count = 0;              // number of speculative predictions this layer
 static float *s_shared_gate = NULL; // [cfg.shared_intermediate]
 static float *s_shared_up  = NULL;  // [cfg.shared_intermediate]
+static float g_merged_shared_gate_score = 0.0f; // CMD1+CMD2 merge: carries shared gate score
 static float *s_moe_out   = NULL;   // [cfg.hidden_dim]
 static float *s_shared_out = NULL;  // [cfg.hidden_dim]
 // Full attention scratch
@@ -4875,6 +4876,7 @@ static void fused_layer_forward(
     // If so, buf_input already contains the normalized input for this layer's CMD1.
     // We can submit CMD1 immediately — the GPU queue serializes CMD3(N-1) then CMD1(N).
     int prev_gpu_combined = (g_deferred.active && g_deferred.gpu_combined);
+    int cmd1_cmd2_merged = 0;  // set to 1 when CMD2 is encoded into CMD1 (linear attn only)
 
     if (prev_gpu_combined && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
         // ---- FAST PATH: GPU-combined previous CMD3 ----
@@ -4988,6 +4990,117 @@ static void fused_layer_forward(
             gpu_linear_attn = 1;
         }
 
+        // ---- CMD1+CMD2 merge for linear attention layers ----
+        // When gpu_linear_attn is active, CMD2 (o_proj + residual + norm + routing)
+        // can be encoded directly into CMD1, eliminating one commit+wait cycle.
+        // buf_moe_hidden (from CMD3(N-1)) is used as the residual source on GPU —
+        // serial queue ordering guarantees CMD3(N-1) completes before CMD1 starts.
+        if (gpu_linear_attn && g_metal->wf_buf &&
+            lc->gate_w && lc->gate_s && lc->gate_b &&
+            lc->sg_w && lc->sg_s && lc->sg_b &&
+            lc->su_w && lc->su_s && lc->su_b &&
+            lc->seg_w && lc->seg_s && lc->seg_b &&
+            g_metal->residual_add && g_metal->rms_norm_sum &&
+            g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w &&
+            g_deferred.gpu_combined && g_metal->buf_moe_hidden) {
+            // batch_out[6] already has the result from CMD1 gated_rms_norm.
+            // buf_moe_hidden has the pre-attention hidden state (residual) from CMD3(N-1).
+
+            // ---- o_proj matvec into cmd1 ----
+            // For linear attention: out_proj (not o_proj), in_dim = total_value
+            {
+                uint32_t o_out_dim = cfg.hidden_dim;
+                uint32_t o_in_dim = (uint32_t)cfg.linear_total_value;
+                uint32_t o_gs = cfg.group_size;
+                id<MTLBuffer> ow_buf, os_buf, ob_buf;
+                NSUInteger ow_off, os_off, ob_off;
+                size_t m_oproj_w_size = (size_t)o_out_dim * o_in_dim / 8;
+                size_t m_oproj_ng = (o_in_dim + o_gs - 1) / o_gs;
+                size_t m_oproj_sb_size = (size_t)o_out_dim * m_oproj_ng * sizeof(uint16_t);
+                metal_staging_reset(g_metal);
+                metal_find_chunk_sized(g_metal, lc->out_proj_w, m_oproj_w_size, &ow_buf, &ow_off);
+                metal_find_chunk_sized(g_metal, lc->out_proj_s, m_oproj_sb_size, &os_buf, &os_off);
+                metal_find_chunk_sized(g_metal, lc->out_proj_b, m_oproj_sb_size, &ob_buf, &ob_off);
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->matvec_fast];
+                [enc setBuffer:ow_buf offset:ow_off atIndex:0];
+                [enc setBuffer:os_buf offset:os_off atIndex:1];
+                [enc setBuffer:ob_buf offset:ob_off atIndex:2];
+                [enc setBuffer:g_metal->batch_out[6] offset:0 atIndex:3];
+                [enc setBuffer:g_metal->buf_output   offset:0 atIndex:4];
+                [enc setBytes:&o_out_dim  length:4 atIndex:5];
+                [enc setBytes:&o_in_dim   length:4 atIndex:6];
+                [enc setBytes:&o_gs       length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+            }
+            // ---- residual_add (buf_output + buf_moe_hidden -> buf_h_mid) ----
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                uint32_t dim = cfg.hidden_dim;
+                [enc setComputePipelineState:g_metal->residual_add];
+                [enc setBuffer:g_metal->buf_moe_hidden offset:0 atIndex:0]; // residual from CMD3(N-1)
+                [enc setBuffer:g_metal->buf_output     offset:0 atIndex:1]; // o_proj result
+                [enc setBuffer:g_metal->buf_h_mid      offset:0 atIndex:2]; // out
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // ---- rms_norm_sum_sq (buf_h_mid -> buf_sum_sq) ----
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                uint32_t dim = cfg.hidden_dim;
+                [enc setComputePipelineState:g_metal->rms_norm_sum];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // ---- rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                id<MTLBuffer> panw_buf; NSUInteger panw_off;
+                metal_find_chunk_sized(g_metal, lc->post_attn_norm_w,
+                    (size_t)cfg.hidden_dim * 2, &panw_buf, &panw_off);
+                uint32_t dim = cfg.hidden_dim;
+                float eps = cfg.rms_norm_eps;
+                [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];
+                [enc setBuffer:panw_buf offset:panw_off atIndex:1];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];
+                [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                uint32_t tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            // ---- routing + shared expert projections (using lc-> pointers directly) ----
+            // Output buffers: allocate on stack for gpu_flush_batch_results
+            float *m_gate_scores = s_gate_scores;
+            memset(m_gate_scores, 0, cfg.num_experts * sizeof(float));
+            float *m_shared_gate = s_shared_gate;
+            memset(m_shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+            float *m_shared_up = s_shared_up;
+            memset(m_shared_up, 0, cfg.shared_intermediate * sizeof(float));
+            float m_shared_gate_score = 0.0f;
+            BatchMatvecSpec moe_specs_merged[4] = {
+                { lc->gate_w, lc->gate_s, lc->gate_b, m_gate_scores,      (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                { lc->sg_w,   lc->sg_s,   lc->sg_b,   m_shared_gate,      (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                { lc->su_w,   lc->su_s,   lc->su_b,   m_shared_up,        (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                { lc->seg_w,  lc->seg_s,  lc->seg_b,  &m_shared_gate_score, 1,                              cfg.hidden_dim, cfg.group_size, 3 },
+            };
+            gpu_encode_batch_matvec(g_metal, cmd1, moe_specs_merged, 4);
+
+            cmd1_cmd2_merged = 1;
+        }
+
         [cmd1 commit];
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
@@ -4998,11 +5111,37 @@ static void fused_layer_forward(
         if (!gpu_linear_attn) {
             gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
         }
+        if (cmd1_cmd2_merged) {
+            // Read back merged CMD2 results: routing scores + shared expert outputs.
+            // The output pointers in moe_specs_merged point to s_gate_scores, s_shared_gate, etc.
+            // which are the same static arrays that gate_scores/shared_gate/etc. will alias later.
+            // gpu_flush reads GPU batch_out[0..3] → those CPU arrays.
+            float m_sgs = 0.0f;
+            BatchMatvecSpec moe_rb[4] = {
+                { NULL, NULL, NULL, s_gate_scores,   (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                { NULL, NULL, NULL, s_shared_gate,   (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                { NULL, NULL, NULL, s_shared_up,     (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                { NULL, NULL, NULL, &m_sgs,            1,                              cfg.hidden_dim, cfg.group_size, 3 },
+            };
+            gpu_flush_batch_results(g_metal, moe_rb, 4);
+            g_merged_shared_gate_score = m_sgs;
+            // Read h_mid and h_post from GPU
+            memcpy(s_h_mid, [g_metal->buf_h_mid contents], cfg.hidden_dim * sizeof(float));
+            memcpy(s_h_post, [g_metal->buf_input contents], cfg.hidden_dim * sizeof(float));
+            memcpy(hidden, s_h_mid, cfg.hidden_dim * sizeof(float));
+        }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
 
         // Now CMD3(N-1) is done. Read back hidden state from GPU.
         if (g_timing_enabled) { t0 = now_ms(); }
-        finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+        if (!cmd1_cmd2_merged) {
+            finalize_deferred_experts();  // reads buf_moe_hidden -> hidden
+        } else {
+            // Merged path: hidden already set from buf_h_mid above.
+            // Clear deferred state so CMD3(N) can proceed.
+            g_deferred.active = 0;
+            g_deferred.cmd_experts = nil;
+        }
 
         // Start predicted expert preads AFTER CMD1_wait.
         // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
@@ -5016,8 +5155,10 @@ static void fused_layer_forward(
                               layer_idx);
             pred_started = 1;
         }
-        // Set up residual for CMD2 (residual = hidden before this layer's attention)
-        cpu_vec_copy(residual, hidden, cfg.hidden_dim);
+        if (!cmd1_cmd2_merged) {
+            // Set up residual for CMD2 (residual = hidden before this layer's attention)
+            cpu_vec_copy(residual, hidden, cfg.hidden_dim);
+        }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
 
         // No input_norm needed — CMD3 already computed it into buf_input.
@@ -5588,12 +5729,18 @@ static void fused_layer_forward(
     float *h_post = s_h_post;
     float *h_mid = s_h_mid;
     float *gate_scores = s_gate_scores;
-    memset(gate_scores, 0, cfg.num_experts * sizeof(float));
     float *shared_gate = s_shared_gate;
-    memset(shared_gate, 0, cfg.shared_intermediate * sizeof(float));
     float *shared_up = s_shared_up;
-    memset(shared_up, 0, cfg.shared_intermediate * sizeof(float));
-    float shared_gate_score = 0.0f;
+    float shared_gate_score;
+    if (cmd1_cmd2_merged) {
+        // Merged path: results already in s_* arrays from gpu_flush in CMD1 readback
+        shared_gate_score = g_merged_shared_gate_score;
+    } else {
+        memset(gate_scores, 0, cfg.num_experts * sizeof(float));
+        memset(shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+        memset(shared_up, 0, cfg.shared_intermediate * sizeof(float));
+        shared_gate_score = 0.0f;
+    }
 
     int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
                             suw && sus && sub && seg_w && seg_s && seg_b);
@@ -5604,7 +5751,8 @@ static void fused_layer_forward(
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
-    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
+    if (!cmd1_cmd2_merged &&
+        (attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
         g_metal && g_metal->wf_buf && have_moe_weights &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
