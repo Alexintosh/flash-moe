@@ -87,31 +87,8 @@ enum ModelCatalog {
             files: makeTieredFileList()
         ),
 
-        // -- Qwen 3.5 397B-A17B 4-bit (the big one) --
-        CatalogEntry(
-            id: "qwen3.5-397b-a17b-q4",
-            displayName: "Qwen 3.5 397B-A17B",
-            repoId: "alexintosh/Qwen3.5-397B-A17B-Q4-FlashMoE",
-            description: "397B parameter MoE — the largest model runnable on a phone. Uses K-reduction (K=4 instead of K=10) to fit in 12GB. Needs 256GB+ storage.",
-            totalSizeBytes: 208_000_000_000,
-            quantization: "4-bit",
-            expertLayers: 60,
-            defaultK: 10,
-            recommendedK: 4,   // K=4 cuts I/O by 60%, fits in 12GB iPhone
-            minRAMGB: 12,
-            files: makeFileList(
-                configFiles: [
-                    ("config.json", 3_809),
-                    ("model_weights.json", 371_000),
-                    ("model_weights.bin", 5_520_000_000),
-                    ("vocab.bin", 3_360_287),
-                    ("tokenizer.json", 19_989_343),
-                    ("tokenizer.bin", 8_201_040),
-                ],
-                expertLayers: 60,
-                expertLayerSize: 3_375_000_000  // ~3.4 GB per layer (512 experts × 7MB)
-            )
-        ),
+        // 397B entry removed — repo not published yet. Re-add when
+        // alexintosh/Qwen3.5-397B-A17B-Q4-FlashMoE is on HuggingFace.
     ]
 
     // MARK: - Helpers
