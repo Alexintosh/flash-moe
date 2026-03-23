@@ -1148,6 +1148,283 @@ kernel void sigmoid_gate(
 
 
 // ============================================================================
+// Kernel 9b: Fused online softmax attention — single kernel replaces
+// attn_scores + attn_softmax + attn_values for full-attention layers
+// ============================================================================
+//
+// FlashAttention-style online softmax: iterate over KV positions in blocks,
+// maintaining running max and sum for numerically stable softmax without
+// materializing the full scores matrix.
+//
+// One threadgroup per query head. 256 threads per threadgroup.
+// Supports GQA: multiple query heads share one KV head.
+// Supports both float32 and FP8 E4M3 KV caches (controlled by use_fp8 param).
+//
+// Algorithm per head:
+//   m = -inf, l = 0, O = 0
+//   For each block of BLOCK_SIZE=32 KV positions:
+//     Compute QK dot products via shared memory + SIMD reduction
+//     Update online softmax: m_new = max(m, block_max)
+//     Rescale: O *= exp(m_old - m_new) * (l_old / l_new)
+//     Accumulate: O += softmax_weight * V[pos]
+//   Output O (already normalized)
+
+#define FUSED_ATTN_BLOCK_SIZE 32
+
+kernel void fused_attention_online(
+    device const float* Q          [[buffer(0)]],   // [num_heads, head_dim]
+    device const float* K_cache    [[buffer(1)]],   // [max_seq, kv_dim] float32
+    device const float* V_cache    [[buffer(2)]],   // [max_seq, kv_dim] float32
+    device float*       out        [[buffer(3)]],   // [num_heads, head_dim]
+    constant uint&      head_dim   [[buffer(4)]],   // 128 or 256
+    constant uint&      kv_dim     [[buffer(5)]],   // num_kv_heads * head_dim
+    constant uint&      seq_len    [[buffer(6)]],   // current sequence length
+    constant uint&      num_heads  [[buffer(7)]],   // total query heads
+    constant uint&      num_kv_heads [[buffer(8)]], // KV heads (GQA)
+    constant float&     scale      [[buffer(9)]],   // 1/sqrt(head_dim)
+    uint tgid  [[threadgroup_position_in_grid]],    // head index
+    uint lid   [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= num_heads) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_h = tgid / heads_per_kv;
+
+    // Pointer to this head's query vector
+    device const float* qh = Q + tgid * head_dim;
+
+    // Online softmax state: running max, running sum, output accumulator
+    // Each thread maintains its portion of the head_dim-dimensional output
+    float m_prev = -1e30f;  // running max of QK scores
+    float l_prev = 0.0f;    // running sum of exp(score - m)
+
+    // Each thread accumulates its slice of the output vector
+    // Thread lid handles dimensions lid, lid+tg_size, lid+2*tg_size, ...
+    // We use registers — head_dim is 128 or 256, with 256 threads we get 1 element each
+    // For head_dim=128 with 256 threads, half the threads are idle for V accumulation
+    float o_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // max 4 dims per thread (head_dim<=1024)
+
+    // Shared memory for QK dot product reduction
+    threadgroup float shared_qk[FUSED_ATTN_BLOCK_SIZE];
+    // Shared memory for SIMD reduction of dot products
+    threadgroup float simd_scratch[32];
+
+    // Process KV positions in blocks
+    for (uint block_start = 0; block_start < seq_len; block_start += FUSED_ATTN_BLOCK_SIZE) {
+        uint block_end = min(block_start + FUSED_ATTN_BLOCK_SIZE, seq_len);
+        uint block_len = block_end - block_start;
+
+        // Phase 1: Compute QK dot products for this block
+        // Each position in the block gets a dot product computed by all threads
+        float block_scores[FUSED_ATTN_BLOCK_SIZE];
+        float block_max = -1e30f;
+
+        for (uint b = 0; b < block_len; b++) {
+            uint pos = block_start + b;
+            device const float* kp = K_cache + pos * kv_dim + kv_h * head_dim;
+
+            // Parallel dot product: each thread handles a stride of head_dim
+            float dot = 0.0f;
+            for (uint d = lid; d < head_dim; d += tg_size) {
+                dot += qh[d] * kp[d];
+            }
+
+            // SIMD reduction within each simd_group
+            float simd_val = simd_sum(dot);
+            uint simd_lane = lid % 32;
+            uint simd_group = lid / 32;
+            uint num_simd_groups = (tg_size + 31) / 32;
+            if (simd_lane == 0) simd_scratch[simd_group] = simd_val;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Final reduction across simd_groups
+            float total = 0.0f;
+            if (lid < num_simd_groups) {
+                total = simd_sum(simd_scratch[lid]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid == 0) {
+                shared_qk[b] = total * scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float s = shared_qk[b];
+            block_scores[b] = s;
+            block_max = max(block_max, s);
+        }
+
+        // Phase 2: Online softmax update
+        // m_new = max(m_prev, block_max)
+        float m_new = max(m_prev, block_max);
+
+        // Rescale previous accumulator: O *= exp(m_prev - m_new)
+        // and track the correction factor for l
+        float correction = exp(m_prev - m_new);
+
+        // Compute new partial sum for this block
+        float block_sum = 0.0f;
+        float block_weights[FUSED_ATTN_BLOCK_SIZE];
+        for (uint b = 0; b < block_len; b++) {
+            float w = exp(block_scores[b] - m_new);
+            block_weights[b] = w;
+            block_sum += w;
+        }
+
+        // Update running sum: l_new = l_prev * correction + block_sum
+        float l_new = l_prev * correction + block_sum;
+
+        // Rescale previous output accumulator
+        float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
+        float new_scale = 1.0f / l_new;
+
+        // Phase 3: Accumulate V contributions for this block
+        for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
+            uint d = lid + dim_idx * tg_size;
+            if (d >= head_dim) break;
+
+            // Rescale previous accumulator
+            float o_val = o_acc[dim_idx] * rescale;
+
+            // Add new V contributions
+            for (uint b = 0; b < block_len; b++) {
+                uint pos = block_start + b;
+                float v_val = V_cache[pos * kv_dim + kv_h * head_dim + d];
+                o_val += block_weights[b] * new_scale * v_val;
+            }
+            o_acc[dim_idx] = o_val;
+        }
+
+        m_prev = m_new;
+        l_prev = l_new;
+    }
+
+    // Write output — each thread writes its dimensions
+    for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
+        uint d = lid + dim_idx * tg_size;
+        if (d >= head_dim) break;
+        out[tgid * head_dim + d] = o_acc[dim_idx];
+    }
+}
+
+
+// ============================================================================
+// Kernel 9c: Fused online softmax attention — FP8 E4M3 KV cache variant
+// ============================================================================
+
+kernel void fused_attention_online_fp8(
+    device const float* Q              [[buffer(0)]],   // [num_heads, head_dim]
+    device const uchar* K_cache_fp8    [[buffer(1)]],   // [max_seq, kv_dim] uint8
+    device const float* K_scales       [[buffer(2)]],   // [max_seq] per-pos scale
+    device const uchar* V_cache_fp8    [[buffer(3)]],   // [max_seq, kv_dim] uint8
+    device const float* V_scales       [[buffer(4)]],   // [max_seq] per-pos scale
+    device float*       out            [[buffer(5)]],   // [num_heads, head_dim]
+    constant uint&      head_dim       [[buffer(6)]],
+    constant uint&      kv_dim         [[buffer(7)]],
+    constant uint&      seq_len        [[buffer(8)]],
+    constant uint&      num_heads      [[buffer(9)]],
+    constant uint&      num_kv_heads   [[buffer(10)]],
+    constant float&     scale          [[buffer(11)]],
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= num_heads) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_h = tgid / heads_per_kv;
+
+    device const float* qh = Q + tgid * head_dim;
+
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+    float o_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    threadgroup float shared_qk[FUSED_ATTN_BLOCK_SIZE];
+    threadgroup float simd_scratch[32];
+
+    for (uint block_start = 0; block_start < seq_len; block_start += FUSED_ATTN_BLOCK_SIZE) {
+        uint block_end = min(block_start + FUSED_ATTN_BLOCK_SIZE, seq_len);
+        uint block_len = block_end - block_start;
+
+        float block_scores[FUSED_ATTN_BLOCK_SIZE];
+        float block_max = -1e30f;
+
+        for (uint b = 0; b < block_len; b++) {
+            uint pos = block_start + b;
+            device const uchar* kp_fp8 = K_cache_fp8 + pos * kv_dim + kv_h * head_dim;
+            float k_scale = K_scales[pos];
+
+            float dot = 0.0f;
+            for (uint d = lid; d < head_dim; d += tg_size) {
+                float k_val = fp8_e4m3_to_float(kp_fp8[d]) * k_scale;
+                dot += qh[d] * k_val;
+            }
+
+            float simd_val = simd_sum(dot);
+            uint simd_lane = lid % 32;
+            uint simd_group = lid / 32;
+            uint num_simd_groups = (tg_size + 31) / 32;
+            if (simd_lane == 0) simd_scratch[simd_group] = simd_val;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float total = 0.0f;
+            if (lid < num_simd_groups) {
+                total = simd_sum(simd_scratch[lid]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid == 0) {
+                shared_qk[b] = total * scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float s = shared_qk[b];
+            block_scores[b] = s;
+            block_max = max(block_max, s);
+        }
+
+        float m_new = max(m_prev, block_max);
+        float correction = exp(m_prev - m_new);
+
+        float block_sum = 0.0f;
+        float block_weights[FUSED_ATTN_BLOCK_SIZE];
+        for (uint b = 0; b < block_len; b++) {
+            float w = exp(block_scores[b] - m_new);
+            block_weights[b] = w;
+            block_sum += w;
+        }
+
+        float l_new = l_prev * correction + block_sum;
+        float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
+        float new_scale = 1.0f / l_new;
+
+        for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
+            uint d = lid + dim_idx * tg_size;
+            if (d >= head_dim) break;
+
+            float o_val = o_acc[dim_idx] * rescale;
+
+            for (uint b = 0; b < block_len; b++) {
+                uint pos = block_start + b;
+                float v_val = fp8_e4m3_to_float(V_cache_fp8[pos * kv_dim + kv_h * head_dim + d]) * V_scales[pos];
+                o_val += block_weights[b] * new_scale * v_val;
+            }
+            o_acc[dim_idx] = o_val;
+        }
+
+        m_prev = m_new;
+        l_prev = l_new;
+    }
+
+    for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
+        uint d = lid + dim_idx * tg_size;
+        if (d >= head_dim) break;
+        out[tgid * head_dim + d] = o_acc[dim_idx];
+    }
+}
+
+
+// ============================================================================
 // Kernel 10: GatedDeltaNet linear attention step (single token, all heads)
 // ============================================================================
 //

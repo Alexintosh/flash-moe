@@ -31,6 +31,9 @@ typedef struct {
     // FP8 E4M3 KV cache attention pipelines (opt-in via g_use_fp8_kv)
     id<MTLComputePipelineState> attn_scores_fp8_pipe;
     id<MTLComputePipelineState> attn_values_fp8_pipe;
+    // Fused online softmax attention (replaces 3-kernel pipeline)
+    id<MTLComputePipelineState> fused_attention_pipe;
+    id<MTLComputePipelineState> fused_attention_fp8_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -214,6 +217,11 @@ static MetalCtx *metal_setup(void) {
     // FP8 E4M3 KV cache attention kernels (optional — only needed when g_use_fp8_kv)
     ctx->attn_scores_fp8_pipe = makePipe(@"attn_scores_fp8");
     ctx->attn_values_fp8_pipe = makePipe(@"attn_values_fp8");
+    // Fused online softmax attention (single kernel replaces 3-kernel pipeline)
+    ctx->fused_attention_pipe     = makePipe(@"fused_attention_online");
+    ctx->fused_attention_fp8_pipe = makePipe(@"fused_attention_online_fp8");
+    if (!ctx->fused_attention_pipe)     fprintf(stderr, "[metal] WARNING: fused_attention_online pipeline failed (3-kernel fallback)\n");
+    if (!ctx->fused_attention_fp8_pipe) fprintf(stderr, "[metal] WARNING: fused_attention_online_fp8 pipeline failed (3-kernel fallback)\n");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->delta_net_step_fused = makePipe(@"gated_delta_net_step_fused");
