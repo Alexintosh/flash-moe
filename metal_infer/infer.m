@@ -572,6 +572,11 @@ static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // >1: split each routed expert pread into N page-aligned chunks (fanout)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
+// Runtime KV sequence limit — set before model load.
+// On iOS: capped to adaptive context (e.g. 8192). On macOS: cfg.max_seq_len.
+// kv_cache_new() and GPU buffers use this instead of raw cfg.max_seq_len.
+static int g_kv_seq_len = 0;  // 0 = use cfg.max_seq_len (set during load)
+
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [cfg.num_layers] cold fds (set in main)
 
@@ -1645,10 +1650,12 @@ static MetalCtx *metal_setup(void) {
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
 
-    // GPU attention buffers
+    // GPU attention buffers — sized to min(g_kv_seq_len, GPU_KV_SEQ)
     {
         size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;  // 512
-        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
+        int gpu_kv = GPU_KV_SEQ;
+        if (g_kv_seq_len > 0 && g_kv_seq_len < gpu_kv) gpu_kv = g_kv_seq_len;
+        size_t kv_cache_size = (size_t)gpu_kv * kv_dim * sizeof(float);
         for (int i = 0; i < cfg.num_full_attn_layers; i++) {
             ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
@@ -2701,10 +2708,17 @@ typedef struct {
 } KVCache;
 
 static KVCache *kv_cache_new(void) {
+    int seq = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(cfg.max_seq_len * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
-    c->v_cache = calloc(cfg.max_seq_len * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
+    c->k_cache = calloc((size_t)seq * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
+    c->v_cache = calloc((size_t)seq * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
     c->len = 0;
+    if (!c->k_cache || !c->v_cache) {
+        fprintf(stderr, "ERROR: KV cache alloc failed (seq=%d, %.1f MB each)\n",
+                seq, (double)seq * cfg.num_kv_heads * cfg.head_dim * sizeof(float) / 1e6);
+        free(c->k_cache); free(c->v_cache); free(c);
+        return NULL;
+    }
     return c;
 }
 
@@ -2891,6 +2905,15 @@ static void full_attention_forward(
 
     // ---- Update KV cache ----
     int cache_pos = kv->len;
+    int kv_max = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
+    if (!kv->k_cache || !kv->v_cache) {
+        fprintf(stderr, "ERROR: KV cache is NULL (alloc failed)\n");
+        return;
+    }
+    if (cache_pos >= kv_max) {
+        fprintf(stderr, "ERROR: KV cache overflow (pos=%d >= max=%d)\n", cache_pos, kv_max);
+        return;
+    }
     memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
     memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
     kv->len++;
@@ -5306,17 +5329,24 @@ static void fused_layer_forward(
 
         // Update KV cache (CPU + GPU mirror)
         int cache_pos = kv->len;
-        memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
-        memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
-
         int fa_idx = cfg.full_attn_index[layer_idx];
-        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
-            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
-                   k_out, kv_dim * sizeof(float));
-            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
-                   v_out, kv_dim * sizeof(float));
+        int kv_max = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
+        if (!kv->k_cache || !kv->v_cache) {
+            fprintf(stderr, "ERROR: KV cache is NULL at layer %d\n", layer_idx);
+        } else if (cache_pos >= kv_max) {
+            fprintf(stderr, "ERROR: KV cache overflow at layer %d (pos=%d >= max=%d)\n",
+                    layer_idx, cache_pos, kv_max);
+        } else {
+            memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
+            memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
+            if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
+                memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                       k_out, kv_dim * sizeof(float));
+                memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                       v_out, kv_dim * sizeof(float));
+            }
+            kv->len++;
         }
-        kv->len++;
 
         // Scaled dot-product attention (GQA) — GPU or CPU
         int heads_per_kv = cfg.num_attn_heads / cfg.num_kv_heads;

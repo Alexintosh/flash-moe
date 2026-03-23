@@ -167,6 +167,9 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                 cfg.max_seq_len = capped;
             }
         }
+        // Set runtime KV sequence limit — kv_cache_new() and GPU buffers use this
+        g_kv_seq_len = cfg.max_seq_len;
+
         if (config->think_budget > 0) {
             g_think_budget = config->think_budget;
         }
@@ -468,6 +471,7 @@ void flashmoe_unload(FlashMoEContext *ctx) {
         // Reset global flags for clean reload
         g_freq_tracking = 0;
         g_cache_telemetry_enabled = 0;
+        g_kv_seq_len = 0;
 
         // Release Metal context
         // MetalCtx is malloc'd but contains ARC-managed id<> objects.
