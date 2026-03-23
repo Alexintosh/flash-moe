@@ -28,6 +28,9 @@ typedef struct {
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
+    // FP8 E4M3 KV cache attention pipelines (opt-in via g_use_fp8_kv)
+    id<MTLComputePipelineState> attn_scores_fp8_pipe;
+    id<MTLComputePipelineState> attn_values_fp8_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -79,8 +82,11 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [cfg.hidden_dim floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    id<MTLBuffer> __strong *buf_kv_k;  // K cache per full-attn layer
-    id<MTLBuffer> __strong *buf_kv_v;  // V cache per full-attn layer
+    id<MTLBuffer> __strong *buf_kv_k;  // K cache per full-attn layer (float or uchar when FP8)
+    id<MTLBuffer> __strong *buf_kv_v;  // V cache per full-attn layer (float or uchar when FP8)
+    // FP8 per-position scale buffers (1 float per cached position per layer)
+    id<MTLBuffer> __strong *buf_kv_k_scales;  // [gpu_kv floats] per full-attn layer (FP8 only)
+    id<MTLBuffer> __strong *buf_kv_v_scales;  // [gpu_kv floats] per full-attn layer (FP8 only)
     id<MTLBuffer> buf_attn_q;       // [cfg.num_attn_heads * cfg.head_dim floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [cfg.num_attn_heads * cfg.max_seq_len floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [cfg.num_attn_heads * cfg.head_dim floats] full attention output
@@ -129,6 +135,8 @@ static MetalCtx *metal_setup(void) {
     // Allocate dynamic buffer arrays based on config
     ctx->buf_kv_k       = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
     ctx->buf_kv_v       = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
+    ctx->buf_kv_k_scales = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
+    ctx->buf_kv_v_scales = (__strong id<MTLBuffer> *)calloc(cfg.num_full_attn_layers, sizeof(id<MTLBuffer>));
     ctx->buf_delta_state = (__strong id<MTLBuffer> *)calloc(cfg.num_linear_layers, sizeof(id<MTLBuffer>));
     ctx->buf_conv_state  = (__strong id<MTLBuffer> *)calloc(cfg.num_linear_layers, sizeof(id<MTLBuffer>));
     ctx->device = MTLCreateSystemDefaultDevice();
@@ -203,6 +211,9 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    // FP8 E4M3 KV cache attention kernels (optional — only needed when g_use_fp8_kv)
+    ctx->attn_scores_fp8_pipe = makePipe(@"attn_scores_fp8");
+    ctx->attn_values_fp8_pipe = makePipe(@"attn_values_fp8");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->delta_net_step_fused = makePipe(@"gated_delta_net_step_fused");
@@ -319,16 +330,28 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
 
     // GPU attention buffers — sized to min(g_kv_seq_len, GPU_KV_SEQ)
+    // When FP8 KV is enabled, KV buffers use uint8_t (1 byte) instead of float (4 bytes)
     {
         size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;  // 512
         int gpu_kv = GPU_KV_SEQ;
         if (g_kv_seq_len > 0 && g_kv_seq_len < gpu_kv) gpu_kv = g_kv_seq_len;
-        size_t kv_cache_size = (size_t)gpu_kv * kv_dim * sizeof(float);
+        size_t elem_size = g_use_fp8_kv ? sizeof(uint8_t) : sizeof(float);
+        size_t kv_cache_size = (size_t)gpu_kv * kv_dim * elem_size;
         for (int i = 0; i < cfg.num_full_attn_layers; i++) {
             ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
             ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
+        }
+        // FP8: allocate per-position scale buffers (1 float per position per layer)
+        if (g_use_fp8_kv) {
+            size_t scale_buf_size = (size_t)gpu_kv * sizeof(float);
+            for (int i = 0; i < cfg.num_full_attn_layers; i++) {
+                ctx->buf_kv_k_scales[i] = [ctx->device newBufferWithLength:scale_buf_size
+                                                            options:MTLResourceStorageModeShared];
+                ctx->buf_kv_v_scales[i] = [ctx->device newBufferWithLength:scale_buf_size
+                                                            options:MTLResourceStorageModeShared];
+            }
         }
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
@@ -338,8 +361,9 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_gate   = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
+        printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each%s), scores buf %.1f MB\n",
                cfg.num_full_attn_layers, kv_cache_size / 1e6,
+               g_use_fp8_kv ? ", FP8 E4M3" : "",
                (double)(cfg.num_attn_heads * cfg.max_seq_len * sizeof(float)) / 1e6);
     }
 

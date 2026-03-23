@@ -1028,6 +1028,109 @@ kernel void attn_values_batched(
 
 
 // ============================================================================
+// Kernel 8b: FP8 E4M3 attention scores — K cache is uchar with per-pos scale
+// ============================================================================
+//
+// Same structure as attn_scores_batched, but K_cache is device uchar* and
+// each position p has a float scale in scales[p].
+// Dequant: k_float = fp8_e4m3_decode(k_byte) * scale[p]
+//
+// FP8 E4M3 decode (inline device function):
+
+static inline float fp8_e4m3_to_float(uchar x) {
+    if (x == 0x7F) return 0.0f;  // NaN -> 0 for safe accumulation
+    uchar sign = (x >> 7) & 1;
+    uchar exp_biased = (x >> 3) & 0xF;
+    uchar mantissa = x & 0x7;
+    float val;
+    if (exp_biased == 0) {
+        val = float(mantissa) * 0.001953125f;  // 2^-9 (subnormal)
+    } else {
+        val = (1.0f + float(mantissa) / 8.0f) * exp2(float(exp_biased) - 7.0f);
+    }
+    return sign ? -val : val;
+}
+
+kernel void attn_scores_fp8(
+    device const float* Q            [[buffer(0)]],   // [num_heads, head_dim]
+    device const uchar* K_cache_fp8  [[buffer(1)]],   // [max_seq, kv_dim] uint8
+    device const float* K_scales     [[buffer(2)]],   // [max_seq] per-pos scale
+    device float*       scores       [[buffer(3)]],   // [num_heads, seq_stride]
+    constant uint&      head_dim     [[buffer(4)]],
+    constant uint&      kv_dim       [[buffer(5)]],
+    constant uint&      seq_len      [[buffer(6)]],
+    constant uint&      seq_stride   [[buffer(7)]],
+    constant float&     scale        [[buffer(8)]],   // 1/sqrt(head_dim)
+    constant uint&      heads_per_kv [[buffer(9)]],
+    constant uint&      num_seq_tgs  [[buffer(10)]],
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint pos = tgid % num_seq_tgs;
+    uint h = tgid / num_seq_tgs;
+    if (pos >= seq_len) return;
+
+    uint kv_h = h / heads_per_kv;
+    device const float* qh = Q + h * head_dim;
+    device const uchar* kp_fp8 = K_cache_fp8 + pos * kv_dim + kv_h * head_dim;
+    float k_scale = K_scales[pos];
+
+    float acc = 0.0f;
+    for (uint d = lid; d < head_dim; d += tg_size) {
+        float k_val = fp8_e4m3_to_float(kp_fp8[d]) * k_scale;
+        acc += qh[d] * k_val;
+    }
+
+    float simd_val = simd_sum(acc);
+    threadgroup float shared[32];
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = simd_sum(shared[simd_lane]);
+        if (simd_lane == 0) {
+            scores[h * seq_stride + pos] = val * scale;
+        }
+    }
+}
+
+
+// ============================================================================
+// Kernel 8c: FP8 E4M3 attention values — V cache is uchar with per-pos scale
+// ============================================================================
+
+kernel void attn_values_fp8(
+    device const float* scores       [[buffer(0)]],   // [num_heads, seq_stride]
+    device const uchar* V_cache_fp8  [[buffer(1)]],   // [max_seq, kv_dim] uint8
+    device const float* V_scales     [[buffer(2)]],   // [max_seq] per-pos scale
+    device float*       out          [[buffer(3)]],   // [num_heads, head_dim]
+    constant uint&      head_dim     [[buffer(4)]],
+    constant uint&      kv_dim       [[buffer(5)]],
+    constant uint&      seq_len      [[buffer(6)]],
+    constant uint&      seq_stride   [[buffer(7)]],
+    constant uint&      heads_per_kv [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint d = tid % head_dim;
+    uint h = tid / head_dim;
+
+    uint kv_h = h / heads_per_kv;
+    device const float* s = scores + h * seq_stride;
+
+    float acc = 0.0f;
+    for (uint p = 0; p < seq_len; p++) {
+        float v_val = fp8_e4m3_to_float(V_cache_fp8[p * kv_dim + kv_h * head_dim + d]) * V_scales[p];
+        acc += s[p] * v_val;
+    }
+    out[h * head_dim + d] = acc;
+}
+
+
+// ============================================================================
 // Kernel 9: Sigmoid element-wise gate
 // ============================================================================
 // out[i] = x[i] * sigmoid(gate[i])

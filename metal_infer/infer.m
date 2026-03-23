@@ -77,6 +77,7 @@
 
 #include "config.h"          // ModelConfig, macros, load_model_config()
 #include "timing.h"          // LayerTimingAccum, cache telemetry, expert tracking globals
+#include "fp8.h"             // FP8 E4M3 encode/decode, g_use_fp8_kv flag
 #include "weights.h"         // bf16 conversion, TensorManifest, WeightFile, hash table
 #include "cpu_kernels.h"     // Vocabulary, tokenizer, CPU compute kernels
 #include "metal_ctx.h"       // MetalCtx, metal_setup(), weight buffer resolution

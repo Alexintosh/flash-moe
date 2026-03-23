@@ -140,7 +140,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                 avail = (size_t)((freePages + inactivePages + speculativePages) * (uint64_t)pageSize);
             }
 #endif
-            size_t kv_cost_per_pos = (size_t)cfg.num_kv_heads * cfg.head_dim * sizeof(float)
+            size_t bytes_per_elem = g_use_fp8_kv ? 1 : sizeof(float);
+            size_t kv_cost_per_pos = (size_t)cfg.num_kv_heads * cfg.head_dim * bytes_per_elem
                                      * 2  // k + v
                                      * cfg.num_full_attn_layers
                                      * 2; // CPU + GPU mirror

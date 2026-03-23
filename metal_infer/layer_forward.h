@@ -48,22 +48,52 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
 // ============================================================================
 
 typedef struct {
-    float *k_cache;  // [max_seq, num_kv_heads * head_dim]
-    float *v_cache;  // [max_seq, num_kv_heads * head_dim]
-    int len;         // current number of cached entries
+    float *k_cache;      // [max_seq, num_kv_heads * head_dim] (NULL when use_fp8=1)
+    float *v_cache;      // [max_seq, num_kv_heads * head_dim] (NULL when use_fp8=1)
+    uint8_t *k_cache_fp8;  // [max_seq, num_kv_heads * head_dim] FP8 E4M3 (NULL when use_fp8=0)
+    uint8_t *v_cache_fp8;  // [max_seq, num_kv_heads * head_dim] FP8 E4M3 (NULL when use_fp8=0)
+    float *k_scales;     // [max_seq] per-position K scale (FP8 only)
+    float *v_scales;     // [max_seq] per-position V scale (FP8 only)
+    int len;             // current number of cached entries
+    int use_fp8;         // 1 = FP8 E4M3, 0 = float32
 } KVCache;
 
 static KVCache *kv_cache_new(void) {
     int seq = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc((size_t)seq * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
-    c->v_cache = calloc((size_t)seq * cfg.num_kv_heads * cfg.head_dim, sizeof(float));
     c->len = 0;
-    if (!c->k_cache || !c->v_cache) {
-        fprintf(stderr, "ERROR: KV cache alloc failed (seq=%d, %.1f MB each)\n",
-                seq, (double)seq * cfg.num_kv_heads * cfg.head_dim * sizeof(float) / 1e6);
-        free(c->k_cache); free(c->v_cache); free(c);
-        return NULL;
+    c->use_fp8 = g_use_fp8_kv;
+    size_t kv_dim = (size_t)cfg.num_kv_heads * cfg.head_dim;
+
+    if (c->use_fp8) {
+        // FP8 E4M3: 1 byte per element + per-position scale
+        c->k_cache_fp8 = calloc((size_t)seq * kv_dim, sizeof(uint8_t));
+        c->v_cache_fp8 = calloc((size_t)seq * kv_dim, sizeof(uint8_t));
+        c->k_scales = calloc(seq, sizeof(float));
+        c->v_scales = calloc(seq, sizeof(float));
+        c->k_cache = NULL;
+        c->v_cache = NULL;
+        if (!c->k_cache_fp8 || !c->v_cache_fp8 || !c->k_scales || !c->v_scales) {
+            fprintf(stderr, "ERROR: FP8 KV cache alloc failed (seq=%d, %.1f MB each)\n",
+                    seq, (double)seq * kv_dim * sizeof(uint8_t) / 1e6);
+            free(c->k_cache_fp8); free(c->v_cache_fp8);
+            free(c->k_scales); free(c->v_scales); free(c);
+            return NULL;
+        }
+    } else {
+        // Float32 path (original)
+        c->k_cache = calloc((size_t)seq * kv_dim, sizeof(float));
+        c->v_cache = calloc((size_t)seq * kv_dim, sizeof(float));
+        c->k_cache_fp8 = NULL;
+        c->v_cache_fp8 = NULL;
+        c->k_scales = NULL;
+        c->v_scales = NULL;
+        if (!c->k_cache || !c->v_cache) {
+            fprintf(stderr, "ERROR: KV cache alloc failed (seq=%d, %.1f MB each)\n",
+                    seq, (double)seq * kv_dim * sizeof(float) / 1e6);
+            free(c->k_cache); free(c->v_cache); free(c);
+            return NULL;
+        }
     }
     return c;
 }
@@ -72,6 +102,10 @@ static void kv_cache_free(KVCache *c) {
     if (c) {
         free(c->k_cache);
         free(c->v_cache);
+        free(c->k_cache_fp8);
+        free(c->v_cache_fp8);
+        free(c->k_scales);
+        free(c->v_scales);
         free(c);
     }
 }
@@ -252,16 +286,28 @@ static void full_attention_forward(
     // ---- Update KV cache ----
     int cache_pos = kv->len;
     int kv_max = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
-    if (!kv->k_cache || !kv->v_cache) {
-        fprintf(stderr, "ERROR: KV cache is NULL (alloc failed)\n");
-        return;
+    if (kv->use_fp8) {
+        if (!kv->k_cache_fp8 || !kv->v_cache_fp8) {
+            fprintf(stderr, "ERROR: FP8 KV cache is NULL (alloc failed)\n");
+            return;
+        }
+    } else {
+        if (!kv->k_cache || !kv->v_cache) {
+            fprintf(stderr, "ERROR: KV cache is NULL (alloc failed)\n");
+            return;
+        }
     }
     if (cache_pos >= kv_max) {
         fprintf(stderr, "ERROR: KV cache overflow (pos=%d >= max=%d)\n", cache_pos, kv_max);
         return;
     }
-    memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
-    memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
+    if (kv->use_fp8) {
+        kv->k_scales[cache_pos] = fp8_encode_vec(k, kv->k_cache_fp8 + cache_pos * kv_dim, kv_dim);
+        kv->v_scales[cache_pos] = fp8_encode_vec(v, kv->v_cache_fp8 + cache_pos * kv_dim, kv_dim);
+    } else {
+        memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
+        memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
+    }
     kv->len++;
 
     // ---- Scaled dot-product attention ----
@@ -272,6 +318,10 @@ static void full_attention_forward(
 
     float *attn_out = calloc(q_dim, sizeof(float));
 
+    // Temp buffer for dequantized K/V when using FP8
+    float *k_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
+    float *v_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
+
     for (int h = 0; h < cfg.num_attn_heads; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = q + h * cfg.head_dim;
@@ -279,10 +329,14 @@ static void full_attention_forward(
         // Compute attention scores for all cached positions
         float *scores = malloc(kv->len * sizeof(float));
         for (int p = 0; p < kv->len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
             float dot = 0.0f;
-            for (int d = 0; d < cfg.head_dim; d++) {
-                dot += qh[d] * kp[d];
+            if (kv->use_fp8) {
+                fp8_decode_vec(kv->k_cache_fp8 + p * kv_dim, k_dequant, kv_dim, kv->k_scales[p]);
+                float *kp = k_dequant + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
+            } else {
+                float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
             }
             scores[p] = dot * scale;
         }
@@ -293,13 +347,19 @@ static void full_attention_forward(
         // Weighted sum of values
         float *oh = attn_out + h * cfg.head_dim;
         for (int p = 0; p < kv->len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
-            for (int d = 0; d < cfg.head_dim; d++) {
-                oh[d] += scores[p] * vp[d];
+            if (kv->use_fp8) {
+                fp8_decode_vec(kv->v_cache_fp8 + p * kv_dim, v_dequant, kv_dim, kv->v_scales[p]);
+                float *vp = v_dequant + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+            } else {
+                float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
+                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
             }
         }
         free(scores);
     }
+    free(k_dequant);
+    free(v_dequant);
 
 
     // ---- Apply sigmoid gate to attention output ----
@@ -1995,19 +2055,41 @@ static void fused_layer_forward(
         int cache_pos = kv->len;
         int fa_idx = cfg.full_attn_index[layer_idx];
         int kv_max = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
-        if (!kv->k_cache || !kv->v_cache) {
+        int kv_cache_ok = kv->use_fp8
+            ? (kv->k_cache_fp8 != NULL && kv->v_cache_fp8 != NULL)
+            : (kv->k_cache != NULL && kv->v_cache != NULL);
+        if (!kv_cache_ok) {
             fprintf(stderr, "ERROR: KV cache is NULL at layer %d\n", layer_idx);
         } else if (cache_pos >= kv_max) {
             fprintf(stderr, "ERROR: KV cache overflow at layer %d (pos=%d >= max=%d)\n",
                     layer_idx, cache_pos, kv_max);
         } else {
-            memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
-            memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
+            if (kv->use_fp8) {
+                // FP8 CPU cache: quantize K and V
+                kv->k_scales[cache_pos] = fp8_encode_vec(k_out, kv->k_cache_fp8 + cache_pos * kv_dim, kv_dim);
+                kv->v_scales[cache_pos] = fp8_encode_vec(v_out, kv->v_cache_fp8 + cache_pos * kv_dim, kv_dim);
+            } else {
+                memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
+                memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
+            }
+            // GPU mirror: always float32 for GPU attention kernels
+            // When FP8, GPU still stores float32 (dequant happens on CPU write)
             if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
-                memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
-                       k_out, kv_dim * sizeof(float));
-                memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
-                       v_out, kv_dim * sizeof(float));
+                if (kv->use_fp8) {
+                    // GPU KV buffers are uchar when FP8 — write quantized data + scales
+                    memcpy((uint8_t *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                           kv->k_cache_fp8 + cache_pos * kv_dim, kv_dim * sizeof(uint8_t));
+                    memcpy((uint8_t *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                           kv->v_cache_fp8 + cache_pos * kv_dim, kv_dim * sizeof(uint8_t));
+                    // Write per-position scales to GPU scale buffers
+                    ((float *)[g_metal->buf_kv_k_scales[fa_idx] contents])[cache_pos] = kv->k_scales[cache_pos];
+                    ((float *)[g_metal->buf_kv_v_scales[fa_idx] contents])[cache_pos] = kv->v_scales[cache_pos];
+                } else {
+                    memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                           k_out, kv_dim * sizeof(float));
+                    memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                           v_out, kv_dim * sizeof(float));
+                }
             }
             kv->len++;
         }
@@ -2030,25 +2112,41 @@ static void fused_layer_forward(
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
-            // CPU fallback
+            // CPU fallback (supports both float32 and FP8 KV cache)
+            float *k_tmp = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
+            float *v_tmp = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
             for (int h = 0; h < cfg.num_attn_heads; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * cfg.head_dim;
                 float *scores = malloc(kv->len * sizeof(float));
                 for (int p = 0; p < kv->len; p++) {
-                    float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
                     float dot = 0.0f;
-                    for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
+                    if (kv->use_fp8) {
+                        fp8_decode_vec(kv->k_cache_fp8 + p * kv_dim, k_tmp, kv_dim, kv->k_scales[p]);
+                        float *kp = k_tmp + kv_h * cfg.head_dim;
+                        for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
+                    } else {
+                        float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
+                        for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
+                    }
                     scores[p] = dot * scale;
                 }
                 cpu_softmax(scores, kv->len);
                 float *oh = attn_out + h * cfg.head_dim;
                 for (int p = 0; p < kv->len; p++) {
-                    float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
-                    for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                    if (kv->use_fp8) {
+                        fp8_decode_vec(kv->v_cache_fp8 + p * kv_dim, v_tmp, kv_dim, kv->v_scales[p]);
+                        float *vp = v_tmp + kv_h * cfg.head_dim;
+                        for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                    } else {
+                        float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
+                        for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                    }
                 }
                 free(scores);
             }
+            free(k_tmp);
+            free(v_tmp);
             for (int i = 0; i < q_dim; i++) {
                 float g = 1.0f / (1.0f + expf(-q_gate[i]));
                 attn_out[i] *= g;
@@ -2316,8 +2414,26 @@ static void fused_layer_forward(
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
-            // Enc A1: attn_scores_batched
-            {
+            // Enc A1: attn_scores_batched (float32 or FP8 variant)
+            if (g_use_fp8_kv && g_metal->attn_scores_fp8_pipe) {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_scores_fp8_pipe];
+                [enc setBuffer:g_metal->buf_attn_q              offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx]        offset:0 atIndex:1];  // uchar KV
+                [enc setBuffer:g_metal->buf_kv_k_scales[fa_idx] offset:0 atIndex:2];  // per-pos scales
+                [enc setBuffer:g_metal->buf_attn_scores         offset:0 atIndex:3];
+                [enc setBytes:&hd        length:4 atIndex:4];
+                [enc setBytes:&kvd       length:4 atIndex:5];
+                [enc setBytes:&sl        length:4 atIndex:6];
+                [enc setBytes:&seq_stride length:4 atIndex:7];
+                [enc setBytes:&scale     length:4 atIndex:8];
+                [enc setBytes:&hpkv      length:4 atIndex:9];
+                [enc setBytes:&sl        length:4 atIndex:10];
+                uint32_t total_tgs = sl * cfg.num_attn_heads;
+                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            } else {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_scores_pipe];
                 [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
@@ -2335,7 +2451,7 @@ static void fused_layer_forward(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
             }
-            // Enc A2: attn_softmax_batched
+            // Enc A2: attn_softmax_batched (unchanged — operates on float scores)
             {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_softmax_pipe];
@@ -2346,8 +2462,25 @@ static void fused_layer_forward(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
             }
-            // Enc A3: attn_values_batched
-            {
+            // Enc A3: attn_values_batched (float32 or FP8 variant)
+            if (g_use_fp8_kv && g_metal->attn_values_fp8_pipe) {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_values_fp8_pipe];
+                [enc setBuffer:g_metal->buf_attn_scores         offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_v[fa_idx]        offset:0 atIndex:1];  // uchar KV
+                [enc setBuffer:g_metal->buf_kv_v_scales[fa_idx] offset:0 atIndex:2];  // per-pos scales
+                [enc setBuffer:g_metal->buf_attn_out            offset:0 atIndex:3];
+                [enc setBytes:&hd        length:4 atIndex:4];
+                [enc setBytes:&kvd       length:4 atIndex:5];
+                [enc setBytes:&sl        length:4 atIndex:6];
+                [enc setBytes:&seq_stride length:4 atIndex:7];
+                [enc setBytes:&hpkv      length:4 atIndex:8];
+                uint32_t total_threads = cfg.head_dim * cfg.num_attn_heads;
+                uint32_t tgs = (total_threads + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            } else {
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_values_pipe];
                 [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
