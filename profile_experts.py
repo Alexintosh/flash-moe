@@ -102,7 +102,51 @@ def main():
                         help="Coverage threshold (0.0-1.0, default 0.8 = keep top experts covering 80%%)")
     parser.add_argument("--tokens", type=int, default=200, help="Tokens per prompt")
     parser.add_argument("--output", type=str, default="hot_experts.json", help="Output manifest path")
+    parser.add_argument("--heuristic", action="store_true",
+                        help="Skip profiling, use uniform heuristic (first N%% of experts as hot)")
+    parser.add_argument("--hot-pct", type=float, default=0.25,
+                        help="Percentage of experts to mark hot in heuristic mode (default 0.25 = 25%%)")
     args = parser.parse_args()
+
+    # Read model config for num_experts and num_layers
+    num_experts = 256  # default
+    num_layers = 40    # default
+    if args.model:
+        config_path = Path(args.model) / "config.json"
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+            tc = config.get("text_config", config)
+            num_experts = tc.get("num_experts", 256)
+            num_layers = tc.get("num_hidden_layers", 40)
+
+    # Heuristic mode: skip profiling, uniformly mark first N% as hot
+    if args.heuristic:
+        if not args.model:
+            parser.error("--heuristic requires --model to read config.json")
+        n_hot = max(1, int(num_experts * args.hot_pct))
+        print(f"Heuristic mode: marking first {n_hot}/{num_experts} experts as hot per layer ({args.hot_pct*100:.0f}%)")
+        hot_map = {}
+        for layer in range(num_layers):
+            hot_map[layer] = list(range(n_hot))
+
+        total_hot = sum(len(v) for v in hot_map.values())
+        total_experts = num_layers * num_experts
+        manifest = {
+            "threshold": args.hot_pct,
+            "num_layers": num_layers,
+            "num_experts": num_experts,
+            "total_hot": total_hot,
+            "total_cold": total_experts - total_hot,
+            "heuristic": True,
+            "hot_experts": {str(k): v for k, v in hot_map.items()},
+        }
+        Path(args.output).write_text(json.dumps(manifest, indent=2))
+        print(f"\nWrote {args.output}")
+        print(f"  Layers: {num_layers}")
+        print(f"  Hot experts: {total_hot} ({100*total_hot/total_experts:.1f}%)")
+        print(f"  Cold experts: {total_experts - total_hot} ({100*(total_experts-total_hot)/total_experts:.1f}%)")
+        print(f"  Avg hot/layer: {n_hot} / {num_experts}")
+        return
 
     if args.freq_output:
         stderr = Path(args.freq_output).read_text()
@@ -115,22 +159,13 @@ def main():
             all_stderr.append(stderr)
         stderr = "\n".join(all_stderr)
     else:
-        parser.error("Need --model or --freq-output")
+        parser.error("Need --model, --freq-output, or --heuristic")
 
     freq_data = parse_raw_freq_dump(stderr)
     if not freq_data:
         print("ERROR: No FREQ_DUMP data found in output.")
         print("       Make sure infer was built with --freq-dump support (freq_print_analysis raw dump).")
         sys.exit(1)
-
-    # Read model config for num_experts
-    num_experts = 256  # default
-    if args.model:
-        config_path = Path(args.model) / "config.json"
-        if config_path.exists():
-            config = json.loads(config_path.read_text())
-            tc = config.get("text_config", config)
-            num_experts = tc.get("num_experts", 256)
 
     # If multiple runs, aggregate frequencies across all runs
     # parse_raw_freq_dump returns last run's data; for aggregation we need
