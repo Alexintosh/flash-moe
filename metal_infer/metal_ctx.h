@@ -278,6 +278,11 @@ static MetalCtx *metal_setup(void) {
     }
     ctx->buf_input  = [ctx->device newBufferWithLength:max_in  options:MTLResourceStorageModeShared];
     ctx->buf_output = [ctx->device newBufferWithLength:max_out options:MTLResourceStorageModeShared];
+    if (!ctx->buf_input || !ctx->buf_output) {
+        fprintf(stderr, "ERROR: Failed to allocate core Metal buffers (%.1f MB requested)\n",
+                (max_in + max_out) / 1e6);
+        free(ctx); return NULL;
+    }
 
     // Batched matmul output slots — each large enough for the biggest projection
     // q_proj = 16384 floats, qkv_proj = 12288, z_proj = 8192, o_proj = 4096
@@ -289,6 +294,10 @@ static MetalCtx *metal_setup(void) {
         for (int i = 0; i < MAX_BATCH_SLOTS; i++) {
             ctx->batch_out[i] = [ctx->device newBufferWithLength:slot_size
                                                          options:MTLResourceStorageModeShared];
+            if (!ctx->batch_out[i]) {
+                fprintf(stderr, "ERROR: Failed to allocate batch_out[%d] (%.1f MB)\n", i, slot_size / 1e6);
+                free(ctx); return NULL;
+            }
         }
     }
 
@@ -305,18 +314,34 @@ static MetalCtx *metal_setup(void) {
                                                      options:MTLResourceStorageModeShared];
     ctx->buf_expert_out   = [ctx->device newBufferWithLength:cfg.hidden_dim * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
+    if (!ctx->buf_expert_data || !ctx->buf_expert_input || !ctx->buf_expert_gate ||
+        !ctx->buf_expert_up || !ctx->buf_expert_act || !ctx->buf_expert_out) {
+        fprintf(stderr, "ERROR: Failed to allocate expert Metal buffers (expert_size=%.1f MB)\n",
+                (double)cfg.expert_size_4bit / 1e6);
+        free(ctx); return NULL;
+    }
 
     // Multi-expert buffers: K independent slots (double-buffered data)
     // Expert data buffers use 2MB-aligned backing memory for DMA efficiency.
     // The pread DMA controller transfers 3.6x faster with 2MB alignment vs 16KB.
     ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:cfg.hidden_dim * sizeof(float)
                                                            options:MTLResourceStorageModeShared];
+    if (!ctx->buf_multi_expert_input) {
+        fprintf(stderr, "ERROR: Failed to allocate multi-expert input buffer\n");
+        free(ctx); return NULL;
+    }
     size_t expert_alloc_size = (cfg.expert_size_4bit + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
     for (int k = 0; k < MAX_K; k++) {
         // 2MB-aligned allocation for optimal DMA throughput
         void *aligned_data = NULL, *aligned_data_b = NULL;
-        posix_memalign(&aligned_data,   2*1024*1024, expert_alloc_size);
-        posix_memalign(&aligned_data_b, 2*1024*1024, expert_alloc_size);
+        int pa_ret1 = posix_memalign(&aligned_data,   2*1024*1024, expert_alloc_size);
+        int pa_ret2 = posix_memalign(&aligned_data_b, 2*1024*1024, expert_alloc_size);
+        if (pa_ret1 != 0 || pa_ret2 != 0 || !aligned_data || !aligned_data_b) {
+            fprintf(stderr, "ERROR: posix_memalign failed for multi-expert data[%d] (%.1f MB each)\n",
+                    k, expert_alloc_size / 1e6);
+            free(aligned_data); free(aligned_data_b);
+            free(ctx); return NULL;
+        }
         memset(aligned_data, 0, expert_alloc_size);
         memset(aligned_data_b, 0, expert_alloc_size);
         ctx->buf_multi_expert_data[k] = [ctx->device newBufferWithBytesNoCopy:aligned_data
@@ -335,6 +360,13 @@ static MetalCtx *metal_setup(void) {
                                                                  options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_out[k]  = [ctx->device newBufferWithLength:cfg.hidden_dim * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
+        if (!ctx->buf_multi_expert_data[k] || !ctx->buf_multi_expert_data_B[k] ||
+            !ctx->buf_multi_expert_gate[k] || !ctx->buf_multi_expert_up[k] ||
+            !ctx->buf_multi_expert_act[k] || !ctx->buf_multi_expert_out[k]) {
+            fprintf(stderr, "ERROR: Failed to allocate multi-expert buffers[%d] (%.1f MB)\n",
+                    k, expert_alloc_size / 1e6);
+            free(ctx); return NULL;
+        }
     }
 
     // Shared expert buffers (for fused CMD2)
@@ -346,6 +378,10 @@ static MetalCtx *metal_setup(void) {
                                                     options:MTLResourceStorageModeShared];
     ctx->buf_shared_out  = [ctx->device newBufferWithLength:cfg.hidden_dim * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
+    if (!ctx->buf_shared_gate || !ctx->buf_shared_up || !ctx->buf_shared_act || !ctx->buf_shared_out) {
+        fprintf(stderr, "ERROR: Failed to allocate shared expert Metal buffers\n");
+        free(ctx); return NULL;
+    }
 
     // Fused o_proj+norm+routing buffers
     ctx->buf_residual = [ctx->device newBufferWithLength:cfg.hidden_dim * sizeof(float)
@@ -354,6 +390,10 @@ static MetalCtx *metal_setup(void) {
                                                  options:MTLResourceStorageModeShared];
     ctx->buf_sum_sq   = [ctx->device newBufferWithLength:sizeof(float)
                                                  options:MTLResourceStorageModeShared];
+    if (!ctx->buf_residual || !ctx->buf_h_mid || !ctx->buf_sum_sq) {
+        fprintf(stderr, "ERROR: Failed to allocate residual/combine Metal buffers\n");
+        free(ctx); return NULL;
+    }
 
     // CMD3 GPU-side combine buffers
     ctx->buf_moe_hidden    = [ctx->device newBufferWithLength:cfg.hidden_dim * sizeof(float)
@@ -362,6 +402,10 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
+    if (!ctx->buf_moe_hidden || !ctx->buf_combine_params || !ctx->buf_cmd3_sum_sq) {
+        fprintf(stderr, "ERROR: Failed to allocate CMD3 GPU-side combine buffers\n");
+        free(ctx); return NULL;
+    }
 
     // GPU attention buffers — sized to min(g_kv_seq_len, GPU_KV_SEQ)
     // When FP8 KV is enabled, KV buffers use uint8_t (1 byte) instead of float (4 bytes)
@@ -376,6 +420,11 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
             ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
+            if (!ctx->buf_kv_k[i] || !ctx->buf_kv_v[i]) {
+                fprintf(stderr, "ERROR: Failed to allocate GPU KV cache[%d] (%.1f MB each)\n",
+                        i, kv_cache_size / 1e6);
+                free(ctx); return NULL;
+            }
         }
         // FP8: allocate per-position scale buffers (1 float per position per layer)
         if (g_use_fp8_kv) {
@@ -385,6 +434,10 @@ static MetalCtx *metal_setup(void) {
                                                             options:MTLResourceStorageModeShared];
                 ctx->buf_kv_v_scales[i] = [ctx->device newBufferWithLength:scale_buf_size
                                                             options:MTLResourceStorageModeShared];
+                if (!ctx->buf_kv_k_scales[i] || !ctx->buf_kv_v_scales[i]) {
+                    fprintf(stderr, "ERROR: Failed to allocate FP8 KV scale buffers[%d]\n", i);
+                    free(ctx); return NULL;
+                }
             }
         }
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
@@ -395,6 +448,10 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_gate   = [ctx->device newBufferWithLength:cfg.num_attn_heads * cfg.head_dim * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
+        if (!ctx->buf_attn_q || !ctx->buf_attn_scores || !ctx->buf_attn_out || !ctx->buf_attn_gate) {
+            fprintf(stderr, "ERROR: Failed to allocate GPU attention buffers\n");
+            free(ctx); return NULL;
+        }
         printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each%s), scores buf %.1f MB\n",
                cfg.num_full_attn_layers, kv_cache_size / 1e6,
                g_use_fp8_kv ? ", FP8 E4M3" : "",
@@ -406,9 +463,13 @@ static MetalCtx *metal_setup(void) {
         for (int i = 0; i < cfg.num_linear_layers; i++) {
             ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:(size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float)
                                                                options:MTLResourceStorageModeShared];
-            memset([ctx->buf_delta_state[i] contents], 0, (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float));
             ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:(cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float)
                                                               options:MTLResourceStorageModeShared];
+            if (!ctx->buf_delta_state[i] || !ctx->buf_conv_state[i]) {
+                fprintf(stderr, "ERROR: Failed to allocate delta-net state buffers[%d]\n", i);
+                free(ctx); return NULL;
+            }
+            memset([ctx->buf_delta_state[i] contents], 0, (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float));
             memset([ctx->buf_conv_state[i] contents], 0, (cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float));
         }
         // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
@@ -420,6 +481,12 @@ static MetalCtx *metal_setup(void) {
         ctx->buf_delta_output  = [ctx->device newBufferWithLength:cfg.linear_total_value*sizeof(float)  options:MTLResourceStorageModeShared];
         ctx->buf_conv_input    = [ctx->device newBufferWithLength:cfg.linear_conv_dim*sizeof(float)     options:MTLResourceStorageModeShared];
         ctx->buf_conv_output   = [ctx->device newBufferWithLength:cfg.linear_conv_dim*sizeof(float)     options:MTLResourceStorageModeShared];
+        if (!ctx->buf_delta_q || !ctx->buf_delta_k || !ctx->buf_delta_v ||
+            !ctx->buf_delta_g_decay || !ctx->buf_delta_beta || !ctx->buf_delta_output ||
+            !ctx->buf_conv_input || !ctx->buf_conv_output) {
+            fprintf(stderr, "ERROR: Failed to allocate delta-net scratch buffers\n");
+            free(ctx); return NULL;
+        }
         size_t state_bytes = (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float);
         size_t conv_bytes = (cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float);
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",

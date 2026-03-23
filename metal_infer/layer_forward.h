@@ -160,6 +160,10 @@ static void full_attention_forward(
     char name[256];
     float *normed = malloc(cfg.hidden_dim * sizeof(float));
     float *residual = malloc(cfg.hidden_dim * sizeof(float));
+    if (!normed || !residual) {
+        fprintf(stderr, "ERROR: full_attention_forward alloc failed\n");
+        free(normed); free(residual); return;
+    }
     cpu_vec_copy(residual, hidden, cfg.hidden_dim);
 
     if (do_debug) {
@@ -188,6 +192,10 @@ static void full_attention_forward(
     float *q_proj_out = calloc(q_proj_dim, sizeof(float));
     float *k = calloc(kv_dim, sizeof(float));
     float *v = calloc(kv_dim, sizeof(float));
+    if (!q_proj_out || !k || !v) {
+        fprintf(stderr, "ERROR: full_attention_forward QKV alloc failed\n");
+        free(normed); free(residual); free(q_proj_out); free(k); free(v); return;
+    }
 
     // Batch Q/K/V projections into a single GPU command buffer
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
@@ -328,6 +336,10 @@ static void full_attention_forward(
 
         // Compute attention scores for all cached positions
         float *scores = malloc(kv->len * sizeof(float));
+        if (!scores) {
+            fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", kv->len);
+            continue;
+        }
         for (int p = 0; p < kv->len; p++) {
             float dot = 0.0f;
             if (kv->use_fp8) {
@@ -461,6 +473,10 @@ static void linear_attention_forward(
     char name[256];
     float *normed = malloc(cfg.hidden_dim * sizeof(float));
     float *residual = malloc(cfg.hidden_dim * sizeof(float));
+    if (!normed || !residual) {
+        fprintf(stderr, "ERROR: linear_attention_forward alloc failed\n");
+        free(normed); free(residual); return;
+    }
     cpu_vec_copy(residual, hidden, cfg.hidden_dim);
 
     // ---- Input LayerNorm ----
@@ -715,6 +731,10 @@ static void moe_forward(
     char name[256];
     float *h_post = malloc(cfg.hidden_dim * sizeof(float));
     float *h_mid = malloc(cfg.hidden_dim * sizeof(float));
+    if (!h_post || !h_mid) {
+        fprintf(stderr, "ERROR: moe_forward alloc failed\n");
+        free(h_post); free(h_mid); return;
+    }
     cpu_vec_copy(h_mid, hidden, cfg.hidden_dim);
 
     // ---- Post-attention LayerNorm ----
@@ -788,6 +808,11 @@ static void moe_forward(
 
     if (packed_fd >= 0) {
         float *expert_out = malloc(cfg.hidden_dim * sizeof(float));
+        if (!expert_out) {
+            fprintf(stderr, "ERROR: moe_forward expert_out alloc failed\n");
+            free(h_post); free(h_mid); free(gate_scores); free(moe_out);
+            free(shared_gate); free(shared_up); return;
+        }
 
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
@@ -808,6 +833,11 @@ static void moe_forward(
             } else {
                 // CPU fallback
                 void *expert_data = malloc(esz);
+                if (!expert_data) {
+                    fprintf(stderr, "WARNING: layer %d expert %d malloc(%zu) failed, skipping\n",
+                            layer_idx, eidx, esz);
+                    continue;
+                }
                 ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
                 if (nread != (ssize_t)esz) {
                     fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
@@ -829,6 +859,11 @@ static void moe_forward(
                 float *gate_proj_out = malloc(cfg.moe_intermediate * sizeof(float));
                 float *up_proj_out = malloc(cfg.moe_intermediate * sizeof(float));
                 float *act_out = malloc(cfg.moe_intermediate * sizeof(float));
+                if (!gate_proj_out || !up_proj_out || !act_out) {
+                    fprintf(stderr, "WARNING: expert MLP alloc failed, skipping expert %d\n", eidx);
+                    free(gate_proj_out); free(up_proj_out); free(act_out);
+                    free(expert_data); continue;
+                }
 
                 cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
                                    cfg.moe_intermediate, cfg.hidden_dim, cfg.group_size);
@@ -1307,7 +1342,7 @@ static void discard_deferred_experts(void) {
 // ============================================================================
 
 // Static scratch buffers — allocated once, reused across all 40 layers per token.
-// Eliminates ~20 malloc/free per layer = ~1200 alloc/free per token.
+// Eliminates ~300 malloc/free per token. Pre-allocated at model load for OOM safety.
 static float *s_normed    = NULL;   // [cfg.hidden_dim]
 static float *s_residual  = NULL;   // [cfg.hidden_dim]
 static float *s_attn_proj = NULL;   // [cfg.hidden_dim]
@@ -1337,9 +1372,19 @@ static float *s_alpha_proj_out = NULL; // [cfg.linear_num_v_heads]
 static float *s_conv_out  = NULL;   // [cfg.linear_conv_dim]
 static float *s_out_vals  = NULL;   // [cfg.linear_total_value]
 static float *s_gated_out = NULL;   // [cfg.linear_total_value]
+// CPU fallback scratch (MoE expert compute + shared expert + FP8 attention)
+static float *s_expert_out_cpu = NULL;   // [cfg.hidden_dim]
+static float *s_gate_proj_out  = NULL;   // [cfg.moe_intermediate]
+static float *s_up_proj_out    = NULL;   // [cfg.moe_intermediate]
+static float *s_act_out        = NULL;   // [cfg.moe_intermediate]
+static float *s_shared_act     = NULL;   // [cfg.shared_intermediate]
+static float *s_k_dequant      = NULL;   // [cfg.num_kv_heads * cfg.head_dim] (FP8 attention)
+static float *s_v_dequant      = NULL;   // [cfg.num_kv_heads * cfg.head_dim] (FP8 attention)
+static int    s_scratch_initialized = 0;
 
-static void init_layer_scratch(void) {
-    if (s_normed) return;  // already initialized
+static int init_layer_scratch(void) {
+    if (s_scratch_initialized) return 0;  // already initialized
+
     s_normed     = calloc(cfg.hidden_dim, sizeof(float));
     s_residual   = calloc(cfg.hidden_dim, sizeof(float));
     s_attn_proj  = calloc(cfg.hidden_dim, sizeof(float));
@@ -1364,6 +1409,55 @@ static void init_layer_scratch(void) {
     s_conv_out   = calloc(cfg.linear_conv_dim, sizeof(float));
     s_out_vals   = calloc(cfg.linear_total_value, sizeof(float));
     s_gated_out  = calloc(cfg.linear_total_value, sizeof(float));
+    // CPU fallback scratch buffers
+    s_expert_out_cpu = calloc(cfg.hidden_dim, sizeof(float));
+    s_gate_proj_out  = calloc(cfg.moe_intermediate, sizeof(float));
+    s_up_proj_out    = calloc(cfg.moe_intermediate, sizeof(float));
+    s_act_out        = calloc(cfg.moe_intermediate, sizeof(float));
+    s_shared_act     = calloc(cfg.shared_intermediate, sizeof(float));
+    s_k_dequant      = calloc(cfg.num_kv_heads * cfg.head_dim, sizeof(float));
+    s_v_dequant      = calloc(cfg.num_kv_heads * cfg.head_dim, sizeof(float));
+
+    // Verify all allocations succeeded
+    if (!s_normed || !s_residual || !s_attn_proj || !s_h_post || !s_h_mid ||
+        !s_gate_scores || !s_spec_gate_scores || !s_shared_gate || !s_shared_up ||
+        !s_moe_out || !s_shared_out || !s_q_proj_out || !s_k_proj_out || !s_v_proj_out ||
+        !s_q || !s_q_gate || !s_attn_out || !s_qkv_proj_out || !s_z_proj_out ||
+        !s_beta_proj_out || !s_alpha_proj_out || !s_conv_out || !s_out_vals || !s_gated_out ||
+        !s_expert_out_cpu || !s_gate_proj_out || !s_up_proj_out || !s_act_out ||
+        !s_shared_act || !s_k_dequant || !s_v_dequant) {
+        fprintf(stderr, "ERROR: Failed to allocate layer scratch buffers (hidden_dim=%d, moe_intermediate=%d)\n",
+                cfg.hidden_dim, cfg.moe_intermediate);
+        return -1;
+    }
+
+    s_scratch_initialized = 1;
+    return 0;
+}
+
+static void free_layer_scratch(void) {
+    if (!s_scratch_initialized) return;
+    free(s_normed);     free(s_residual);   free(s_attn_proj);
+    free(s_h_post);     free(s_h_mid);      free(s_gate_scores);
+    free(s_spec_gate_scores); free(s_shared_gate); free(s_shared_up);
+    free(s_moe_out);    free(s_shared_out);
+    free(s_q_proj_out); free(s_k_proj_out); free(s_v_proj_out);
+    free(s_q);          free(s_q_gate);     free(s_attn_out);
+    free(s_qkv_proj_out); free(s_z_proj_out);
+    free(s_beta_proj_out); free(s_alpha_proj_out);
+    free(s_conv_out);   free(s_out_vals);   free(s_gated_out);
+    free(s_expert_out_cpu); free(s_gate_proj_out); free(s_up_proj_out);
+    free(s_act_out);    free(s_shared_act);
+    free(s_k_dequant);  free(s_v_dequant);
+    s_normed = s_residual = s_attn_proj = s_h_post = s_h_mid = NULL;
+    s_gate_scores = s_spec_gate_scores = s_shared_gate = s_shared_up = NULL;
+    s_moe_out = s_shared_out = NULL;
+    s_q_proj_out = s_k_proj_out = s_v_proj_out = s_q = s_q_gate = s_attn_out = NULL;
+    s_qkv_proj_out = s_z_proj_out = s_beta_proj_out = s_alpha_proj_out = NULL;
+    s_conv_out = s_out_vals = s_gated_out = NULL;
+    s_expert_out_cpu = s_gate_proj_out = s_up_proj_out = s_act_out = NULL;
+    s_shared_act = s_k_dequant = s_v_dequant = NULL;
+    s_scratch_initialized = 0;
 }
 
 static void fused_layer_forward(
@@ -1381,7 +1475,10 @@ static void fused_layer_forward(
     if (g_timing_enabled) { t_layer_start = now_ms(); }
     int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
 
-    init_layer_scratch();
+    if (init_layer_scratch() != 0) {
+        fprintf(stderr, "FATAL: scratch buffer allocation failed, cannot proceed\n");
+        return;
+    }
     if (!layer_cache_built) build_layer_cache(wf);
     LayerWeightCache *lc = &layer_cache[layer_idx];
     int is_full = (kv != NULL);
@@ -2113,12 +2210,16 @@ static void fused_layer_forward(
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
             // CPU fallback (supports both float32 and FP8 KV cache)
-            float *k_tmp = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
-            float *v_tmp = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
+            float *k_tmp = kv->use_fp8 ? s_k_dequant : NULL;
+            float *v_tmp = kv->use_fp8 ? s_v_dequant : NULL;
             for (int h = 0; h < cfg.num_attn_heads; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * cfg.head_dim;
                 float *scores = malloc(kv->len * sizeof(float));
+                if (!scores) {
+                    fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", kv->len);
+                    continue;
+                }
                 for (int p = 0; p < kv->len; p++) {
                     float dot = 0.0f;
                     if (kv->use_fp8) {
@@ -2145,8 +2246,7 @@ static void fused_layer_forward(
                 }
                 free(scores);
             }
-            free(k_tmp);
-            free(v_tmp);
+            // k_tmp, v_tmp are static scratch buffers — no free needed
             for (int i = 0; i < q_dim; i++) {
                 float g = 1.0f / (1.0f + expf(-q_gate[i]));
                 attn_out[i] *= g;
@@ -3192,13 +3292,18 @@ static void fused_layer_forward(
         return;
 
     } else if (packed_fd >= 0) {
-        // CPU fallback for experts
-        float *expert_out_cpu = malloc(cfg.hidden_dim * sizeof(float));
+        // CPU fallback for experts (uses pre-allocated scratch buffers)
+        float *expert_out_cpu = s_expert_out_cpu;
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
             off_t expert_offset; size_t esz;
             expert_offset_size(layer_idx, eidx, &expert_offset, &esz);
             void *expert_data = malloc(esz);
+            if (!expert_data) {
+                fprintf(stderr, "WARNING: layer %d expert %d malloc(%zu) failed, skipping\n",
+                        layer_idx, eidx, esz);
+                continue;
+            }
             ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
             if (nread != (ssize_t)esz) {
                 fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
@@ -3221,9 +3326,9 @@ static void fused_layer_forward(
             uint16_t *ds_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.down_s_off_2 : cfg.down_s_off_4));
             uint16_t *db_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.down_b_off_2 : cfg.down_b_off_4));
 
-            float *gate_proj_out = malloc(cfg.moe_intermediate * sizeof(float));
-            float *up_proj_out = malloc(cfg.moe_intermediate * sizeof(float));
-            float *act_out = malloc(cfg.moe_intermediate * sizeof(float));
+            float *gate_proj_out = s_gate_proj_out;
+            float *up_proj_out = s_up_proj_out;
+            float *act_out = s_act_out;
 
             cpu_dequant_matvec(gw, gs_p, gb_p, h_post, gate_proj_out,
                                cfg.moe_intermediate, cfg.hidden_dim, cfg.group_size);
@@ -3233,32 +3338,26 @@ static void fused_layer_forward(
             cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
                                cfg.hidden_dim, cfg.moe_intermediate, cfg.group_size);
 
-            free(gate_proj_out);
-            free(up_proj_out);
-            free(act_out);
             free(expert_data);
 
             cpu_vec_madd(moe_out, expert_out_cpu, expert_weights[k], cfg.hidden_dim);
         }
-        free(expert_out_cpu);
 
-        // CPU shared expert
-        float *shared_act = calloc(cfg.shared_intermediate, sizeof(float));
-        cpu_swiglu(shared_gate, shared_up, shared_act, cfg.shared_intermediate);
+        // CPU shared expert (uses pre-allocated scratch)
+        memset(s_shared_act, 0, cfg.shared_intermediate * sizeof(float));
+        cpu_swiglu(shared_gate, shared_up, s_shared_act, cfg.shared_intermediate);
         if (sdw && sds && sdb) {
-            cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
+            cpu_dequant_matvec(sdw, sds, sdb, s_shared_act, shared_out,
                                cfg.hidden_dim, cfg.shared_intermediate, cfg.group_size);
         }
-        free(shared_act);
     } else {
-        // No experts available -- still need shared expert
-        float *shared_act = calloc(cfg.shared_intermediate, sizeof(float));
-        cpu_swiglu(shared_gate, shared_up, shared_act, cfg.shared_intermediate);
+        // No experts available -- still need shared expert (uses pre-allocated scratch)
+        memset(s_shared_act, 0, cfg.shared_intermediate * sizeof(float));
+        cpu_swiglu(shared_gate, shared_up, s_shared_act, cfg.shared_intermediate);
         if (sdw && sds && sdb) {
-            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
+            fast_dequant_matvec(sdw, sds, sdb, s_shared_act, shared_out,
                                 cfg.hidden_dim, cfg.shared_intermediate, cfg.group_size);
         }
-        free(shared_act);
     }
 
     // ---- Shared expert gate ----

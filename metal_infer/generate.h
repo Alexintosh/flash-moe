@@ -484,10 +484,23 @@ static void serve_loop(
     PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
     int sys_pos = 0;
     if (sys_pt && sys_pt->count > 0) {
+        // Cap system prompt length to max_seq_len
+        if (sys_pt->count > cfg.max_seq_len) {
+            fprintf(stderr, "WARNING: system prompt (%d tokens) exceeds max context (%d), truncating\n",
+                    sys_pt->count, cfg.max_seq_len);
+            sys_pt->count = cfg.max_seq_len;
+        }
         // Pre-embed all system prompt tokens
         float *sys_embed_batch = NULL;
         if (sys_pt->count > 1) {
             sys_embed_batch = malloc((size_t)sys_pt->count * cfg.hidden_dim * sizeof(float));
+            if (!sys_embed_batch) {
+                fprintf(stderr, "ERROR: Failed to allocate system prompt embed batch (%.1f MB)\n",
+                        (double)sys_pt->count * cfg.hidden_dim * 4 / 1e6);
+                // Fall back to per-token embedding (slower but works)
+            }
+        }
+        if (sys_embed_batch) {
             for (int i = 0; i < sys_pt->count; i++) {
                 embed_lookup(wf, sys_pt->ids[i], sys_embed_batch + (size_t)i * cfg.hidden_dim);
             }
@@ -784,12 +797,25 @@ static void serve_loop(
 
             // ---- Batch prefill ----
             double t_prefill = now_ms();
+            // Cap prompt length to max_seq_len
+            if (pt->count > cfg.max_seq_len) {
+                fprintf(stderr, "WARNING: request prompt (%d tokens) exceeds max context (%d), truncating\n",
+                        pt->count, cfg.max_seq_len);
+                pt->count = cfg.max_seq_len;
+            }
             // Pre-embed all request tokens
             float *serve_embed_batch = NULL;
             if (pt->count > 1) {
                 serve_embed_batch = malloc((size_t)pt->count * cfg.hidden_dim * sizeof(float));
-                for (int i = 0; i < pt->count; i++) {
-                    embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * cfg.hidden_dim);
+                if (!serve_embed_batch) {
+                    fprintf(stderr, "ERROR: Failed to allocate serve embed batch (%.1f MB)\n",
+                            (double)pt->count * cfg.hidden_dim * 4 / 1e6);
+                    // Fall back to per-token embedding (slower but works)
+                }
+                if (serve_embed_batch) {
+                    for (int i = 0; i < pt->count; i++) {
+                        embed_lookup(wf, pt->ids[i], serve_embed_batch + (size_t)i * cfg.hidden_dim);
+                    }
                 }
             }
             // Intermediate prefill tokens: discard last-layer expert output
@@ -1441,12 +1467,25 @@ int main(int argc, char **argv) {
         printf("--- Generating %d tokens ---\n", max_tokens);
         int pos = 0;  // position counter for RoPE
 
+        // ---- Cap prompt length to max_seq_len ----
+        if (pt->count > cfg.max_seq_len) {
+            fprintf(stderr, "WARNING: prompt (%d tokens) exceeds max context (%d), truncating\n",
+                    pt->count, cfg.max_seq_len);
+            pt->count = cfg.max_seq_len;
+        }
+
         // ---- Batch prefill: pre-embed all prompt tokens ----
         // Embedding all tokens upfront into a batch buffer avoids interleaving
         // embed_lookup with GPU work, and enables the optimized prefill loop below.
         float *embed_batch = NULL;
         if (pt->count > 1) {
             embed_batch = malloc((size_t)pt->count * cfg.hidden_dim * sizeof(float));
+            if (!embed_batch) {
+                fprintf(stderr, "ERROR: Failed to allocate embed batch (%.1f MB)\n",
+                        (double)pt->count * cfg.hidden_dim * 4 / 1e6);
+                free(hidden); free(logits);
+                return -1;
+            }
             double t_embed = now_ms();
             for (int i = 0; i < pt->count; i++) {
                 embed_lookup(wf, pt->ids[i], embed_batch + (size_t)i * cfg.hidden_dim);
