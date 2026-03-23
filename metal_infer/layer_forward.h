@@ -1671,8 +1671,9 @@ static void fused_layer_forward(
         // can be encoded directly into CMD1, eliminating one commit+wait cycle.
         // buf_moe_hidden (from CMD3(N-1)) is used as the residual source on GPU —
         // serial queue ordering guarantees CMD3(N-1) completes before CMD1 starts.
-        // TODO: CMD1+CMD2 merge needs validation — disabled until verified
-        if (0 && gpu_linear_attn && g_metal->wf_buf &&
+        // CMD1+CMD2 merge: encode CMD2 dispatches into CMD1 for linear attention layers,
+        // eliminating one commit+wait cycle per layer (45 layers x ~0.05-0.1ms).
+        if (gpu_linear_attn && g_metal->wf_buf &&
             lc->gate_w && lc->gate_s && lc->gate_b &&
             lc->sg_w && lc->sg_s && lc->sg_b &&
             lc->su_w && lc->su_s && lc->su_b &&
@@ -2808,8 +2809,12 @@ static void fused_layer_forward(
         memcpy(hidden, h_mid, cfg.hidden_dim * sizeof(float));
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
 
-    } else {
+    } else if (!cmd1_cmd2_merged) {
         // ---- Non-fused fallback path ----
+        // Skipped when cmd1_cmd2_merged: the merge path already computed o_proj,
+        // residual, norm, and routing on GPU within CMD1. Running the fallback
+        // would clobber those results (and read garbage via attn_out_for_oproj
+        // which points to a sentinel, not real attention output).
         // O projection
         if (attn_out_for_oproj && oproj_w && oproj_s && oproj_b) {
             fast_dequant_matvec(oproj_w, oproj_s, oproj_b, attn_out_for_oproj,
