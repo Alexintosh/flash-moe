@@ -51,6 +51,9 @@ struct FlashMoEContext {
     double total_time_ms;
     double ttft_ms;
 
+    // Memory pressure monitoring (iOS)
+    dispatch_source_t memory_pressure_source;
+
     // Error state
     char last_error[512];
 };
@@ -239,6 +242,53 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         if (!g_metal) {
             snprintf(ctx->last_error, sizeof(ctx->last_error), "Metal initialization failed");
             return -1;
+        }
+
+        // Use Metal recommended working set as additional constraint on context length
+        {
+            size_t metal_budget = g_metal->recommended_working_set;
+            size_t kv_cost_per_pos_gpu = (size_t)cfg.num_kv_heads * cfg.head_dim * sizeof(float)
+                                         * 2  // k + v
+                                         * cfg.num_full_attn_layers;
+            // Estimate non-KV Metal usage (delta-net state + expert buffers + working buffers)
+            size_t delta_net_bytes = (size_t)cfg.num_linear_layers *
+                cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float);
+            size_t expert_buf_bytes = (size_t)MAX_K * 2 * cfg.expert_size_4bit;
+            size_t fixed_gpu = delta_net_bytes + expert_buf_bytes + 50 * 1024 * 1024;
+            if (metal_budget > fixed_gpu && kv_cost_per_pos_gpu > 0) {
+                int metal_max = (int)((metal_budget - fixed_gpu) / kv_cost_per_pos_gpu);
+                // Clamp to powers of 2
+                int metal_capped = 512;
+                for (int p = 512; p <= 8192; p *= 2) {
+                    if (p <= metal_max) metal_capped = p;
+                }
+                if (cfg.max_seq_len > metal_capped) {
+                    NSLog(@"[FlashMoE] Metal working set constraint: %d → %d (%.1f GB budget, %.1f MB fixed GPU)",
+                          cfg.max_seq_len, metal_capped, metal_budget / 1e9, fixed_gpu / 1e6);
+                    cfg.max_seq_len = metal_capped;
+                    g_kv_seq_len = cfg.max_seq_len;
+                }
+            }
+        }
+
+        // Set up memory pressure monitoring
+        {
+            dispatch_source_t src = dispatch_source_create(
+                DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+                dispatch_get_main_queue());
+            if (src) {
+                dispatch_source_set_event_handler(src, ^{
+                    unsigned long status = dispatch_source_get_data(src);
+                    if (status & DISPATCH_MEMORYPRESSURE_CRITICAL) {
+                        NSLog(@"[FlashMoE] CRITICAL memory pressure — consider reducing context or unloading model");
+                    } else if (status & DISPATCH_MEMORYPRESSURE_WARN) {
+                        NSLog(@"[FlashMoE] WARNING: memory pressure elevated");
+                    }
+                });
+                dispatch_resume(src);
+                ctx->memory_pressure_source = src;
+            }
         }
 
         // ---- Initialize I/O thread pool ----
@@ -472,6 +522,12 @@ void flashmoe_unload(FlashMoEContext *ctx) {
         g_freq_tracking = 0;
         g_cache_telemetry_enabled = 0;
         g_kv_seq_len = 0;
+
+        // Cancel memory pressure monitoring
+        if (ctx->memory_pressure_source) {
+            dispatch_source_cancel(ctx->memory_pressure_source);
+            ctx->memory_pressure_source = NULL;
+        }
 
         // Release Metal context
         // MetalCtx is malloc'd but contains ARC-managed id<> objects.

@@ -112,6 +112,8 @@ typedef struct {
     id<MTLBuffer> buf_delta_output;   // [cfg.linear_total_value=4096] float
     id<MTLBuffer> buf_conv_input;     // [cfg.linear_conv_dim=8192] float
     id<MTLBuffer> buf_conv_output;    // [cfg.linear_conv_dim=8192] float
+    // Wired memory budget from Metal device
+    size_t recommended_working_set;   // [ctx->device recommendedMaxWorkingSetSize]
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -135,6 +137,9 @@ static MetalCtx *metal_setup(void) {
         free(ctx); return NULL;
     }
     printf("[metal] Device: %s\n", [[ctx->device name] UTF8String]);
+
+    ctx->recommended_working_set = (size_t)[ctx->device recommendedMaxWorkingSetSize];
+    printf("[metal] Recommended working set: %.1f GB\n", ctx->recommended_working_set / 1e9);
 
     ctx->queue = [ctx->device newCommandQueue];
     if (!ctx->queue) {
@@ -368,6 +373,16 @@ static MetalCtx *metal_setup(void) {
     // Create shared event for CPU-GPU async pipeline
     ctx->pipeline_event = [ctx->device newSharedEvent];
     ctx->event_value = 0;
+
+    // Report total GPU allocation and warn if over budget
+    {
+        size_t allocated = (size_t)[ctx->device currentAllocatedSize];
+        printf("[metal] Current GPU allocation: %.1f MB\n", allocated / 1e6);
+        if (allocated > ctx->recommended_working_set) {
+            fprintf(stderr, "[metal] WARNING: GPU allocation (%.1f MB) exceeds recommended working set (%.1f MB)\n",
+                    allocated / 1e6, ctx->recommended_working_set / 1e6);
+        }
+    }
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
