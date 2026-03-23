@@ -635,9 +635,16 @@ static void metal_set_weights_split(MetalCtx *ctx, WeightFile *wf) {
         printf("[metal] Split Metal buffers ready: chunk0=%.2f GB, chunk1=%.2f GB\n",
                s0 / 1e9, s1 / 1e9);
     } else {
-        fprintf(stderr, "WARNING: Cannot create split Metal buffers — CPU fallback\n");
+        // Metal can't track both chunks (OOM on memory-constrained devices).
+        // CPU fallback: wf_buf=nil, wf_num_chunks=0 → all guards route to CPU path.
+        // Expert forward still uses GPU (separate buffers). Only attention projections
+        // and norms fall back to CPU dequant matvec.
+        fprintf(stderr, "[metal] Cannot create split Metal buffers (%.2f GB total) — CPU fallback for attention\n",
+                wf->size / 1e9);
         ctx->wf_chunks[0] = nil;
         ctx->wf_chunks[1] = nil;
+        ctx->wf_buf = nil;
+        ctx->wf_num_chunks = 0;
     }
     printf("[metal] metal_set_weights_split done: wf_buf=%s wf_num_chunks=%d\n",
            ctx->wf_buf ? "SET" : "nil", ctx->wf_num_chunks);
