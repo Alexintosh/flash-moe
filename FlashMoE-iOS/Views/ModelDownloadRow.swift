@@ -207,13 +207,6 @@ struct ModelDownloadRow: View {
                 .foregroundStyle(.green)
 
             Spacer()
-
-            Button(role: .destructive) {
-                downloadManager.deleteModel(catalogId: entry.id)
-            } label: {
-                Image(systemName: "trash")
-                    .font(.caption)
-            }
         }
     }
 
