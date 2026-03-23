@@ -30,6 +30,7 @@ struct ChatView: View {
     @State private var showStats = false
     @State private var showModelInfo = false
     @State private var showProfiler = false
+    @State private var scrollAnchor = UUID()  // updates on each token to trigger scroll
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -48,9 +49,14 @@ struct ChatView: View {
                 .onTapGesture { inputFocused = false }
                 .onChange(of: messages.count) {
                     if let last = messages.last {
-                        withAnimation {
+                        withAnimation(.easeOut(duration: 0.15)) {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
+                    }
+                }
+                .onChange(of: scrollAnchor) {
+                    if let last = messages.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
             }
@@ -197,8 +203,10 @@ struct ChatView: View {
             }
 
             var gotTokens = false
+            var tokenCount = 0
             for await token in stream {
                 gotTokens = true
+                tokenCount += 1
                 // Strip special tokens that leak through
                 let clean = token.text
                     .replacingOccurrences(of: "<|im_end|>", with: "")
@@ -206,23 +214,35 @@ struct ChatView: View {
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
                 if !clean.isEmpty {
                     messages[assistantIndex].text += clean
+                    // Auto-scroll every few tokens (not every token to avoid scroll jank)
+                    if tokenCount % 3 == 0 {
+                        scrollAnchor = UUID()
+                    }
                 }
             }
+            // Final scroll to catch last tokens
+            scrollAnchor = UUID()
 
             // If continuation returned empty (context full), fall back to full generate
             if !gotTokens && engine.canContinue {
                 engine.reset()
                 let formattedPrompt = buildChatPrompt(userMessage: text)
                 let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+                tokenCount = 0
                 for await token in fallbackStream {
+                    tokenCount += 1
                     let clean = token.text
                         .replacingOccurrences(of: "<|im_end|>", with: "")
                         .replacingOccurrences(of: "<|im_start|>", with: "")
                         .replacingOccurrences(of: "<|endoftext|>", with: "")
                     if !clean.isEmpty {
                         messages[assistantIndex].text += clean
+                        if tokenCount % 3 == 0 {
+                            scrollAnchor = UUID()
+                        }
                     }
                 }
+                scrollAnchor = UUID()
             }
 
             isGenerating = false
