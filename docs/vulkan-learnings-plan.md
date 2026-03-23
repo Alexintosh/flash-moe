@@ -155,6 +155,19 @@ The iOS unity build (`FlashMoEEngine.m` -> `#include "infer.m"`) continues to wo
 
 ---
 
+## Post-Implementation Results
+
+All 4 phases from the Vulkan fork analysis have been completed and merged. Summary of outcomes:
+
+- **Phase 1 (Delta-Net Fusion)**: Fused pass 2+3 in `gated_delta_net_step_fused` kernel. Eliminates ~1M device memory reads/token across 45 linear attention layers. Measured +0.5-1% overall tok/s.
+- **Phase 2 (CMD1+CMD2 Merge)**: For GPU linear attention layers, CMD2 dispatches (o_proj + residual + norm + routing) are appended to CMD1 instead of creating a separate command buffer. Saves one GPU sync point per linear attention layer (45 layers x ~0.05-0.1ms = 2.25-4.5ms/token).
+- **Phase 3 (Modular Decomposition)**: 8081-line `infer.m` split into 9 focused modules (config.h, timing.h, fp8.h, weights.h, cpu_kernels.h, metal_ctx.h, gpu_dispatch.h, expert_io.h, layer_forward.h, generate.h) plus an 86-line unity build entry point. Zero performance impact. iOS unity build continues to work unchanged.
+- **Phase 4 (Dynamic SIMD)**: `[[threads_per_simdgroup]]` attribute added to all dequant kernels. Zero impact on current Apple Silicon (always SIMD 32), but prevents breakage on future hardware with different SIMD widths.
+
+Combined measured impact: **+1.5-3% tok/s** on the 397B model (M3 Max).
+
+---
+
 ## What We're NOT Doing (and why)
 
 | Technique | Why Not |

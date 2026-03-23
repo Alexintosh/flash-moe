@@ -94,6 +94,18 @@ Qwen3.5 MoE models use a hybrid attention architecture with GatedDeltaNet (linea
 
 9. **iOS Unity Build** — The entire 7,500-line inference engine compiles into the iOS app via `#include "infer.m"`. No fork, no separate codebase. A thin C API (`FlashMoEEngine.h`) wraps the static globals, and a Swift `@Observable` bridge provides `AsyncStream<Token>` generation with automatic memory-adaptive context sizing.
 
+10. **FP8 E4M3 KV Cache** — Opt-in quantization of the KV cache from float32 to FP8 E4M3 (1 sign, 4 exponent, 3 mantissa bits). Per-position dynamic scales stored separately. Reduces KV memory from ~60KB/position to ~15KB/position for the 397B model (4x reduction), enabling longer context on memory-constrained devices. GPU inline dequant in the fused attention kernel reads FP8 bytes and scales on the fly. Enabled with `--fp8-kv` flag; default off to preserve float32 precision.
+
+11. **Fused Online Softmax Attention** — Single-kernel FlashAttention-style implementation replaces the previous 3-dispatch pipeline (Q@K^T, softmax, scores@V) for full-attention layers. Iterates over KV positions in blocks of `BLOCK_SIZE=64`, maintaining online softmax state (running max `m`, running sum `l`, output accumulator `o`) per head. Each block computes partial scores, updates the running statistics, and rescales the accumulator — never materializing the full attention matrix. Reduces 3 GPU dispatches to 1 per full-attention layer.
+
+12. **Metal Function Constants** — Compile-time specialization of the fused attention kernel via Metal `[[function_constant(0)]]`. The `USE_FP8_KV` boolean constant eliminates dead branches at pipeline creation time, so the FP8 dequant path has zero overhead when disabled and the float32 path has zero overhead when FP8 is active. Both variants share a single source kernel (`fused_attention_fc`).
+
+13. **OOM Prevention** — Comprehensive allocation hardening across the engine: 30+ static scratch buffers pre-allocated at model load (eliminates ~300 malloc/free per token), all 40+ Metal buffer allocations checked for nil with actionable error messages, `calloc` guards on all CPU allocations with early-return on failure, `posix_memalign` for 2MB-aligned expert I/O buffers with error checking. On iOS: dispatch-source memory pressure handler cancels generation on critical pressure, `didReceiveMemoryWarning` observer as a second line of defense, pre-flight 500MB availability check before every generation call, and adaptive context length sizing via `os_proc_available_memory()`. See [docs/oom-prevention.md](docs/oom-prevention.md).
+
+14. **Wired Memory Limit** — Metal's `recommendedMaxWorkingSetSize` API queried at startup and stored in `MetalCtx.recommended_working_set`. Used to constrain KV cache allocation so GPU buffer totals stay within the device's wired memory budget, preventing Metal from evicting buffers to system memory (which causes severe latency spikes).
+
+15. **Universal App** — The SwiftUI shell compiles for both iPhone and Mac (via "Designed for iPad" / Mac Catalyst compatibility). Views use `#if os(iOS)` conditional compilation for platform-specific UI (toolbar placement, keyboard dismiss, document picker). The same C inference engine, Metal shaders, and Swift bridge run on both platforms without modification.
+
 ### iOS-Specific Constraints
 
 - **Metal 4GB per-buffer limit** — iOS Metal buffers cannot exceed 4096 MB, regardless of entitlements. The 35B model (2.5GB weights) fits in a single buffer. The 397B model (5.5GB weights) does not. Attempted workarounds: two overlapping buffers (OOM), staging buffer with memcpy per dispatch (data corruption from in-flight command buffer aliasing), CPU fallback (works, 6 min/token). Solution: split `model_weights.bin` into two <4GB files at packing time.
@@ -225,14 +237,15 @@ metal_infer/
   infer.m              # Unity build entry point (86 lines, #includes all modules)
   config.h             # ModelConfig struct, constants, macros (438 lines)
   timing.h             # Timing, telemetry, tracking globals (256 lines)
+  fp8.h                # FP8 E4M3 encode/decode, per-tensor dynamic scale, g_use_fp8_kv flag (119 lines)
   weights.h            # Tensor manifest, hash table, mmap, bf16 conversion (205 lines)
   cpu_kernels.h        # Vocabulary, tokenizer, CPU compute kernels (387 lines)
-  metal_ctx.h          # MetalCtx, metal_setup(), buffer management (603 lines)
+  metal_ctx.h          # MetalCtx, metal_setup(), buffer management, wired memory query (603 lines)
   gpu_dispatch.h       # BatchMatvecSpec, batched GPU matmul, expert forward (721 lines)
   expert_io.h          # I/O thread pool, parallel pread, cache (827 lines)
-  layer_forward.h      # RoPE, KVCache, attention, MoE, fused pipeline (3068 lines)
+  layer_forward.h      # RoPE, KVCache, attention, MoE, fused pipeline, scratch buffers (3068 lines)
   generate.h           # Inference loop, sampling, HTTP serve, main() (1717 lines)
-  shaders.metal        # Metal compute kernels (~1300 lines)
+  shaders.metal        # Metal compute kernels (~1500 lines, includes fused attention + FP8 variants)
   chat.m               # Interactive chat TUI with tool calling
   tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
   main.m               # MoE-only benchmark
@@ -356,4 +369,7 @@ The engine explicitly controls memory:
 - Expert data streams from SSD on demand — no full model load required
 - No custom caches. Trust the OS page cache for expert LRU.
 - iOS: adaptive context length via `os_proc_available_memory()`, KV caches sized to fit device
+- Wired memory budget: `recommendedMaxWorkingSetSize` constrains Metal buffer totals
+- OOM prevention: 30+ pre-allocated scratch buffers, 40+ Metal nil checks, calloc guards, posix_memalign checks. iOS adds memory pressure handler, didReceiveMemoryWarning observer, and 500MB pre-flight check. See [docs/oom-prevention.md](docs/oom-prevention.md).
+- FP8 KV cache (opt-in): reduces KV memory 4x for longer context on constrained devices
 - Minimum RAM: 8GB iPhone (35B), 12GB iPhone (397B with K=4), 24GB Mac (35B), 48GB Mac (397B)

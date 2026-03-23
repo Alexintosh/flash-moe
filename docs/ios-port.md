@@ -26,6 +26,7 @@ iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory.
 - Collapsible `<think>` blocks (DisclosureGroup)
 - Special token stripping (`<|endoftext|>`, `<|im_end|>`, `<|im_start|>`)
 - Tap outside keyboard to dismiss
+- Auto-scroll to latest message via `ScrollViewReader` + `scrollTo(:anchor:.bottom)`
 - New chat / reset conversation
 - KV cache reuse across conversation turns (continuation mode)
 
@@ -55,6 +56,20 @@ iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory.
 - 4-bit experts (full quality, production)
 - 2-bit experts (faster, breaks JSON/tool calling)
 - Tiered quantization (4-bit hot / 2-bit cold experts, auto-detected)
+
+### FP8 KV Cache (opt-in)
+- FP8 E4M3 quantization of K and V caches: float32 (4 bytes/element) to uint8 (1 byte/element)
+- Per-position dynamic scales stored in separate Metal buffers
+- Reduces KV memory from ~60KB/position to ~15KB/position for the 397B model (4x)
+- On iPhone 17 (12GB): enables significantly longer context windows for the 35B model
+- GPU inline dequant in the fused attention kernel — no CPU decode overhead
+- Enabled with `--fp8-kv` flag; default off for maximum precision
+
+### Universal App Support
+- Same SwiftUI shell compiles for both iPhone and Mac destinations
+- `#if os(iOS)` conditional compilation for platform-specific UI (toolbar, keyboard dismiss, document picker)
+- C inference engine, Metal shaders, and Swift bridge are fully cross-platform
+- No code fork — one codebase serves both platforms
 
 ## Architecture
 
@@ -125,10 +140,25 @@ iOS Metal buffers cannot exceed 4096 MB regardless of entitlements. The 35B mode
 
 ### Memory Management
 - Adaptive context length via `os_proc_available_memory()` -- reduces 262144 to 8192 based on available memory
+- Wired memory budget: `recommendedMaxWorkingSetSize` constrains Metal buffer totals to stay within device budget
 - KV cache sizing: `MAX_SEQ_LEN` (1M) replaced with runtime `g_kv_seq_len` (4096) per cache
+- FP8 KV cache: 4x memory reduction when opted in (`bytes_per_elem = g_use_fp8_kv ? 1 : sizeof(float)`)
 - Expert mmap disabled on iOS -- jetsam kills from 112GB mapped address space
 - Debug vs Release: Metal debug wrappers add ~2GB overhead, must build Release for on-device testing
 - `isExcludedFromBackup` on all model files to prevent iOS purging 200GB+ of data
+
+### OOM Prevention (8 Protections)
+
+1. **Memory pressure dispatch source** — `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` handler cancels generation on `DISPATCH_MEMORYPRESSURE_CRITICAL`. This is actionable (sets `atomic_store(&ctx->cancelled, 1)`), not just logging.
+2. **`didReceiveMemoryWarning` observer** — `UIApplicationDidReceiveMemoryWarningNotification` as a second line of defense, also cancels generation.
+3. **Pre-flight 500MB check** — `os_proc_available_memory() < 500MB` returns error before starting generation (checked in both `flashmoe_generate` and `flashmoe_generate_continuation`).
+4. **Adaptive context length** — Runtime context cap based on available memory and Metal wired budget at model load time.
+5. **Pre-allocated scratch buffers** — 30+ static scratch buffers allocated once at model load, reused across all layers per token. Eliminates ~300 malloc/free per token.
+6. **Metal buffer nil checks** — All 40+ `newBufferWithLength` calls checked for nil with actionable error messages and early return.
+7. **calloc guards** — All CPU allocations checked for NULL with error reporting.
+8. **posix_memalign for expert I/O** — 2MB-aligned expert data buffers with error checking.
+
+See [docs/oom-prevention.md](../docs/oom-prevention.md) for the full architecture document.
 
 ### ARC Cleanup
 MetalCtx `free()` without nil-ing `id<>` Objective-C fields caused heap corruption on model switch. Fix: nil all `id<>` fields before `free`.
