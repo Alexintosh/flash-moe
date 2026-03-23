@@ -209,6 +209,9 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         // CMD1+CMD2 merge toggle (default: enabled)
         g_cmd_merge_enabled = config->cmd_merge;
 
+        // Fused attention toggle (default: disabled, experimental)
+        g_fused_attention_enabled = config->fused_attention;
+
         // K = experts per token from config
         // K override: allow reducing active experts for memory-constrained devices.
         // Lower K = less I/O per token (linear reduction). Quality degrades gracefully
@@ -770,7 +773,7 @@ int flashmoe_generate(
 
         // ---- Prefill intermediate tokens (discard expert output) ----
         if (pt->count > 1) {
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
+            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) { @autoreleasepool {
                 if (atomic_load(&ctx->cancelled)) {
                     free(embed_batch);
                     free(pt->ids); free(pt);
@@ -791,7 +794,7 @@ int flashmoe_generate(
                 }
                 discard_deferred_experts();
                 pos++;
-            }
+            } /* @autoreleasepool */ }
         }
 
         // ---- Last prefill token (need full hidden state) ----
@@ -851,7 +854,7 @@ int flashmoe_generate(
         // ---- Auto-regressive generation loop ----
         double gen_start = now_ms();
 
-        for (int gen = 1; gen < max_tokens; gen++) {
+        for (int gen = 1; gen < max_tokens; gen++) { @autoreleasepool {
             // Check cancellation
             if (atomic_load(&ctx->cancelled)) break;
 
@@ -912,7 +915,7 @@ int flashmoe_generate(
                                     ctx->tokens_per_second, user_data);
                 if (stop) break;
             }
-        }
+        } /* @autoreleasepool */ }
 
         ctx->total_time_ms = now_ms() - t0;
         double gen_elapsed = now_ms() - gen_start;
@@ -1003,7 +1006,7 @@ int flashmoe_generate_continuation(
         }
 
         if (pt->count > 1) {
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
+            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) { @autoreleasepool {
                 if (atomic_load(&ctx->cancelled)) {
                     free(embed_batch);
                     free(pt->ids); free(pt);
@@ -1024,7 +1027,7 @@ int flashmoe_generate_continuation(
                 }
                 discard_deferred_experts();
                 pos++;
-            }
+            } /* @autoreleasepool */ }
         }
 
         // Last prefill token
@@ -1084,7 +1087,7 @@ int flashmoe_generate_continuation(
         // ---- Auto-regressive generation loop ----
         double gen_start = now_ms();
 
-        for (int gen = 1; gen < max_tokens; gen++) {
+        for (int gen = 1; gen < max_tokens; gen++) { @autoreleasepool {
             if (atomic_load(&ctx->cancelled)) break;
 
             int is_eos = 0;
@@ -1136,7 +1139,7 @@ int flashmoe_generate_continuation(
                                     ctx->tokens_per_second, user_data);
                 if (stop) break;
             }
-        }
+        } /* @autoreleasepool */ }
 
         ctx->total_time_ms = now_ms() - t0;
         double gen_elapsed = now_ms() - gen_start;
