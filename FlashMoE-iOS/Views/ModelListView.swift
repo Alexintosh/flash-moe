@@ -120,6 +120,7 @@ struct ModelListView: View {
                 Picker("Active Experts (K)", selection: $activeExpertsK) {
                     Text("Model default").tag(0)
                     Text("K=2 (fastest, lowest quality)").tag(2)
+                    Text("K=3").tag(3)
                     Text("K=4").tag(4)
                     Text("K=6").tag(6)
                     Text("K=8").tag(8)
