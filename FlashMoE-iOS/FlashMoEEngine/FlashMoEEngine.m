@@ -17,6 +17,9 @@
 #include "FlashMoEEngine.h"
 #include <stdatomic.h>
 #include <os/proc.h>
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#endif
 
 // ============================================================================
 // FlashMoEContext — wraps engine state for the public C API
@@ -53,6 +56,9 @@ struct FlashMoEContext {
 
     // Memory pressure monitoring (iOS)
     dispatch_source_t memory_pressure_source;
+#if TARGET_OS_IPHONE
+    id memory_warning_observer;
+#endif
 
     // Error state
     char last_error[512];
@@ -279,10 +285,14 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                 DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
                 dispatch_get_main_queue());
             if (src) {
+                FlashMoEContext *ctx_capture = ctx;
                 dispatch_source_set_event_handler(src, ^{
                     unsigned long status = dispatch_source_get_data(src);
                     if (status & DISPATCH_MEMORYPRESSURE_CRITICAL) {
-                        NSLog(@"[FlashMoE] CRITICAL memory pressure — consider reducing context or unloading model");
+                        NSLog(@"[FlashMoE] CRITICAL memory pressure — cancelling generation");
+                        if (ctx_capture) {
+                            atomic_store(&ctx_capture->cancelled, 1);
+                        }
                     } else if (status & DISPATCH_MEMORYPRESSURE_WARN) {
                         NSLog(@"[FlashMoE] WARNING: memory pressure elevated");
                     }
@@ -338,6 +348,10 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         ctx->layer_fds_cold_local = calloc(cfg.num_layers, sizeof(int));
         ctx->layer_mmaps = calloc(cfg.num_layers, sizeof(void *));
         ctx->layer_mmap_sizes = calloc(cfg.num_layers, sizeof(size_t));
+        if (!ctx->layer_fds || !ctx->layer_fds_cold_local || !ctx->layer_mmaps || !ctx->layer_mmap_sizes) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to allocate layer arrays (%d layers)", cfg.num_layers);
+            return -1;
+        }
 
         memset(g_expert_seen, 0, cfg.num_layers * ((cfg.num_experts + 7) / 8));
 
@@ -379,10 +393,18 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
 
         // ---- Allocate deferred expert state ----
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
+        if (!g_deferred.h_mid) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to allocate deferred expert state (%d floats)", cfg.hidden_dim);
+            return -1;
+        }
 
         // ---- Allocate per-layer state ----
         ctx->layer_states = calloc(cfg.num_layers, sizeof(void *));
         ctx->kv_caches = calloc(cfg.num_layers, sizeof(KVCache *));
+        if (!ctx->layer_states || !ctx->kv_caches) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to allocate per-layer state arrays (%d layers)", cfg.num_layers);
+            return -1;
+        }
 
         for (int i = 0; i < cfg.num_layers; i++) {
             if (cfg.is_full_attn[i]) {
@@ -395,12 +417,34 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         // ---- Allocate working buffers ----
         ctx->hidden = calloc(cfg.hidden_dim, sizeof(float));
         ctx->logits = calloc(cfg.vocab_size, sizeof(float));
+        if (!ctx->hidden || !ctx->logits) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to allocate working buffers (hidden=%d, vocab=%d)", cfg.hidden_dim, cfg.vocab_size);
+            return -1;
+        }
         ctx->final_norm_w = get_tensor_ptr(ctx->wf, "model.norm.weight");
 
         // ---- Build layer cache (precomputes weight pointers) ----
         build_layer_cache(ctx->wf);
 
         ctx->loaded = 1;
+
+        // Register for iOS memory warning notifications
+#if TARGET_OS_IPHONE
+        {
+            FlashMoEContext *ctx_warn = ctx;
+            ctx->memory_warning_observer = [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                NSLog(@"[FlashMoE] iOS memory warning received — cancelling generation");
+                if (ctx_warn && ctx_warn->loaded) {
+                    atomic_store(&ctx_warn->cancelled, 1);
+                }
+            }];
+        }
+#endif
+
         if (config->verbose) {
             NSLog(@"[FlashMoE] Model loaded: %d layers, %d experts (K=%d), hidden=%d",
                   cfg.num_layers, cfg.num_experts, ctx->K, cfg.hidden_dim);
@@ -523,6 +567,14 @@ void flashmoe_unload(FlashMoEContext *ctx) {
         g_freq_tracking = 0;
         g_cache_telemetry_enabled = 0;
         g_kv_seq_len = 0;
+
+        // Remove iOS memory warning observer
+#if TARGET_OS_IPHONE
+        if (ctx->memory_warning_observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:ctx->memory_warning_observer];
+            ctx->memory_warning_observer = nil;
+        }
+#endif
 
         // Cancel memory pressure monitoring
         if (ctx->memory_pressure_source) {
@@ -665,6 +717,18 @@ int flashmoe_generate(
         atomic_store(&ctx->cancelled, 0);
         ctx->tokens_generated = 0;
         ctx->tokens_per_second = 0;
+
+        // Pre-flight memory check (iOS)
+#if TARGET_OS_IPHONE
+        {
+            size_t avail = os_proc_available_memory();
+            if (avail < 500 * 1024 * 1024) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "Insufficient memory (%.0f MB available, need 500+ MB)", avail / 1e6);
+                return -1;
+            }
+        }
+#endif
 
         double t0 = now_ms();
 
@@ -884,6 +948,18 @@ int flashmoe_generate_continuation(
         atomic_store(&ctx->cancelled, 0);
         ctx->tokens_generated = 0;
         ctx->tokens_per_second = 0;
+
+        // Pre-flight memory check (iOS)
+#if TARGET_OS_IPHONE
+        {
+            size_t avail = os_proc_available_memory();
+            if (avail < 500 * 1024 * 1024) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                         "Insufficient memory (%.0f MB available, need 500+ MB)", avail / 1e6);
+                return -1;
+            }
+        }
+#endif
 
         double t0 = now_ms();
 
