@@ -29,6 +29,17 @@
 using namespace metal;
 
 // ============================================================================
+// Function constants for compile-time specialization
+// ============================================================================
+// Metal function constants allow the compiler to eliminate dead branches at
+// pipeline creation time. USE_FP8_KV controls the KV read path in the fused
+// attention kernel — the compiler removes the unused float32 or FP8 code path.
+// FC_HEAD_DIM can be used for loop unrolling hints.
+
+constant bool USE_FP8_KV [[function_constant(0)]];
+constant uint FC_HEAD_DIM [[function_constant(1)]];
+
+// ============================================================================
 // BFloat16 helpers
 // ============================================================================
 
@@ -1407,6 +1418,146 @@ kernel void fused_attention_online_fp8(
             for (uint b = 0; b < block_len; b++) {
                 uint pos = block_start + b;
                 float v_val = fp8_e4m3_to_float(V_cache_fp8[pos * kv_dim + kv_h * head_dim + d]) * V_scales[pos];
+                o_val += block_weights[b] * new_scale * v_val;
+            }
+            o_acc[dim_idx] = o_val;
+        }
+
+        m_prev = m_new;
+        l_prev = l_new;
+    }
+
+    for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
+        uint d = lid + dim_idx * tg_size;
+        if (d >= head_dim) break;
+        out[tgid * head_dim + d] = o_acc[dim_idx];
+    }
+}
+
+
+// ============================================================================
+// Kernel 9d: Fused online softmax attention — function-constant specialized
+// ============================================================================
+//
+// Single kernel that handles both float32 and FP8 KV caches. The Metal compiler
+// uses function constants (USE_FP8_KV, FC_HEAD_DIM) to eliminate dead branches
+// at pipeline creation time, producing code equivalent to the separate kernels
+// but from a single source.
+//
+// Buffer layout unifies both paths:
+//   buffer(1): K cache — float* when !USE_FP8_KV, uchar* when USE_FP8_KV
+//   buffer(2): K scales (FP8 only, ignored otherwise)
+//   buffer(3): V cache — float* when !USE_FP8_KV, uchar* when USE_FP8_KV
+//   buffer(4): V scales (FP8 only, ignored otherwise)
+
+kernel void fused_attention_online_fc(
+    device const float* Q              [[buffer(0)]],
+    device const void*  K_cache_raw    [[buffer(1)]],   // float* or uchar* depending on USE_FP8_KV
+    device const float* K_scales       [[buffer(2)]],   // per-pos scales (FP8 only)
+    device const void*  V_cache_raw    [[buffer(3)]],   // float* or uchar* depending on USE_FP8_KV
+    device const float* V_scales       [[buffer(4)]],   // per-pos scales (FP8 only)
+    device float*       out            [[buffer(5)]],
+    constant uint&      head_dim       [[buffer(6)]],
+    constant uint&      kv_dim         [[buffer(7)]],
+    constant uint&      seq_len        [[buffer(8)]],
+    constant uint&      num_heads      [[buffer(9)]],
+    constant uint&      num_kv_heads   [[buffer(10)]],
+    constant float&     scale          [[buffer(11)]],
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= num_heads) return;
+
+    uint heads_per_kv = num_heads / num_kv_heads;
+    uint kv_h = tgid / heads_per_kv;
+
+    device const float* qh = Q + tgid * head_dim;
+
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
+    float o_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    threadgroup float shared_qk[FUSED_ATTN_BLOCK_SIZE];
+    threadgroup float simd_scratch[32];
+
+    for (uint block_start = 0; block_start < seq_len; block_start += FUSED_ATTN_BLOCK_SIZE) {
+        uint block_end = min(block_start + FUSED_ATTN_BLOCK_SIZE, seq_len);
+        uint block_len = block_end - block_start;
+
+        float block_scores[FUSED_ATTN_BLOCK_SIZE];
+        float block_max = -1e30f;
+
+        for (uint b = 0; b < block_len; b++) {
+            uint pos = block_start + b;
+            float dot = 0.0f;
+
+            // Function constant: compiler eliminates the dead branch
+            if (USE_FP8_KV) {
+                device const uchar* kp_fp8 = (device const uchar*)K_cache_raw + pos * kv_dim + kv_h * head_dim;
+                float k_scale = K_scales[pos];
+                for (uint d = lid; d < head_dim; d += tg_size) {
+                    float k_val = fp8_e4m3_to_float(kp_fp8[d]) * k_scale;
+                    dot += qh[d] * k_val;
+                }
+            } else {
+                device const float* kp = (device const float*)K_cache_raw + pos * kv_dim + kv_h * head_dim;
+                for (uint d = lid; d < head_dim; d += tg_size) {
+                    dot += qh[d] * kp[d];
+                }
+            }
+
+            float simd_val = simd_sum(dot);
+            uint simd_lane = lid % 32;
+            uint simd_group = lid / 32;
+            uint num_simd_groups = (tg_size + 31) / 32;
+            if (simd_lane == 0) simd_scratch[simd_group] = simd_val;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float total = 0.0f;
+            if (lid < num_simd_groups) {
+                total = simd_sum(simd_scratch[lid]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid == 0) {
+                shared_qk[b] = total * scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float s = shared_qk[b];
+            block_scores[b] = s;
+            block_max = max(block_max, s);
+        }
+
+        float m_new = max(m_prev, block_max);
+        float correction = exp(m_prev - m_new);
+
+        float block_sum = 0.0f;
+        float block_weights[FUSED_ATTN_BLOCK_SIZE];
+        for (uint b = 0; b < block_len; b++) {
+            float w = exp(block_scores[b] - m_new);
+            block_weights[b] = w;
+            block_sum += w;
+        }
+
+        float l_new = l_prev * correction + block_sum;
+        float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
+        float new_scale = 1.0f / l_new;
+
+        for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
+            uint d = lid + dim_idx * tg_size;
+            if (d >= head_dim) break;
+
+            float o_val = o_acc[dim_idx] * rescale;
+
+            for (uint b = 0; b < block_len; b++) {
+                uint pos = block_start + b;
+                float v_val;
+                if (USE_FP8_KV) {
+                    v_val = fp8_e4m3_to_float(((device const uchar*)V_cache_raw)[pos * kv_dim + kv_h * head_dim + d]) * V_scales[pos];
+                } else {
+                    v_val = ((device const float*)V_cache_raw)[pos * kv_dim + kv_h * head_dim + d];
+                }
                 o_val += block_weights[b] * new_scale * v_val;
             }
             o_acc[dim_idx] = o_val;

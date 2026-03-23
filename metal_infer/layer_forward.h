@@ -2415,8 +2415,42 @@ static void fused_layer_forward(
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
             // Try fused online softmax attention (single kernel replaces 3-kernel pipeline)
+            // Priority: function-constant specialized > type-specific > 3-kernel fallback
             int use_fused = 0;
-            if (g_use_fp8_kv && g_metal->fused_attention_fp8_pipe) {
+            if (g_metal->fused_attention_fc_pipe) {
+                // Function-constant specialized path: single kernel handles both FP8 and float32.
+                // Buffer layout is unified: buffers 1-4 are K_cache, K_scales, V_cache, V_scales.
+                // For float32 mode, K_scales and V_scales are unused (compiler eliminated FP8 code).
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->fused_attention_fc_pipe];
+                [enc setBuffer:g_metal->buf_attn_q           offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx]     offset:0 atIndex:1];
+                // K_scales: use real scales for FP8, dummy buffer for float32
+                if (g_use_fp8_kv && g_metal->buf_kv_k_scales[fa_idx]) {
+                    [enc setBuffer:g_metal->buf_kv_k_scales[fa_idx] offset:0 atIndex:2];
+                } else {
+                    [enc setBuffer:g_metal->buf_attn_q offset:0 atIndex:2];  // dummy, not read
+                }
+                [enc setBuffer:g_metal->buf_kv_v[fa_idx]     offset:0 atIndex:3];
+                if (g_use_fp8_kv && g_metal->buf_kv_v_scales[fa_idx]) {
+                    [enc setBuffer:g_metal->buf_kv_v_scales[fa_idx] offset:0 atIndex:4];
+                } else {
+                    [enc setBuffer:g_metal->buf_attn_q offset:0 atIndex:4];  // dummy, not read
+                }
+                [enc setBuffer:g_metal->buf_attn_out         offset:0 atIndex:5];
+                uint32_t nh = (uint32_t)cfg.num_attn_heads;
+                uint32_t nkvh = (uint32_t)cfg.num_kv_heads;
+                [enc setBytes:&hd        length:4 atIndex:6];
+                [enc setBytes:&kvd       length:4 atIndex:7];
+                [enc setBytes:&sl        length:4 atIndex:8];
+                [enc setBytes:&nh        length:4 atIndex:9];
+                [enc setBytes:&nkvh      length:4 atIndex:10];
+                [enc setBytes:&scale     length:4 atIndex:11];
+                [enc dispatchThreadgroups:MTLSizeMake(cfg.num_attn_heads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                use_fused = 1;
+            } else if (g_use_fp8_kv && g_metal->fused_attention_fp8_pipe) {
                 // Fused FP8 path: Q, K_fp8, K_scales, V_fp8, V_scales, out
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->fused_attention_fp8_pipe];

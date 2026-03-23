@@ -34,6 +34,8 @@ typedef struct {
     // Fused online softmax attention (replaces 3-kernel pipeline)
     id<MTLComputePipelineState> fused_attention_pipe;
     id<MTLComputePipelineState> fused_attention_fp8_pipe;
+    // Function-constant specialized fused attention (single source, two specializations)
+    id<MTLComputePipelineState> fused_attention_fc_pipe;  // specialized for current FP8/float32 mode
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [cfg.hidden_dim or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -222,6 +224,33 @@ static MetalCtx *metal_setup(void) {
     ctx->fused_attention_fp8_pipe = makePipe(@"fused_attention_online_fp8");
     if (!ctx->fused_attention_pipe)     fprintf(stderr, "[metal] WARNING: fused_attention_online pipeline failed (3-kernel fallback)\n");
     if (!ctx->fused_attention_fp8_pipe) fprintf(stderr, "[metal] WARNING: fused_attention_online_fp8 pipeline failed (3-kernel fallback)\n");
+    // Function-constant specialized fused attention: single kernel source, compiled
+    // with USE_FP8_KV and FC_HEAD_DIM set at pipeline creation time.
+    // The Metal compiler eliminates the dead FP8/float32 branch, producing optimal code.
+    {
+        MTLFunctionConstantValues *fcv = [[MTLFunctionConstantValues alloc] init];
+        bool use_fp8 = (g_use_fp8_kv != 0);
+        uint32_t hd = (uint32_t)cfg.head_dim;
+        [fcv setConstantValue:&use_fp8 type:MTLDataTypeBool atIndex:0];
+        [fcv setConstantValue:&hd      type:MTLDataTypeUInt atIndex:1];
+        NSError *fc_err = nil;
+        id<MTLFunction> fc_fn = [ctx->library newFunctionWithName:@"fused_attention_online_fc"
+                                                   constantValues:fcv
+                                                            error:&fc_err];
+        if (fc_fn) {
+            ctx->fused_attention_fc_pipe = [ctx->device newComputePipelineStateWithFunction:fc_fn error:&fc_err];
+            if (ctx->fused_attention_fc_pipe) {
+                printf("[metal] Function-constant fused attention pipeline ready (FP8=%d, head_dim=%u)\n",
+                       use_fp8, hd);
+            } else {
+                fprintf(stderr, "[metal] WARNING: fused_attention_fc pipeline creation failed: %s\n",
+                        [[fc_err localizedDescription] UTF8String]);
+            }
+        } else {
+            fprintf(stderr, "[metal] WARNING: fused_attention_online_fc function not found: %s\n",
+                    fc_err ? [[fc_err localizedDescription] UTF8String] : "unknown");
+        }
+    }
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->delta_net_step_fused = makePipe(@"gated_delta_net_step_fused");
