@@ -1825,8 +1825,10 @@ static void fused_layer_forward(
         // CMD3(N-1) is guaranteed done (serial queue), so buf_B is safe to overwrite.
         // Predictions overlap with CPU attn + CMD2 + routing (~0.6ms head start).
         // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
+        // Skip if cross-layer prefetch already has buf_B in-flight for this layer.
         if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
-            g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0) {
+            g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0 &&
+            !(g_prefetch_active && g_prefetch_layer == layer_idx)) {
             async_pread_start(packed_fd, &PRED_EXPERT(layer_idx, 0),
                               PRED_COUNT(layer_idx),
                               g_metal->buf_multi_expert_data_B, mmap_base,
@@ -2904,6 +2906,81 @@ static void fused_layer_forward(
         int valid[MAX_K];
         id<MTLBuffer> expert_bufs[MAX_K];  // buffer to dispatch from per expert
 
+        // Cross-layer prefetch: check if we have pre-loaded experts from the previous layer's CMD3.
+        // If the prefetch targeted THIS layer and completed, match hits into valid[]/expert_bufs[].
+        int prefetch_hits = 0;
+        int prefetch_handled __attribute__((unused)) = 0;  // 1 if cross-layer prefetch handled all I/O
+        if (g_prefetch_active && g_prefetch_layer == layer_idx) {
+            async_pread_wait();
+            g_prefetch_active = 0;
+            g_prefetch_layer = -1;
+
+            for (int k = 0; k < actual_K; k++) {
+                valid[k] = 0;
+                for (int p = 0; p < g_async_pread.num_experts; p++) {
+                    if (expert_indices[k] == PRED_EXPERT(layer_idx, p) && g_async_pread.valid[p]) {
+                        expert_bufs[k] = g_metal->buf_multi_expert_data_B[p];
+                        valid[k] = 1;
+                        prefetch_hits++;
+                        break;
+                    }
+                }
+            }
+            g_prefetch_hits_total += prefetch_hits;
+            g_prefetch_misses_total += (actual_K - prefetch_hits);
+
+            if (prefetch_hits == actual_K) {
+                // All experts pre-loaded — skip I/O entirely
+                prefetch_handled = 1;
+                pred_started = 0;  // no prediction path needed
+                goto experts_loaded;
+            } else if (prefetch_hits > 0) {
+                // Partial hits: pread misses into buf_A, keep hits in buf_B
+                int miss_ei[MAX_K];
+                int miss_k_slots[MAX_K];
+                int miss_count = 0;
+                for (int k = 0; k < actual_K; k++) {
+                    if (!valid[k]) {
+                        miss_ei[miss_count] = expert_indices[k];
+                        miss_k_slots[miss_count] = k;
+                        expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+                        miss_count++;
+                    }
+                }
+                if (miss_count > 0) {
+                    InferPreadTask tasks[MAX_K];
+                    for (int m = 0; m < miss_count; m++) {
+                        int k = miss_k_slots[m];
+                        off_t eoff; size_t esz;
+                        expert_offset_size(layer_idx, miss_ei[m], &eoff, &esz);
+                        tasks[m].fd = packed_fd;
+                        tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
+                        tasks[m].offset = eoff;
+                        tasks[m].size = esz;
+                        tasks[m].result = 0;
+                        tasks[m].mmap_base = mmap_base;
+                        tasks[m].lz4_comp_buf = NULL;
+                        tasks[m].lz4_comp_size = 0;
+                    }
+                    io_pool_dispatch(tasks, miss_count);
+                    for (int m = 0; m < miss_count; m++) {
+                        int k = miss_k_slots[m];
+                        valid[k] = (tasks[m].result == (ssize_t)tasks[m].size);
+                    }
+                }
+                prefetch_handled = 1;
+                pred_started = 0;
+                goto experts_loaded;
+            }
+            // prefetch_hits == 0: fall through to normal I/O paths
+        }
+        // Drain stale prefetch targeting a different layer (shouldn't happen in normal flow)
+        if (g_prefetch_active && g_prefetch_layer != layer_idx) {
+            async_pread_wait();
+            g_prefetch_active = 0;
+            g_prefetch_layer = -1;
+        }
+
         if (g_malloc_cache) {
             // ---- Malloc cache path (zero-copy Metal buffer wrappers) ----
             // Phase 1: check cache for each expert, collect misses
@@ -3098,6 +3175,7 @@ static void fused_layer_forward(
             }
         }
 
+        experts_loaded:  // Cross-layer prefetch jumps here when all experts are pre-loaded
         // Shared expert prep (doesn't need expert data — can overlap with async pread)
         memcpy([g_metal->buf_multi_expert_input contents], h_post, cfg.hidden_dim * sizeof(float));
         memcpy([g_metal->buf_shared_gate contents], shared_gate,
@@ -3117,7 +3195,8 @@ static void fused_layer_forward(
 
         // Store this layer's routing for next token's temporal prediction.
         // MUST happen AFTER the prediction hit check above (which reads g_pred_experts).
-        if (g_pred_enabled && g_pred_generating) {
+        // Also store when expert_prefetch is enabled (cross-layer prefetch needs predictions).
+        if ((g_pred_enabled || g_expert_prefetch_enabled) && g_pred_generating) {
             for (int k = 0; k < actual_K; k++) {
                 PRED_EXPERT(layer_idx, k) = expert_indices[k];
             }
@@ -3290,6 +3369,27 @@ static void fused_layer_forward(
         for (int k = 0; k < actual_K; k++) {
             g_deferred.expert_weights[k] = expert_weights[k];
             g_deferred.valid[k] = valid[k];
+        }
+
+        // Cross-layer prefetch: start pread'ing next layer's predicted experts into Set B.
+        // CMD3 GPU execution overlaps with this I/O (~2.4ms of GPU time to hide behind).
+        // Uses temporal prediction: last token's expert choices for layer N+1.
+        if (g_expert_prefetch_enabled && g_layer_fds_global &&
+            layer_idx + 1 < cfg.num_layers &&
+            g_pred_count && PRED_COUNT(layer_idx + 1) > 0 &&
+            !g_prefetch_active && g_pred_generating && g_pred_valid) {
+            int next = layer_idx + 1;
+            int next_fd = g_layer_fds_global[next];
+            void *next_mmap = (g_layer_mmaps_global && g_layer_mmaps_global[next] != MAP_FAILED)
+                               ? g_layer_mmaps_global[next] : NULL;
+            if (next_fd >= 0 && g_metal->buf_multi_expert_data_B[0]) {
+                async_pread_start(next_fd, &PRED_EXPERT(next, 0),
+                                  PRED_COUNT(next),
+                                  g_metal->buf_multi_expert_data_B,
+                                  next_mmap, next);
+                g_prefetch_active = 1;
+                g_prefetch_layer = next;
+            }
         }
 
         // Return immediately — GPU experts are running async.

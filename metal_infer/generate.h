@@ -1021,6 +1021,7 @@ static void print_usage(const char *prog) {
     printf("  --tiered             Use tiered quantization: hot=4-bit, cold=2-bit (packed_experts_tiered/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
+    printf("  --no-prefetch        Disable cross-layer expert prefetch (default: ON)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
@@ -1063,6 +1064,7 @@ int main(int argc, char **argv) {
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
+            {"no-prefetch",   no_argument,       0, 'X'},
             {"collect-routing", required_argument, 0, 'Z'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
@@ -1090,6 +1092,7 @@ int main(int argc, char **argv) {
                 case 'Q': g_use_tiered = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
+                case 'X': g_expert_prefetch_enabled = 0; break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
@@ -1416,6 +1419,15 @@ int main(int argc, char **argv) {
         if (!g_use_lz4)
             printf("[tiered-io] Cold fds (F_NOCACHE) + warm fds (page cached) active\n");
 
+        // Wire up cross-layer prefetch globals
+        g_layer_fds_global = layer_fds;
+        g_layer_mmaps_global = (void **)layer_mmaps;
+        g_layer_mmap_sizes_global = layer_mmap_sizes;
+        g_prefetch_active = 0;
+        g_prefetch_layer = -1;
+        g_prefetch_hits_total = 0;
+        g_prefetch_misses_total = 0;
+
         // Warm page cache hint
         if (expert_layers_available > 0) {
             double t_warm = now_ms();
@@ -1427,6 +1439,9 @@ int main(int argc, char **argv) {
             }
             printf("[warmup] Page cache hint: %.1f ms\n", now_ms() - t_warm);
         }
+
+        if (g_expert_prefetch_enabled)
+            printf("[prefetch] Cross-layer expert prefetch enabled (overlap I/O with CMD3 GPU)\n");
 
         // ---- Allocate per-layer state ----
         void **layer_states = calloc(cfg.num_layers, sizeof(void *));
@@ -1729,6 +1744,15 @@ int main(int argc, char **argv) {
         }
 
         // ---- Cleanup ----
+        // Drain any in-flight cross-layer prefetch
+        if (g_prefetch_active) {
+            async_pread_wait();
+            g_prefetch_active = 0;
+            g_prefetch_layer = -1;
+        }
+        g_layer_fds_global = NULL;
+        g_layer_mmaps_global = NULL;
+        g_layer_mmap_sizes_global = NULL;
         io_pool_shutdown();
         if (g_malloc_cache) {
             malloc_cache_free(g_malloc_cache);

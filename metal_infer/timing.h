@@ -73,6 +73,17 @@ static int g_cmd_merge_enabled = 1; // 1: merge CMD1+CMD2 for linear attention (
 static int g_fused_attention_enabled = 0; // 1: fused online softmax attention (experimental), 0: 3-kernel fallback
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
+// Cross-layer expert prefetch: after CMD3(N) commit, start pread'ing next layer's
+// predicted experts into buf_B. When layer N+1 reaches I/O, hits skip pread.
+static int *g_layer_fds_global = NULL;           // [cfg.num_layers] warm fds (set by generate.h or FlashMoEEngine.m)
+static void **g_layer_mmaps_global = NULL;        // [cfg.num_layers] mmap bases
+static size_t *g_layer_mmap_sizes_global = NULL;  // [cfg.num_layers] mmap sizes
+static int g_prefetch_active = 0;                 // 1 if async prefetch for next layer is in-flight
+static int g_prefetch_layer = -1;                 // which layer the in-flight prefetch targets
+static int g_expert_prefetch_enabled = 1;         // default ON; toggled via config/CLI
+static int g_prefetch_hits_total = 0;             // cross-layer prefetch hit counter
+static int g_prefetch_misses_total = 0;           // cross-layer prefetch miss counter
+
 // Runtime KV sequence limit — set before model load.
 // On iOS: capped to adaptive context (e.g. 8192). On macOS: cfg.max_seq_len.
 // kv_cache_new() and GPU buffers use this instead of raw cfg.max_seq_len.
@@ -254,5 +265,11 @@ static void timing_print(void) {
         double hit_rate = total > 0 ? (double)g_pred_hits / total * 100.0 : 0;
         fprintf(stderr, "  [predict] hits=%llu misses=%llu rate=%.1f%% layers=%llu\n",
                 g_pred_hits, g_pred_misses, hit_rate, g_pred_layers);
+    }
+    if (g_expert_prefetch_enabled && (g_prefetch_hits_total + g_prefetch_misses_total) > 0) {
+        int total = g_prefetch_hits_total + g_prefetch_misses_total;
+        double hit_rate = total > 0 ? (double)g_prefetch_hits_total / total * 100.0 : 0;
+        fprintf(stderr, "  [prefetch] hits=%d misses=%d rate=%.1f%%\n",
+                g_prefetch_hits_total, g_prefetch_misses_total, hit_rate);
     }
 }

@@ -401,6 +401,16 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         // Wire up global cold fds
         g_layer_fds_cold = ctx->layer_fds_cold_local;
 
+        // Wire up cross-layer prefetch globals
+        g_layer_fds_global = ctx->layer_fds;
+        g_layer_mmaps_global = (void **)ctx->layer_mmaps;
+        g_layer_mmap_sizes_global = ctx->layer_mmap_sizes;
+        g_expert_prefetch_enabled = config->expert_prefetch;
+        g_prefetch_active = 0;
+        g_prefetch_layer = -1;
+        g_prefetch_hits_total = 0;
+        g_prefetch_misses_total = 0;
+
         // ---- Allocate deferred expert state ----
         g_deferred.h_mid = calloc(cfg.hidden_dim, sizeof(float));
         if (!g_deferred.h_mid) {
@@ -480,6 +490,13 @@ void flashmoe_unload(FlashMoEContext *ctx) {
             dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
             g_async_pread.active = 0;
         }
+
+        // Clear cross-layer prefetch globals
+        g_layer_fds_global = NULL;
+        g_layer_mmaps_global = NULL;
+        g_layer_mmap_sizes_global = NULL;
+        g_prefetch_active = 0;
+        g_prefetch_layer = -1;
 
         // Shutdown I/O pool
         io_pool_shutdown();
