@@ -34,10 +34,8 @@ using namespace metal;
 // Metal function constants allow the compiler to eliminate dead branches at
 // pipeline creation time. USE_FP8_KV controls the KV read path in the fused
 // attention kernel — the compiler removes the unused float32 or FP8 code path.
-// FC_HEAD_DIM can be used for loop unrolling hints.
 
 constant bool USE_FP8_KV [[function_constant(0)]];
-constant uint FC_HEAD_DIM [[function_constant(1)]];
 
 // ============================================================================
 // BFloat16 helpers
@@ -1180,7 +1178,7 @@ kernel void sigmoid_gate(
 //     Accumulate: O += softmax_weight * V[pos]
 //   Output O (already normalized)
 
-#define FUSED_ATTN_BLOCK_SIZE 32
+#define FUSED_ATTN_BLOCK_SIZE 64
 
 kernel void fused_attention_online(
     device const float* Q          [[buffer(0)]],   // [num_heads, head_dim]
@@ -1287,7 +1285,7 @@ kernel void fused_attention_online(
 
         // Rescale previous output accumulator
         float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
-        float new_scale = 1.0f / l_new;
+        float new_scale = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
 
         // Phase 3: Accumulate V contributions for this block
         for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
@@ -1407,7 +1405,7 @@ kernel void fused_attention_online_fp8(
 
         float l_new = l_prev * correction + block_sum;
         float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
-        float new_scale = 1.0f / l_new;
+        float new_scale = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
 
         for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
             uint d = lid + dim_idx * tg_size;
@@ -1542,7 +1540,7 @@ kernel void fused_attention_online_fc(
 
         float l_new = l_prev * correction + block_sum;
         float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
-        float new_scale = 1.0f / l_new;
+        float new_scale = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
 
         for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
             uint d = lid + dim_idx * tg_size;

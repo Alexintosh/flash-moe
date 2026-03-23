@@ -225,14 +225,12 @@ static MetalCtx *metal_setup(void) {
     if (!ctx->fused_attention_pipe)     fprintf(stderr, "[metal] WARNING: fused_attention_online pipeline failed (3-kernel fallback)\n");
     if (!ctx->fused_attention_fp8_pipe) fprintf(stderr, "[metal] WARNING: fused_attention_online_fp8 pipeline failed (3-kernel fallback)\n");
     // Function-constant specialized fused attention: single kernel source, compiled
-    // with USE_FP8_KV and FC_HEAD_DIM set at pipeline creation time.
+    // with USE_FP8_KV set at pipeline creation time.
     // The Metal compiler eliminates the dead FP8/float32 branch, producing optimal code.
     {
         MTLFunctionConstantValues *fcv = [[MTLFunctionConstantValues alloc] init];
         bool use_fp8 = (g_use_fp8_kv != 0);
-        uint32_t hd = (uint32_t)cfg.head_dim;
         [fcv setConstantValue:&use_fp8 type:MTLDataTypeBool atIndex:0];
-        [fcv setConstantValue:&hd      type:MTLDataTypeUInt atIndex:1];
         NSError *fc_err = nil;
         id<MTLFunction> fc_fn = [ctx->library newFunctionWithName:@"fused_attention_online_fc"
                                                    constantValues:fcv
@@ -240,8 +238,7 @@ static MetalCtx *metal_setup(void) {
         if (fc_fn) {
             ctx->fused_attention_fc_pipe = [ctx->device newComputePipelineStateWithFunction:fc_fn error:&fc_err];
             if (ctx->fused_attention_fc_pipe) {
-                printf("[metal] Function-constant fused attention pipeline ready (FP8=%d, head_dim=%u)\n",
-                       use_fp8, hd);
+                printf("[metal] Function-constant fused attention pipeline ready (FP8=%d)\n", use_fp8);
             } else {
                 fprintf(stderr, "[metal] WARNING: fused_attention_fc pipeline creation failed: %s\n",
                         [[fc_err localizedDescription] UTF8String]);
