@@ -7,6 +7,9 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+#if os(macOS)
+import AppKit
+#endif
 
 // MARK: - Local Model Entry
 
@@ -62,9 +65,15 @@ struct ModelListView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No models found")
                             .font(.headline)
+#if os(iOS)
                         Text("Download a model below, or transfer one via Files.app.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+#else
+                        Text("Download a model below, or use \"Open Model Folder\" to load from disk.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+#endif
                     }
                     .padding(.vertical, 4)
                 }
@@ -154,6 +163,7 @@ struct ModelListView: View {
         }
         .navigationTitle("Flash-MoE")
         .toolbar {
+#if os(iOS)
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     showFilePicker = true
@@ -161,13 +171,25 @@ struct ModelListView: View {
                     Label("Import", systemImage: "folder.badge.plus")
                 }
             }
+#else
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    openMacModelFolder()
+                } label: {
+                    Label("Open Model Folder...", systemImage: "folder.badge.plus")
+                }
+            }
+#endif
         }
+#if os(iOS)
         .sheet(isPresented: $showFilePicker) {
             FolderImportPicker { url in
                 pendingImportURL = url
                 showImportActionAlert = true
             }
         }
+#endif
+#if os(iOS)
         .alert("Import Model", isPresented: $showImportActionAlert) {
             Button("Link (Bookmark)") {
                 if let url = pendingImportURL {
@@ -187,6 +209,7 @@ struct ModelListView: View {
         } message: {
             Text("Link keeps the model in its current location. Move to App copies it into the app's Documents folder for better reliability.")
         }
+#endif
         .alert("Delete Model", isPresented: Binding(
             get: { modelToDelete != nil },
             set: { if !$0 { modelToDelete = nil } }
@@ -201,6 +224,7 @@ struct ModelListView: View {
         } message: {
             Text("Delete \"\(modelToDelete?.name ?? "")\" (\(String(format: "%.1f GB", modelToDelete?.sizeGB ?? 0.0)))? This cannot be undone.")
         }
+#if os(iOS)
         .sheet(item: $modelToExport) { model in
             FolderExportPicker(sourceURL: URL(fileURLWithPath: model.path)) { destURL in
                 // moveToService already moved the files — just refresh the model list
@@ -208,6 +232,7 @@ struct ModelListView: View {
                 scanForModels()
             }
         }
+#endif
         .overlay {
             if let progress = importProgress {
                 VStack(spacing: 12) {
@@ -221,7 +246,12 @@ struct ModelListView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
         }
-        .onAppear { scanForModels(); restoreBookmarks() }
+        .onAppear {
+            scanForModels()
+#if os(iOS)
+            restoreBookmarks()
+#endif
+        }
         .refreshable { scanForModels() }
         .onChange(of: downloadManager.activeDownload?.status) { _, newStatus in
             if newStatus == .complete {
@@ -237,9 +267,15 @@ struct ModelListView: View {
                 .foregroundStyle(.orange)
             Text("Flash-MoE")
                 .font(.largeTitle.bold())
+#if os(iOS)
             Text("Run massive MoE models on iPhone")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+#else
+            Text("Run massive MoE models on your Mac")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+#endif
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical)
@@ -257,6 +293,49 @@ struct ModelListView: View {
             }
         }
     }
+
+#if os(macOS)
+    private func openMacModelFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Select a Flash-MoE model directory"
+        panel.prompt = "Open"
+        if panel.runModal() == .OK, let url = panel.url {
+            // On macOS, no sandbox bookmark needed for user-selected directories.
+            // Just store the path and scan.
+            let fm = FileManager.default
+            if FlashMoEEngine.validateModel(at: url.path) {
+                // Valid model directory — add to scanned paths
+                var paths = UserDefaults.standard.stringArray(forKey: "macModelPaths") ?? []
+                if !paths.contains(url.path) {
+                    paths.append(url.path)
+                    UserDefaults.standard.set(paths, forKey: "macModelPaths")
+                }
+                scanForModels()
+            } else {
+                // Check if it contains model subdirectories
+                var foundModel = false
+                if let entries = try? fm.contentsOfDirectory(atPath: url.path) {
+                    for entry in entries {
+                        let fullPath = (url.path as NSString).appendingPathComponent(entry)
+                        if FlashMoEEngine.validateModel(at: fullPath) {
+                            foundModel = true
+                            break
+                        }
+                    }
+                }
+                var paths = UserDefaults.standard.stringArray(forKey: "macModelPaths") ?? []
+                if !paths.contains(url.path) {
+                    paths.append(url.path)
+                    UserDefaults.standard.set(paths, forKey: "macModelPaths")
+                }
+                scanForModels()
+            }
+        }
+    }
+#endif
 
     private func loadModel(_ model: LocalModel) {
         guard engine.state != .loading && engine.state != .generating else { return }
@@ -288,7 +367,18 @@ struct ModelListView: View {
         }
     }
 
-    // MARK: - File Import
+    private func deleteModel(_ model: LocalModel) {
+        do {
+            try FileManager.default.removeItem(atPath: model.path)
+            print("[delete] Removed \(model.name) at \(model.path)")
+            scanForModels()
+        } catch {
+            print("ERROR: Failed to delete \(model.name): \(error)")
+        }
+    }
+
+#if os(iOS)
+    // MARK: - File Import (iOS)
 
     private func handleImportedFolder(_ url: URL) {
         // Save a security-scoped bookmark so we can access this folder across launches
@@ -315,16 +405,6 @@ struct ModelListView: View {
         }
 
         url.stopAccessingSecurityScopedResource()
-    }
-
-    private func deleteModel(_ model: LocalModel) {
-        do {
-            try FileManager.default.removeItem(atPath: model.path)
-            print("[delete] Removed \(model.name) at \(model.path)")
-            scanForModels()
-        } catch {
-            print("ERROR: Failed to delete \(model.name): \(error)")
-        }
     }
 
     private func moveImportedFolderToDocuments(_ url: URL) {
@@ -413,10 +493,12 @@ struct ModelListView: View {
             }
         }
     }
+#endif
 }
 
-// MARK: - Folder Import Picker
+// MARK: - Folder Import/Export Pickers (iOS)
 
+#if os(iOS)
 struct FolderImportPicker: UIViewControllerRepresentable {
     let onPick: (URL) -> Void
 
@@ -470,6 +552,7 @@ struct FolderExportPicker: UIViewControllerRepresentable {
         }
     }
 }
+#endif
 
 // MARK: - Model Row
 
@@ -540,7 +623,34 @@ enum ModelScanner {
             await scanDirectory(docsDir.path, into: &models)
         }
 
-        // Scan bookmarked external folders (imported via Files picker)
+#if os(macOS)
+        // Scan user-added model directories (macOS)
+        if let macPaths = UserDefaults.standard.stringArray(forKey: "macModelPaths") {
+            for path in macPaths {
+                let fm2 = FileManager.default
+                var isDir: ObjCBool = false
+                guard fm2.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
+                if FlashMoEEngine.validateModel(at: path) {
+                    let size = directorySize(at: path)
+                    let hasTiered = fm2.fileExists(atPath: (path as NSString).appendingPathComponent("packed_experts_tiered/layer_00.bin"))
+                    let has4bit = fm2.fileExists(atPath: (path as NSString).appendingPathComponent("packed_experts/layer_00.bin"))
+                    let has2bit = fm2.fileExists(atPath: (path as NSString).appendingPathComponent("packed_experts_2bit/layer_00.bin"))
+                    models.append(LocalModel(
+                        name: URL(fileURLWithPath: path).lastPathComponent,
+                        path: path,
+                        sizeBytes: size,
+                        hasTiered: hasTiered,
+                        has4bit: has4bit,
+                        has2bit: has2bit
+                    ))
+                } else {
+                    await scanDirectory(path, into: &models)
+                }
+            }
+        }
+#endif
+
+        // Scan bookmarked external folders (imported via Files picker on iOS)
         if let bookmarks = UserDefaults.standard.array(forKey: "importedModelBookmarks") as? [Data] {
             for bookmark in bookmarks {
                 var isStale = false
