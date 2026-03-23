@@ -1673,7 +1673,7 @@ static void fused_layer_forward(
         // serial queue ordering guarantees CMD3(N-1) completes before CMD1 starts.
         // CMD1+CMD2 merge: encode CMD2 dispatches into CMD1 for linear attention layers,
         // eliminating one commit+wait cycle per layer (45 layers x ~0.05-0.1ms).
-        if (gpu_linear_attn && g_metal->wf_buf &&
+        if (g_cmd_merge_enabled && gpu_linear_attn && g_metal->wf_buf &&
             lc->gate_w && lc->gate_s && lc->gate_b &&
             lc->sg_w && lc->sg_s && lc->sg_b &&
             lc->su_w && lc->su_s && lc->su_b &&

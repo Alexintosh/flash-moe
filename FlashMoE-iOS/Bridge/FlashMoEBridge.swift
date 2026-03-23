@@ -77,7 +77,7 @@ final class FlashMoEEngine: @unchecked Sendable {
     /// For example, K=4 on a K=10 model cuts I/O by 60%.
     func loadModel(at path: String, maxContext: Int = 0, thinkBudget: Int = 2048,
                    useTiered: Bool = false, activeExpertsK: Int = 0, cacheIOSplit: Int = 1,
-                   verbose: Bool = false) async throws {
+                   cmdMerge: Bool = true, verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
         }
@@ -110,6 +110,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.use_tiered = useTiered ? 1 : 0
                 config.active_experts_k = Int32(activeExpertsK)
                 config.cache_io_split = Int32(cacheIOSplit)
+                config.cmd_merge = cmdMerge ? 1 : 0
                 config.verbose = verbose ? 1 : 0
 
                 // Load

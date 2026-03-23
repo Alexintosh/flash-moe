@@ -206,6 +206,9 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             g_cache_io_split = 1;  // disabled by default
         }
 
+        // CMD1+CMD2 merge toggle (default: enabled)
+        g_cmd_merge_enabled = config->cmd_merge;
+
         // K = experts per token from config
         // K override: allow reducing active experts for memory-constrained devices.
         // Lower K = less I/O per token (linear reduction). Quality degrades gracefully

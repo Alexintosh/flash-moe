@@ -41,6 +41,7 @@ typedef struct {
                                 // Reducing K cuts I/O proportionally (e.g. K=4 on a K=10 model
                                 // reduces expert reads by 60%). Quality degrades gracefully.
     int cache_io_split;         // >1 = split each expert pread into N page-aligned chunks (fanout), 0/1 = disabled
+    int cmd_merge;              // 1 = merge CMD1+CMD2 for linear attention (default), 0 = separate (safer)
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 

@@ -69,6 +69,7 @@ static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // >1: split each routed expert pread into N page-aligned chunks (fanout)
+static int g_cmd_merge_enabled = 1; // 1: merge CMD1+CMD2 for linear attention (saves ~2ms/token), 0: separate
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
 // Runtime KV sequence limit — set before model load.

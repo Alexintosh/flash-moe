@@ -36,6 +36,7 @@ struct ModelListView: View {
     @State private var selectedModel: LocalModel?
     @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 1
     @AppStorage("activeExpertsK") private var activeExpertsK: Int = 0
+    @AppStorage("cmdMergeEnabled") private var cmdMergeEnabled: Bool = true
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
@@ -142,6 +143,13 @@ struct ModelListView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                Toggle("CMD1+CMD2 Merge", isOn: $cmdMergeEnabled)
+                Text(cmdMergeEnabled
+                     ? "Merges GPU command buffers for linear attention layers. Faster but experimental."
+                     : "Separate command buffers. Safer, slightly slower.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if let error = downloadManager.error,
@@ -359,6 +367,7 @@ struct ModelListView: View {
                     useTiered: model.hasTiered,
                     activeExpertsK: activeK,
                     cacheIOSplit: cacheIOSplit,
+                    cmdMerge: cmdMergeEnabled,
                     verbose: true
                 )
             } catch {
