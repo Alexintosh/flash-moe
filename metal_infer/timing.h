@@ -80,7 +80,7 @@ static void **g_layer_mmaps_global = NULL;        // [cfg.num_layers] mmap bases
 static size_t *g_layer_mmap_sizes_global = NULL;  // [cfg.num_layers] mmap sizes
 static int g_prefetch_active = 0;                 // 1 if async prefetch for next layer is in-flight
 static int g_prefetch_layer = -1;                 // which layer the in-flight prefetch targets
-static int g_expert_prefetch_enabled = 1;         // default ON; toggled via config/CLI
+static int g_expert_prefetch_enabled = 0;         // default OFF until validated; toggled via config/CLI
 static int g_prefetch_hits_total = 0;             // cross-layer prefetch hit counter
 static int g_prefetch_misses_total = 0;           // cross-layer prefetch miss counter
 

@@ -40,7 +40,7 @@ struct ModelListView: View {
     @AppStorage("fusedAttention") private var fusedAttention: Bool = false
     @AppStorage("thinkingEnabled") private var thinkingEnabled: Bool = true
     @AppStorage("thinkBudget") private var thinkBudget: Int = 2048
-    @AppStorage("expertPrefetch") private var expertPrefetch: Bool = true
+    @AppStorage("expertPrefetch") private var expertPrefetch: Bool = false
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
