@@ -32,6 +32,7 @@ struct ChatView: View {
     @State private var showProfiler = false
     @State private var scrollAnchor = UUID()  // updates on each token to trigger scroll
     @FocusState private var inputFocused: Bool
+    @AppStorage("thinkingEnabled") private var thinkingEnabled: Bool = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -251,7 +252,10 @@ struct ChatView: View {
 
     /// Format conversation as Qwen chat template
     private func buildChatPrompt(userMessage: String) -> String {
-        var prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        let sysContent = thinkingEnabled
+            ? "You are a helpful assistant."
+            : "You are a helpful assistant. /no_think"
+        var prompt = "<|im_start|>system\n\(sysContent)<|im_end|>\n"
 
         // Include conversation history (skip the empty assistant message we just appended)
         for msg in messages.dropLast() {

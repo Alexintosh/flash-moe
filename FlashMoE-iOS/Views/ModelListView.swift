@@ -38,6 +38,8 @@ struct ModelListView: View {
     @AppStorage("activeExpertsK") private var activeExpertsK: Int = 0
     @AppStorage("cmdMergeEnabled") private var cmdMergeEnabled: Bool = true
     @AppStorage("fusedAttention") private var fusedAttention: Bool = false
+    @AppStorage("thinkingEnabled") private var thinkingEnabled: Bool = true
+    @AppStorage("thinkBudget") private var thinkBudget: Int = 2048
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
@@ -122,8 +124,11 @@ struct ModelListView: View {
                     Text("K=2 (fastest, lowest quality)").tag(2)
                     Text("K=3").tag(3)
                     Text("K=4").tag(4)
+                    Text("K=5").tag(5)
                     Text("K=6").tag(6)
+                    Text("K=7").tag(7)
                     Text("K=8").tag(8)
+                    Text("K=9").tag(9)
                     Text("K=10 (full quality)").tag(10)
                 }
                 .pickerStyle(.menu)
@@ -159,6 +164,25 @@ struct ModelListView: View {
                      : "Standard 3-kernel attention pipeline (scores, softmax, values). Proven correct.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Toggle("Thinking", isOn: $thinkingEnabled)
+                Text(thinkingEnabled
+                     ? "Model can reason in <think> tags before answering."
+                     : "Thinking disabled — model answers directly. Better for low K values.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if thinkingEnabled {
+                    Picker("Think Budget", selection: $thinkBudget) {
+                        Text("128 tokens").tag(128)
+                        Text("256 tokens").tag(256)
+                        Text("512 tokens").tag(512)
+                        Text("1024 tokens").tag(1024)
+                        Text("2048 tokens (default)").tag(2048)
+                        Text("Unlimited").tag(0)
+                    }
+                    .pickerStyle(.menu)
+                }
             }
 
             if let error = downloadManager.error,
@@ -373,6 +397,7 @@ struct ModelListView: View {
             do {
                 try await engine.loadModel(
                     at: model.path,
+                    thinkBudget: thinkingEnabled ? thinkBudget : -1,
                     useTiered: model.hasTiered,
                     activeExpertsK: activeK,
                     cacheIOSplit: cacheIOSplit,

@@ -180,9 +180,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         // Set runtime KV sequence limit — kv_cache_new() and GPU buffers use this
         g_kv_seq_len = cfg.max_seq_len;
 
-        if (config->think_budget > 0) {
-            g_think_budget = config->think_budget;
-        }
+        // think_budget: >0 = max thinking tokens, 0 = unlimited, -1 = disable thinking entirely
+        g_think_budget = config->think_budget;
 
         // Set tiered mode
         g_use_tiered = config->use_tiered;
@@ -612,6 +611,7 @@ void flashmoe_unload(FlashMoEContext *ctx) {
             g_metal->rms_norm_apply_bf16 = nil;
             g_metal->residual_add = nil;
             g_metal->swiglu = nil;
+            g_metal->fused_gate_up = nil;
             g_metal->attn_scores_pipe = nil;
             g_metal->attn_softmax_pipe = nil;
             g_metal->attn_values_pipe = nil;
@@ -896,8 +896,11 @@ int flashmoe_generate(
             lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
             next_token = cpu_argmax(ctx->logits, cfg.vocab_size);
 
-            // Think budget: force end thinking
-            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
+            // Think budget: -1 = disabled (immediate end), >0 = max tokens, 0 = unlimited
+            if (in_think && g_think_budget < 0) {
+                next_token = cfg.think_end_token;
+                in_think = 0;
+            } else if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
                 next_token = cfg.think_end_token;
                 in_think = 0;
             }
