@@ -36,6 +36,7 @@ typedef struct {
     int max_context;            // Max sequence length (0 = use model default)
     int think_budget;           // Max thinking tokens (0 = unlimited)
     int use_tiered;             // 1 = use tiered quantization if available, 0 = auto-detect
+    int use_2bit;               // 1 = force 2-bit experts, 0 = auto-detect from directory
     int active_experts_k;       // Override K (experts per token). 0 = use model default.
                                 // Reducing K cuts I/O proportionally (e.g. K=4 on a K=10 model
                                 // reduces expert reads by 60%). Quality degrades gracefully.

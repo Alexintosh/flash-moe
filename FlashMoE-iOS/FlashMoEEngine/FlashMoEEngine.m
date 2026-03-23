@@ -173,7 +173,18 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
 
         // Set tiered mode
         g_use_tiered = config->use_tiered;
-        g_use_2bit = 0;
+        g_use_2bit = config->use_2bit;
+
+        // Auto-detect 2-bit experts if not explicitly set and no 4-bit/tiered found
+        if (!g_use_2bit && !g_use_tiered) {
+            char probe_4bit[1024], probe_2bit[1024];
+            snprintf(probe_4bit, sizeof(probe_4bit), "%s/packed_experts/layer_00.bin", model_path);
+            snprintf(probe_2bit, sizeof(probe_2bit), "%s/packed_experts_2bit/layer_00.bin", model_path);
+            if (access(probe_4bit, R_OK) != 0 && access(probe_2bit, R_OK) == 0) {
+                g_use_2bit = 1;
+                NSLog(@"[FlashMoE] Auto-detected 2-bit expert files");
+            }
+        }
 
         // Set cache I/O split (fanout mode): >1 = split expert preads into N chunks
         if (config->cache_io_split > 1) {
@@ -287,12 +298,23 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             ctx->layer_mmap_sizes[i] = 0;
             if (ctx->layer_fds[i] >= 0) {
                 fcntl(ctx->layer_fds[i], F_RDAHEAD, 0);
-                struct stat st;
-                if (fstat(ctx->layer_fds[i], &st) == 0 && st.st_size > 0) {
-                    ctx->layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE,
-                                                ctx->layer_fds[i], 0);
-                    if (ctx->layer_mmaps[i] != MAP_FAILED) {
-                        ctx->layer_mmap_sizes[i] = st.st_size;
+#if TARGET_OS_IOS
+                // On real iOS devices, do NOT mmap expert files.
+                // mmap'ing all expert layers (e.g. 60 × 1.9GB = 112GB for 397B)
+                // causes jetsam kills. Use pread() only on iOS.
+                // (macOS / Mac Catalyst can still mmap.)
+                if (![[NSProcessInfo processInfo] isMacCatalystApp]) {
+                    // pread-only: leave layer_mmaps[i] = MAP_FAILED
+                } else
+#endif
+                {
+                    struct stat st;
+                    if (fstat(ctx->layer_fds[i], &st) == 0 && st.st_size > 0) {
+                        ctx->layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE,
+                                                    ctx->layer_fds[i], 0);
+                        if (ctx->layer_mmaps[i] != MAP_FAILED) {
+                            ctx->layer_mmap_sizes[i] = st.st_size;
+                        }
                     }
                 }
             }
@@ -448,8 +470,106 @@ void flashmoe_unload(FlashMoEContext *ctx) {
         g_cache_telemetry_enabled = 0;
 
         // Release Metal context
-        // (Note: MetalCtx uses ARC for ObjC objects, but struct is malloc'd)
+        // MetalCtx is malloc'd but contains ARC-managed id<> objects.
+        // Must nil every id<> field so ARC decrements refcounts before free().
+        // Without this, switching models corrupts the heap (objc Method cache corrupted).
         if (g_metal) {
+            // Nil every ARC-managed id<> field so refcounts are decremented.
+            // Without this, switching models leaks Metal objects and corrupts the heap.
+            g_metal->device = nil;
+            g_metal->queue = nil;
+            g_metal->library = nil;
+            // Pipeline states
+            g_metal->matvec_v3 = nil;
+            g_metal->matvec_v5 = nil;
+            g_metal->matvec_fast = nil;
+            g_metal->matvec_2bit = nil;
+            g_metal->rms_norm_sum = nil;
+            g_metal->rms_norm_apply = nil;
+            g_metal->rms_norm_apply_bf16 = nil;
+            g_metal->residual_add = nil;
+            g_metal->swiglu = nil;
+            g_metal->attn_scores_pipe = nil;
+            g_metal->attn_softmax_pipe = nil;
+            g_metal->attn_values_pipe = nil;
+            g_metal->sigmoid_gate_pipe = nil;
+            g_metal->moe_combine_residual = nil;
+            // GPU linear attention pipelines
+            g_metal->delta_net_step = nil;
+            g_metal->conv1d_step = nil;
+            g_metal->rms_norm_qk = nil;
+            g_metal->compute_decay_beta = nil;
+            g_metal->gated_rms_norm = nil;
+            // Shared event
+            g_metal->pipeline_event = nil;
+            // Buffers
+            g_metal->buf_input = nil;
+            g_metal->buf_output = nil;
+            g_metal->wf_buf = nil;
+            g_metal->wf_staging = nil;
+            for (int i = 0; i < MAX_WF_CHUNKS; i++) g_metal->wf_chunks[i] = nil;
+            for (int i = 0; i < MAX_BATCH_SLOTS; i++) g_metal->batch_out[i] = nil;
+            // Expert buffers
+            g_metal->buf_expert_data = nil;
+            g_metal->buf_expert_input = nil;
+            g_metal->buf_expert_gate = nil;
+            g_metal->buf_expert_up = nil;
+            g_metal->buf_expert_act = nil;
+            g_metal->buf_expert_out = nil;
+            for (int i = 0; i < MAX_K; i++) {
+                g_metal->buf_multi_expert_data[i] = nil;
+                g_metal->buf_multi_expert_data_B[i] = nil;
+                g_metal->buf_multi_expert_gate[i] = nil;
+                g_metal->buf_multi_expert_up[i] = nil;
+                g_metal->buf_multi_expert_act[i] = nil;
+                g_metal->buf_multi_expert_out[i] = nil;
+            }
+            g_metal->buf_multi_expert_input = nil;
+            g_metal->buf_shared_gate = nil;
+            g_metal->buf_shared_up = nil;
+            g_metal->buf_shared_act = nil;
+            g_metal->buf_shared_out = nil;
+            g_metal->buf_residual = nil;
+            g_metal->buf_h_mid = nil;
+            g_metal->buf_sum_sq = nil;
+            g_metal->buf_moe_hidden = nil;
+            g_metal->buf_combine_params = nil;
+            g_metal->buf_cmd3_sum_sq = nil;
+            // GPU attention buffers
+            g_metal->buf_attn_q = nil;
+            g_metal->buf_attn_scores = nil;
+            g_metal->buf_attn_out = nil;
+            g_metal->buf_attn_gate = nil;
+            if (g_metal->buf_kv_k) {
+                for (int i = 0; i < cfg.num_full_attn_layers; i++) {
+                    g_metal->buf_kv_k[i] = nil;
+                    g_metal->buf_kv_v[i] = nil;
+                }
+                free(g_metal->buf_kv_k); g_metal->buf_kv_k = NULL;
+                free(g_metal->buf_kv_v); g_metal->buf_kv_v = NULL;
+            }
+            // Delta-net GPU buffers
+            if (g_metal->buf_delta_state) {
+                for (int i = 0; i < cfg.num_linear_layers; i++) {
+                    g_metal->buf_delta_state[i] = nil;
+                }
+                free(g_metal->buf_delta_state); g_metal->buf_delta_state = NULL;
+            }
+            if (g_metal->buf_conv_state) {
+                for (int i = 0; i < cfg.num_linear_layers; i++) {
+                    g_metal->buf_conv_state[i] = nil;
+                }
+                free(g_metal->buf_conv_state); g_metal->buf_conv_state = NULL;
+            }
+            // Delta-net scratch buffers
+            g_metal->buf_delta_q = nil;
+            g_metal->buf_delta_k = nil;
+            g_metal->buf_delta_v = nil;
+            g_metal->buf_delta_g_decay = nil;
+            g_metal->buf_delta_beta = nil;
+            g_metal->buf_delta_output = nil;
+            g_metal->buf_conv_input = nil;
+            g_metal->buf_conv_output = nil;
             free(g_metal);
             g_metal = NULL;
         }
