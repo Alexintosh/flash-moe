@@ -313,7 +313,11 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         }
 
         // Wrap weight file for Metal GPU access
-        metal_set_weights(g_metal, ctx->wf->data, ctx->wf->size);
+        if (ctx->wf->is_split) {
+            metal_set_weights_split(g_metal, ctx->wf);
+        } else {
+            metal_set_weights(g_metal, ctx->wf->data, ctx->wf->size);
+        }
 
         // ---- Load vocabulary ----
         ctx->vocab = load_vocab(vocab_path);

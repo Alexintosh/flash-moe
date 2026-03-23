@@ -149,9 +149,13 @@ static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
 // ============================================================================
 
 typedef struct {
-    void *data;
-    size_t size;
+    void *data;          // mmap base (or part 0 base for split files)
+    size_t size;         // total logical size (sum of both parts for split)
     TensorManifest *manifest;
+    // Split weight support: two independently mmap'd regions
+    int is_split;
+    void *split_data[2]; // [0] = part 0 base, [1] = part 1 base
+    size_t split_size[2]; // sizes of each part
 } WeightFile;
 
 // Try to mmap a split weight file (model_weights_0.bin + model_weights_1.bin)
@@ -176,29 +180,31 @@ static int open_split_weights(const char *dir_path, void **out_data, size_t *out
     size_t size0 = st0.st_size, size1 = st1.st_size;
     size_t total = size0 + size1;
 
-    // Reserve a contiguous virtual range, then map each file into its portion
-    void *base = mmap(NULL, total, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (base == MAP_FAILED) {
-        fprintf(stderr, "ERROR: Cannot reserve %zu bytes for split weights\n", total);
-        close(fd0); close(fd1);
+    // mmap each file independently (MAP_FIXED not available on iOS)
+    void *m0 = mmap(NULL, size0, PROT_READ, MAP_PRIVATE, fd0, 0);
+    close(fd0);
+    if (m0 == MAP_FAILED) {
+        fprintf(stderr, "ERROR: Split weight mmap part 0 failed: %s\n", strerror(errno));
+        close(fd1);
         return -1;
     }
 
-    void *m0 = mmap(base, size0, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd0, 0);
-    void *m1 = mmap((char *)base + size0, size1, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd1, 0);
-    close(fd0); close(fd1);
-
-    if (m0 == MAP_FAILED || m1 == MAP_FAILED) {
-        fprintf(stderr, "ERROR: Split weight mmap failed: %s\n", strerror(errno));
-        munmap(base, total);
+    void *m1 = mmap(NULL, size1, PROT_READ, MAP_PRIVATE, fd1, 0);
+    close(fd1);
+    if (m1 == MAP_FAILED) {
+        fprintf(stderr, "ERROR: Split weight mmap part 1 failed: %s\n", strerror(errno));
+        munmap(m0, size0);
         return -1;
     }
 
-    madvise(base, total, MADV_SEQUENTIAL);
+    madvise(m0, size0, MADV_SEQUENTIAL);
+    madvise(m1, size1, MADV_SEQUENTIAL);
     printf("[weights] mmap'd split weights: %.2f GB + %.2f GB = %.2f GB\n",
            size0 / 1e9, size1 / 1e9, total / 1e9);
 
-    *out_data = base;
+    // Use m0 as the base pointer. Tensors in part 1 (offset >= size0) will
+    // need special handling in get_tensor_ptr via the split metadata.
+    *out_data = m0;
     *out_size = total;
     *out_mmap0 = m0; *out_size0 = size0;
     *out_mmap1 = m1; *out_size1 = size1;
@@ -260,6 +266,13 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     wf->data = data;
     wf->size = size;
     wf->manifest = manifest;
+    wf->is_split = is_split;
+    if (is_split) {
+        wf->split_data[0] = split_mmap0;
+        wf->split_size[0] = split_size0;
+        wf->split_data[1] = split_mmap1;
+        wf->split_size[1] = split_size1;
+    }
 
     return wf;
 }
@@ -269,6 +282,10 @@ static void *get_tensor_ptr(WeightFile *wf, const char *name) {
     if (!t) {
         fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
         return NULL;
+    }
+    if (wf->is_split && t->offset >= wf->split_size[0]) {
+        // Tensor lives in part 1
+        return (char *)wf->split_data[1] + (t->offset - wf->split_size[0]);
     }
     return (char *)wf->data + t->offset;
 }

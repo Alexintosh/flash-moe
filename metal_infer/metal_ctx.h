@@ -528,6 +528,9 @@ static void reset_delta_net_state(void) {
 // Metal enforces a hard 4GB per-buffer limit. Files >4GB get two overlapping buffers.
 #define METAL_MAX_BUF ((size_t)4096 * 1024 * 1024 - 16384)  // 4GB - 1 page
 #define WF_STAGING_SIZE ((size_t)50 * 1024 * 1024)  // legacy, kept for compile compat
+// Forward declaration: called with split info when weight file is split
+static void metal_set_weights_split(MetalCtx *ctx, WeightFile *wf);
+
 static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
     size_t page_size = 16384;
     ctx->wf_mmap_base = data;
@@ -593,6 +596,53 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
            ctx->wf_buf ? "SET" : "nil", ctx->wf_num_chunks);
 }
 
+// Split weight file: each part is independently mmap'd, each gets its own Metal buffer.
+// Tensor offsets in the manifest are absolute (as if the file were contiguous).
+// metal_find_chunk_sized already handles multi-chunk lookup via wf_chunk_offsets.
+static void metal_set_weights_split(MetalCtx *ctx, WeightFile *wf) {
+    size_t page_size = 16384;
+    ctx->wf_mmap_base = wf->data;
+    ctx->wf_mmap_size = wf->size;
+    ctx->wf_num_chunks = 0;
+    ctx->wf_staging = nil;
+    ctx->wf_staging_used = 0;
+    ctx->wf_buf = nil;
+
+    size_t s0 = wf->split_size[0];
+    size_t s1 = wf->split_size[1];
+    size_t a0 = (s0 + page_size - 1) & ~(page_size - 1);
+    size_t a1 = (s1 + page_size - 1) & ~(page_size - 1);
+
+    printf("[metal] Split weight files: %.2f GB + %.2f GB (total %.2f GB)\n",
+           s0 / 1e9, s1 / 1e9, wf->size / 1e9);
+
+    ctx->wf_chunks[0] = [ctx->device newBufferWithBytesNoCopy:wf->split_data[0]
+                                                       length:a0
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+    ctx->wf_chunks[1] = [ctx->device newBufferWithBytesNoCopy:wf->split_data[1]
+                                                       length:a1
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+
+    if (ctx->wf_chunks[0] && ctx->wf_chunks[1]) {
+        ctx->wf_buf = ctx->wf_chunks[0];
+        ctx->wf_chunk_offsets[0] = 0;
+        ctx->wf_chunk_sizes[0] = a0;
+        ctx->wf_chunk_offsets[1] = s0;  // logical offset where part 1 starts
+        ctx->wf_chunk_sizes[1] = a1;
+        ctx->wf_num_chunks = 2;
+        printf("[metal] Split Metal buffers ready: chunk0=%.2f GB, chunk1=%.2f GB\n",
+               s0 / 1e9, s1 / 1e9);
+    } else {
+        fprintf(stderr, "WARNING: Cannot create split Metal buffers — CPU fallback\n");
+        ctx->wf_chunks[0] = nil;
+        ctx->wf_chunks[1] = nil;
+    }
+    printf("[metal] metal_set_weights_split done: wf_buf=%s wf_num_chunks=%d\n",
+           ctx->wf_buf ? "SET" : "nil", ctx->wf_num_chunks);
+}
+
 // GPU dequant matvec: out[out_dim] = W_4bit * x[in_dim]
 // W_packed, scales, biases are pointers into mmap'd weight file
 // x_f32 is CPU float array, result written back to out_f32
@@ -645,7 +695,20 @@ static inline void metal_find_chunk_sized(MetalCtx *ctx, const void *ptr, size_t
         metal_stage(ctx, ptr, size, out_buf, out_offset);
         return;
     }
-    // Chunk mode: find the zero-copy Metal buffer containing this pointer
+    // Chunk mode: find the zero-copy Metal buffer containing this pointer.
+    // For split files, pointers may be in EITHER mmap region (not contiguous).
+    // We check each chunk's actual backing pointer range.
+    for (int i = 0; i < ctx->wf_num_chunks; i++) {
+        const char *chunk_base = (const char *)[ctx->wf_chunks[i] contents];
+        size_t chunk_len = [ctx->wf_chunks[i] length];
+        const char *p = (const char *)ptr;
+        if (p >= chunk_base && p < chunk_base + chunk_len) {
+            *out_buf = ctx->wf_chunks[i];
+            *out_offset = (NSUInteger)(p - chunk_base);
+            return;
+        }
+    }
+    // Fallback: compute offset from mmap base (works for single contiguous file)
     size_t abs_off = (const char *)ptr - (const char *)ctx->wf_mmap_base;
     for (int i = ctx->wf_num_chunks - 1; i >= 0; i--) {
         if (abs_off >= ctx->wf_chunk_offsets[i]) {
