@@ -218,6 +218,7 @@ static void gpu_encode_expert_forward_slot(
     uint32_t num_tgs = (gate_up_out + 7) / 8;
 
     // 4-bit: fused gate+up+SwiGLU; 2-bit: separate dispatches
+    // NOTE: fused kernel = 1 TG per row (not ROWS_PER_TG=8)
     if (!g_use_2bit && g_fused_expert_enabled && ctx->fused_gate_up) {
         // fused_gate_up_swiglu: data[k] -> act[k] directly
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
@@ -233,7 +234,7 @@ static void gpu_encode_expert_forward_slot(
         [enc setBytes:&gate_up_out length:4 atIndex:8];
         [enc setBytes:&gate_up_in  length:4 atIndex:9];
         [enc setBytes:&gs          length:4 atIndex:10];
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(gate_up_out, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     } else {
@@ -335,6 +336,7 @@ static void gpu_encode_expert_forward_slot_buf(
     uint32_t num_tgs = (gate_up_out + 7) / 8;
 
     // 4-bit: fused gate+up+SwiGLU; 2-bit: separate dispatches
+    // NOTE: fused kernel = 1 TG per row (not ROWS_PER_TG=8)
     if (!g_use_2bit && g_fused_expert_enabled && ctx->fused_gate_up) {
         // fused_gate_up_swiglu: data_buf -> act[k] directly
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
@@ -350,7 +352,7 @@ static void gpu_encode_expert_forward_slot_buf(
         [enc setBytes:&gate_up_out length:4 atIndex:8];
         [enc setBytes:&gate_up_in  length:4 atIndex:9];
         [enc setBytes:&gs          length:4 atIndex:10];
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(gate_up_out, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     } else {
@@ -479,6 +481,8 @@ static void gpu_encode_experts_batched(
         // 2-bit path: fallback to separate gate, up, SwiGLU dispatches
         if (!use_2bit_k && g_fused_expert_enabled && ctx->fused_gate_up) {
             // Encoder A: fused_gate_up_swiglu -> act[k] directly
+            // NOTE: fused kernel uses 1 threadgroup per output row (like matvec_fast),
+            // NOT ROWS_PER_TG=8 rows per threadgroup (like matvec_v3).
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                 [enc setComputePipelineState:ctx->fused_gate_up];
@@ -493,7 +497,7 @@ static void gpu_encode_experts_batched(
                 [enc setBytes:&gate_up_out length:4 atIndex:8];
                 [enc setBytes:&gate_up_in  length:4 atIndex:9];
                 [enc setBytes:&gs          length:4 atIndex:10];
-                [enc dispatchThreadgroups:MTLSizeMake(gate_up_tgs, 1, 1)
+                [enc dispatchThreadgroups:MTLSizeMake(gate_up_out, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
             }
@@ -597,6 +601,7 @@ static void gpu_encode_expert_forward(
     uint32_t num_tgs = (gate_up_out + 7) / 8;
 
     // Always 4-bit in this path: use fused kernel if available
+    // NOTE: fused kernel = 1 TG per row (not ROWS_PER_TG=8)
     if (g_fused_expert_enabled && ctx->fused_gate_up) {
         // fused_gate_up_swiglu: expert_data -> expert_act directly
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
@@ -612,7 +617,7 @@ static void gpu_encode_expert_forward(
         [enc setBytes:&gate_up_out length:4 atIndex:8];
         [enc setBytes:&gate_up_in  length:4 atIndex:9];
         [enc setBytes:&gs          length:4 atIndex:10];
-        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(gate_up_out, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     } else {
