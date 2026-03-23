@@ -78,6 +78,7 @@ final class FlashMoEEngine: @unchecked Sendable {
     func loadModel(at path: String, maxContext: Int = 0, thinkBudget: Int = 2048,
                    useTiered: Bool = false, activeExpertsK: Int = 0, cacheIOSplit: Int = 1,
                    cmdMerge: Bool = true, fusedAttention: Bool = false,
+                   expertPrefetch: Bool = true,
                    verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
@@ -113,6 +114,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.cache_io_split = Int32(cacheIOSplit)
                 config.cmd_merge = cmdMerge ? 1 : 0
                 config.fused_attention = fusedAttention ? 1 : 0
+                config.expert_prefetch = expertPrefetch ? 1 : 0
                 config.verbose = verbose ? 1 : 0
 
                 // Load
