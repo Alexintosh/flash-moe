@@ -1430,6 +1430,7 @@ typedef struct {
     uint64_t event_value;                // monotonically increasing event counter
     // GPU delta-net (gated_delta_net_step) and conv1d pipelines
     id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
+    id<MTLComputePipelineState> delta_net_step_fused;  // gated_delta_net_step_fused kernel (pass 2+3 merged)
     id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
     id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
@@ -1534,12 +1535,14 @@ static MetalCtx *metal_setup(void) {
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
+    ctx->delta_net_step_fused = makePipe(@"gated_delta_net_step_fused");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
     ctx->rms_norm_qk       = makePipe(@"rms_norm_qk");
     ctx->compute_decay_beta = makePipe(@"compute_decay_beta");
     ctx->gated_rms_norm    = makePipe(@"gated_rms_norm");
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
     if (!ctx->delta_net_step) fprintf(stderr, "[metal] WARNING: gated_delta_net_step pipeline failed (CPU fallback)\n");
+    if (!ctx->delta_net_step_fused) fprintf(stderr, "[metal] WARNING: gated_delta_net_step_fused pipeline failed (using unfused fallback)\n");
     if (!ctx->conv1d_step)    fprintf(stderr, "[metal] WARNING: conv1d_step pipeline failed (CPU fallback)\n");
     if (!ctx->rms_norm_qk)       fprintf(stderr, "[metal] WARNING: rms_norm_qk pipeline failed (CPU fallback)\n");
     if (!ctx->compute_decay_beta) fprintf(stderr, "[metal] WARNING: compute_decay_beta pipeline failed (CPU fallback)\n");
@@ -4921,10 +4924,11 @@ static void fused_layer_forward(
             }
 
             // Enc L4: gated_delta_net_step — the main recurrence
+            // Use fused kernel (pass 2+3 merged) when available, original as fallback
             {
                 uint32_t khpv = cfg.linear_num_v_heads / cfg.linear_num_k_heads;  // 4
                 id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->delta_net_step];
+                [enc setComputePipelineState:g_metal->delta_net_step_fused ? g_metal->delta_net_step_fused : g_metal->delta_net_step];
                 [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0]; // persistent state
                 [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:1]; // q (first 2048 floats)
                 [enc setBuffer:g_metal->buf_conv_output offset:cfg.linear_total_key * sizeof(float) atIndex:2]; // k (next 2048)
@@ -5079,11 +5083,11 @@ static void fused_layer_forward(
                     [enc endEncoding];
                 }
 
-                // Enc L4: gated_delta_net_step
+                // Enc L4: gated_delta_net_step (fused pass 2+3 when available)
                 {
                     uint32_t khpv = cfg.linear_num_v_heads / cfg.linear_num_k_heads;
                     id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    [enc setComputePipelineState:g_metal->delta_net_step];
+                    [enc setComputePipelineState:g_metal->delta_net_step_fused ? g_metal->delta_net_step_fused : g_metal->delta_net_step];
                     [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0];
                     [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];
                     [enc setBuffer:g_metal->buf_conv_output offset:cfg.linear_total_key * sizeof(float) atIndex:2];

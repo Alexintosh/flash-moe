@@ -1098,6 +1098,62 @@ kernel void gated_delta_net_step(
 
 
 // ============================================================================
+// Kernel 10b: Fused GatedDeltaNet recurrence step (pass 2+3 merged)
+// ============================================================================
+//
+// Same as gated_delta_net_step but fuses the delta update (pass 2) and output
+// query (pass 3) into a single loop over the 128-element state row. This
+// eliminates 128 state reads per thread × 128 threads × 64 heads = ~1M fewer
+// device memory reads per token.
+//
+// Pass 1 (decay + kv_mem) remains separate because it must complete before
+// computing delta = (v[vi] - kv_mem) * beta.
+//
+// Dispatch: identical to gated_delta_net_step.
+
+kernel void gated_delta_net_step_fused(
+    device float *state,             // [64 * 128 * 128] persistent state
+    device const float *q,           // [2048] (16 k-heads * 128)
+    device const float *k,           // [2048] (16 k-heads * 128)
+    device const float *v,           // [8192] (64 v-heads * 128)
+    device const float *g_decay,     // [64] per v-head
+    device const float *beta_gate,   // [64] per v-head
+    device float *output,            // [8192] (64 v-heads * 128)
+    constant uint &k_heads_per_v,    // = 4
+    uint head_id [[threadgroup_position_in_grid]],
+    uint vi [[thread_position_in_threadgroup]]
+) {
+    uint kh = head_id / k_heads_per_v;
+    float g = g_decay[head_id];
+    float beta = beta_gate[head_id];
+
+    uint state_base = head_id * 128 * 128 + vi * 128;
+    uint k_base = kh * 128;
+    uint v_base = head_id * 128;
+
+    // Pass 1: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
+    float kv_mem = 0.0f;
+    for (uint ki = 0; ki < 128; ki++) {
+        float s = state[state_base + ki] * g;
+        state[state_base + ki] = s;
+        kv_mem += s * k[k_base + ki];
+    }
+
+    // Pass 2+3 fused: Delta update + output query in single loop
+    // After S[vi][ki] += k[ki] * delta, state is final — immediately
+    // accumulate out += S[vi][ki] * q[ki] in the same iteration.
+    float delta = (v[v_base + vi] - kv_mem) * beta;
+    float out_val = 0.0f;
+    for (uint ki = 0; ki < 128; ki++) {
+        float s = state[state_base + ki] + k[k_base + ki] * delta;
+        state[state_base + ki] = s;
+        out_val += s * q[k_base + ki];
+    }
+    output[v_base + vi] = out_val;
+}
+
+
+// ============================================================================
 // Kernel 11: Conv1d depthwise step (single token, incremental inference)
 // ============================================================================
 //
