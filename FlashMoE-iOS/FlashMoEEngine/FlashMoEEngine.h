@@ -44,6 +44,7 @@ typedef struct {
     int cmd_merge;              // 1 = merge CMD1+CMD2 for linear attention (default), 0 = separate (safer)
     int fused_attention;        // 1 = fused online softmax attention (experimental), 0 = 3-kernel fallback
     int expert_prefetch;        // 1 = prefetch next layer's experts during CMD3 (default), 0 = disabled
+    int fused_expert;           // 1 = fused gate+up+SwiGLU kernel (default), 0 = separate dispatches
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 

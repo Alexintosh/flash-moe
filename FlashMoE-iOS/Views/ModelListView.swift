@@ -41,6 +41,7 @@ struct ModelListView: View {
     @AppStorage("thinkingEnabled") private var thinkingEnabled: Bool = true
     @AppStorage("thinkBudget") private var thinkBudget: Int = 2048
     @AppStorage("expertPrefetch") private var expertPrefetch: Bool = false
+    @AppStorage("fusedExpert") private var fusedExpert: Bool = true
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
@@ -163,6 +164,13 @@ struct ModelListView: View {
                 Text(fusedAttention
                      ? "Single-kernel online softmax attention. Experimental — reduces GPU dispatches."
                      : "Standard 3-kernel attention pipeline (scores, softmax, values). Proven correct.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Fused Expert Kernel", isOn: $fusedExpert)
+                Text(fusedExpert
+                     ? "Fused gate+up+SwiGLU in one kernel. Fewer GPU dispatches per expert."
+                     : "Separate gate, up, SwiGLU dispatches per expert.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -412,6 +420,7 @@ struct ModelListView: View {
                     cmdMerge: cmdMergeEnabled,
                     fusedAttention: fusedAttention,
                     expertPrefetch: expertPrefetch,
+                    fusedExpert: fusedExpert,
                     verbose: true
                 )
             } catch {

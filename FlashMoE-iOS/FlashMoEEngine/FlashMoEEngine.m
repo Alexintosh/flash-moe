@@ -405,6 +405,7 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         g_layer_mmaps_global = (void **)ctx->layer_mmaps;
         g_layer_mmap_sizes_global = ctx->layer_mmap_sizes;
         g_expert_prefetch_enabled = config->expert_prefetch;
+        g_fused_expert_enabled = config->fused_expert;
         g_prefetch_active = 0;
         g_prefetch_layer = -1;
         g_prefetch_hits_total = 0;

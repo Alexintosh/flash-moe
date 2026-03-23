@@ -71,6 +71,7 @@ static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // >1: split each routed expert pread into N page-aligned chunks (fanout)
 static int g_cmd_merge_enabled = 1; // 1: merge CMD1+CMD2 for linear attention (saves ~2ms/token), 0: separate
 static int g_fused_attention_enabled = 0; // 1: fused online softmax attention (experimental), 0: 3-kernel fallback
+static int g_fused_expert_enabled = 1;   // 1: fused gate+up+SwiGLU kernel (default ON), 0: separate dispatches
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
 // Cross-layer expert prefetch: after CMD3(N) commit, start pread'ing next layer's
