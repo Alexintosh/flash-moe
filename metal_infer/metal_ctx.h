@@ -23,6 +23,7 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
+    id<MTLComputePipelineState> fused_gate_up;  // fused gate+up+SwiGLU kernel (4-bit only)
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
@@ -212,6 +213,7 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
+    ctx->fused_gate_up = makePipe(@"fused_gate_up_swiglu");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");

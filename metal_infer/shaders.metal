@@ -189,7 +189,10 @@ kernel void fused_gate_up_swiglu(
     constant uint&         group_size [[buffer(10)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_size  [[threads_per_simdgroup]]
 ) {
     if (tgid >= out_dim) return;
     uint num_groups = in_dim / group_size;
@@ -215,14 +218,15 @@ kernel void fused_gate_up_swiglu(
             }
         }
     }
-    threadgroup float sg[32], su[32];
+    // Reduction using dynamic SIMD width (future-proof for non-32 SIMD sizes)
+    uint num_simd_groups = tg_size / simd_size;
+    threadgroup float sg[32], su[32];  // max 256/simd_size groups
     float rg = simd_sum(ga), ru = simd_sum(ua);
-    uint sl = lid%32, si = lid/32, ns = (tg_size+31)/32;
-    if (sl==0) { sg[si]=rg; su[si]=ru; }
+    if (simd_lane == 0) { sg[simd_group] = rg; su[simd_group] = ru; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (si==0 && sl<ns) {
-        float vg=simd_sum(sg[sl]), vu=simd_sum(su[sl]);
-        if (sl==0) out[tgid] = (vg/(1.0f+exp(-vg))) * vu;
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float vg = simd_sum(sg[simd_lane]), vu = simd_sum(su[simd_lane]);
+        if (simd_lane == 0) out[tgid] = (vg / (1.0f + exp(-vg))) * vu;
     }
 }
 
