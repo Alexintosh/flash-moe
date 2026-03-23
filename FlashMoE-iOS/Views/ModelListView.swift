@@ -37,6 +37,7 @@ struct ModelListView: View {
     @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 1
     @AppStorage("activeExpertsK") private var activeExpertsK: Int = 0
     @AppStorage("cmdMergeEnabled") private var cmdMergeEnabled: Bool = true
+    @AppStorage("fusedAttention") private var fusedAttention: Bool = false
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
@@ -148,6 +149,13 @@ struct ModelListView: View {
                 Text(cmdMergeEnabled
                      ? "Merges GPU command buffers for linear attention layers. Faster but experimental."
                      : "Separate command buffers. Safer, slightly slower.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Fused Attention", isOn: $fusedAttention)
+                Text(fusedAttention
+                     ? "Single-kernel online softmax attention. Experimental — reduces GPU dispatches."
+                     : "Standard 3-kernel attention pipeline (scores, softmax, values). Proven correct.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -368,6 +376,7 @@ struct ModelListView: View {
                     activeExpertsK: activeK,
                     cacheIOSplit: cacheIOSplit,
                     cmdMerge: cmdMergeEnabled,
+                    fusedAttention: fusedAttention,
                     verbose: true
                 )
             } catch {

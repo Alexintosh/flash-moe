@@ -1203,15 +1203,15 @@ kernel void fused_attention_online(
     // Pointer to this head's query vector
     device const float* qh = Q + tgid * head_dim;
 
-    // Online softmax state: running max, running sum, output accumulator
-    // Each thread maintains its portion of the head_dim-dimensional output
-    float m_prev = -1e30f;  // running max of QK scores
-    float l_prev = 0.0f;    // running sum of exp(score - m)
+    // Online softmax state (FlashAttention-2 style: unnormalized accumulator)
+    // m: running max of QK scores
+    // l: running sum of exp(score - m)
+    // o: unnormalized weighted V accumulator (divided by l at the end)
+    float m_prev = -1e30f;
+    float l_prev = 0.0f;
 
     // Each thread accumulates its slice of the output vector
     // Thread lid handles dimensions lid, lid+tg_size, lid+2*tg_size, ...
-    // We use registers — head_dim is 128 or 256, with 256 threads we get 1 element each
-    // For head_dim=128 with 256 threads, half the threads are idle for V accumulation
     float o_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // max 4 dims per thread (head_dim<=1024)
 
     // Shared memory for QK dot product reduction
@@ -1225,7 +1225,6 @@ kernel void fused_attention_online(
         uint block_len = block_end - block_start;
 
         // Phase 1: Compute QK dot products for this block
-        // Each position in the block gets a dot product computed by all threads
         float block_scores[FUSED_ATTN_BLOCK_SIZE];
         float block_max = -1e30f;
 
@@ -1263,15 +1262,11 @@ kernel void fused_attention_online(
             block_max = max(block_max, s);
         }
 
-        // Phase 2: Online softmax update
-        // m_new = max(m_prev, block_max)
+        // Phase 2: Online softmax update (FlashAttention-2 algorithm)
         float m_new = max(m_prev, block_max);
-
-        // Rescale previous accumulator: O *= exp(m_prev - m_new)
-        // and track the correction factor for l
         float correction = exp(m_prev - m_new);
 
-        // Compute new partial sum for this block
+        // Compute softmax weights for this block (unnormalized)
         float block_sum = 0.0f;
         float block_weights[FUSED_ATTN_BLOCK_SIZE];
         for (uint b = 0; b < block_len; b++) {
@@ -1280,26 +1275,22 @@ kernel void fused_attention_online(
             block_sum += w;
         }
 
-        // Update running sum: l_new = l_prev * correction + block_sum
+        // Update running sum: l = l_prev * correction + block_sum
         float l_new = l_prev * correction + block_sum;
 
-        // Rescale previous output accumulator
-        float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
-        float new_scale = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
-
-        // Phase 3: Accumulate V contributions for this block
+        // Phase 3: Rescale previous accumulator and add V contributions
         for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
             uint d = lid + dim_idx * tg_size;
             if (d >= head_dim) break;
 
-            // Rescale previous accumulator
-            float o_val = o_acc[dim_idx] * rescale;
+            // Rescale previous unnormalized accumulator by correction factor
+            float o_val = o_acc[dim_idx] * correction;
 
-            // Add new V contributions
+            // Add new V contributions (unnormalized — will divide by l at the end)
             for (uint b = 0; b < block_len; b++) {
                 uint pos = block_start + b;
                 float v_val = V_cache[pos * kv_dim + kv_h * head_dim + d];
-                o_val += block_weights[b] * new_scale * v_val;
+                o_val += block_weights[b] * v_val;
             }
             o_acc[dim_idx] = o_val;
         }
@@ -1308,11 +1299,12 @@ kernel void fused_attention_online(
         l_prev = l_new;
     }
 
-    // Write output — each thread writes its dimensions
+    // Write output — normalize by dividing by the total softmax sum
+    float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
     for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
         uint d = lid + dim_idx * tg_size;
         if (d >= head_dim) break;
-        out[tgid * head_dim + d] = o_acc[dim_idx];
+        out[tgid * head_dim + d] = o_acc[dim_idx] * inv_l;
     }
 }
 
@@ -1404,19 +1396,18 @@ kernel void fused_attention_online_fp8(
         }
 
         float l_new = l_prev * correction + block_sum;
-        float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
-        float new_scale = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
 
+        // Rescale previous accumulator and add V contributions (unnormalized)
         for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
             uint d = lid + dim_idx * tg_size;
             if (d >= head_dim) break;
 
-            float o_val = o_acc[dim_idx] * rescale;
+            float o_val = o_acc[dim_idx] * correction;
 
             for (uint b = 0; b < block_len; b++) {
                 uint pos = block_start + b;
                 float v_val = fp8_e4m3_to_float(V_cache_fp8[pos * kv_dim + kv_h * head_dim + d]) * V_scales[pos];
-                o_val += block_weights[b] * new_scale * v_val;
+                o_val += block_weights[b] * v_val;
             }
             o_acc[dim_idx] = o_val;
         }
@@ -1425,10 +1416,12 @@ kernel void fused_attention_online_fp8(
         l_prev = l_new;
     }
 
+    // Final normalization: divide by total softmax sum
+    float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
     for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
         uint d = lid + dim_idx * tg_size;
         if (d >= head_dim) break;
-        out[tgid * head_dim + d] = o_acc[dim_idx];
+        out[tgid * head_dim + d] = o_acc[dim_idx] * inv_l;
     }
 }
 
@@ -1539,14 +1532,13 @@ kernel void fused_attention_online_fc(
         }
 
         float l_new = l_prev * correction + block_sum;
-        float rescale = (l_prev > 0.0f) ? (correction * l_prev / l_new) : 0.0f;
-        float new_scale = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
 
+        // Rescale previous accumulator and add V contributions (unnormalized)
         for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
             uint d = lid + dim_idx * tg_size;
             if (d >= head_dim) break;
 
-            float o_val = o_acc[dim_idx] * rescale;
+            float o_val = o_acc[dim_idx] * correction;
 
             for (uint b = 0; b < block_len; b++) {
                 uint pos = block_start + b;
@@ -1556,7 +1548,7 @@ kernel void fused_attention_online_fc(
                 } else {
                     v_val = ((device const float*)V_cache_raw)[pos * kv_dim + kv_h * head_dim + d];
                 }
-                o_val += block_weights[b] * new_scale * v_val;
+                o_val += block_weights[b] * v_val;
             }
             o_acc[dim_idx] = o_val;
         }
@@ -1565,10 +1557,12 @@ kernel void fused_attention_online_fc(
         l_prev = l_new;
     }
 
+    // Final normalization: divide by total softmax sum
+    float inv_l = (l_prev > 0.0f) ? (1.0f / l_prev) : 0.0f;
     for (uint dim_idx = 0; dim_idx < 4; dim_idx++) {
         uint d = lid + dim_idx * tg_size;
         if (d >= head_dim) break;
-        out[tgid * head_dim + d] = o_acc[dim_idx];
+        out[tgid * head_dim + d] = o_acc[dim_idx] * inv_l;
     }
 }
 

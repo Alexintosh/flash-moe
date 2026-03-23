@@ -2519,9 +2519,7 @@ static void fused_layer_forward(
             // Try fused online softmax attention (single kernel replaces 3-kernel pipeline)
             // Priority: function-constant specialized > type-specific > 3-kernel fallback
             int use_fused = 0;
-            // TODO: fused attention kernels need validation — disabled until verified
-            // The 3-kernel path (scores, softmax, values) is proven correct.
-            if (0 && g_metal->fused_attention_fc_pipe) {
+            if (g_fused_attention_enabled && g_metal->fused_attention_fc_pipe) {
                 // Function-constant specialized path: single kernel handles both FP8 and float32.
                 // Buffer layout is unified: buffers 1-4 are K_cache, K_scales, V_cache, V_scales.
                 // For float32 mode, K_scales and V_scales are unused (compiler eliminated FP8 code).
