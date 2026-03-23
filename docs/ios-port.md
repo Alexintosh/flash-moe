@@ -1,0 +1,163 @@
+# iOS Port Overview
+
+This document summarizes the Flash-MoE iOS port. For full details, see:
+- [FlashMoE-iOS/IOS_PORT.md](../FlashMoE-iOS/IOS_PORT.md) -- complete porting story, problems solved, architecture
+- [FlashMoE-iOS/397B_ANALYSIS.md](../FlashMoE-iOS/397B_ANALYSIS.md) -- 397B on iPhone: memory budget, Metal limits, K-reduction quality
+
+## What We Built
+
+A native SwiftUI iOS app that runs Qwen3.5 MoE models on iPhone, sharing 100% of the C/Metal inference engine with the macOS CLI via unity build (`#include "infer.m"`).
+
+### Results
+
+| Device | Model | K | tok/s | Notes |
+|--------|-------|---|-------|-------|
+| iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B | 8 | **5.5** | Full quality, full GPU path |
+| iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B (tiered) | 8 | **5.5+** | 13.4GB download, same quality |
+| iPhone 17 (12GB, A19) | Qwen3.5-397B-A17B | 4 | ~0.003 | CPU fallback only (Metal 4GB buffer limit) |
+
+iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory.
+
+## iOS App Features
+
+### Chat Interface
+- Streaming token display with typing animation
+- Message bubbles with text selection (long press to copy)
+- Collapsible `<think>` blocks (DisclosureGroup)
+- Special token stripping (`<|endoftext|>`, `<|im_end|>`, `<|im_start|>`)
+- Tap outside keyboard to dismiss
+- New chat / reset conversation
+- KV cache reuse across conversation turns (continuation mode)
+
+### Model Management
+- On-device model scanning (Documents directory)
+- HuggingFace download catalog with per-model K recommendations
+- Background URLSession downloads with progress tracking
+- Swipe-to-delete for downloaded models
+- Import from Files app (UIDocumentPickerViewController) with bookmark or move-to-Documents
+- Export/Move model to Files app for cross-app access
+- Model info sheet (layers, experts, hidden dim, vocab, file sizes)
+
+### Expert Settings
+- K value picker (2-10) for K-reduction (fewer experts = less I/O, lower quality)
+- Fanout chunks picker (off/2/4/8) for I/O splitting
+- Adaptive context length based on available device memory
+- K-reduction for memory-constrained devices (reduces expert I/O proportionally)
+
+### Profiler
+- Resource monitoring overlay
+- Thermal state indicator (Cool/Warm/Hot/Critical)
+- Temperature display in Celsius
+- TTFT display in minutes when >500s
+- tok/s and tokens generated counters
+
+### Quantization Support
+- 4-bit experts (full quality, production)
+- 2-bit experts (faster, breaks JSON/tool calling)
+- Tiered quantization (4-bit hot / 2-bit cold experts, auto-detected)
+
+## Architecture
+
+```
+SwiftUI (UI + @Observable state)
+    -> Swift async bridge (AsyncStream<GenerationToken>)
+        -> Objective-C wrapper (FlashMoEEngine.h C API)
+            -> C inference engine (7,500+ lines, unity build)
+                -> Metal GPU shaders (1,300 lines)
+```
+
+### Engine C API (FlashMoEEngine.h)
+
+```
+flashmoe_create()                  -- allocate context
+flashmoe_load(ctx, config)         -- load model, allocate Metal resources
+flashmoe_generate(ctx, prompt, max_tokens, callback, user_data)
+flashmoe_generate_continuation()   -- reuse KV cache for multi-turn
+flashmoe_cancel()                  -- thread-safe cancellation
+flashmoe_reset()                   -- clear KV cache and position
+flashmoe_unload()                  -- release model resources
+flashmoe_destroy()                 -- free context
+flashmoe_get_stats()               -- model info + generation stats
+flashmoe_validate_model()          -- check model directory validity
+flashmoe_turn_count()              -- conversation turn count
+flashmoe_last_error()              -- human-readable error string
+```
+
+### Key Files
+
+```
+FlashMoE-iOS/
+  FlashMoEEngine/
+    FlashMoEEngine.h       -- C API (create/load/generate/cancel/reset/destroy)
+    FlashMoEEngine.m       -- Unity build wrapping infer.m (#define CHAT_MODE 1)
+  Bridge/
+    FlashMoEBridge.swift   -- @Observable async Swift wrapper
+  Views/
+    ChatView.swift         -- Streaming chat UI with thinking disclosure
+    ModelListView.swift    -- Model discovery + download catalog
+    ModelDownloadRow.swift -- Download progress with pause/resume
+    ProfilerView.swift     -- Resource monitoring overlay
+  Services/
+    DownloadManager.swift  -- Background URLSession model downloads
+  Models/
+    ModelCatalog.swift     -- HuggingFace model registry with K recommendations
+  App/
+    FlashMoEApp.swift      -- SwiftUI app entry point
+  IOS_PORT.md              -- Full porting documentation
+  397B_ANALYSIS.md         -- 397B memory/performance analysis
+  project.yml              -- XcodeGen config (iOS 18+, iPhone only)
+  copy_model_to_iphone.sh  -- Push models to device over USB
+```
+
+## iOS-Specific Constraints and Solutions
+
+### Metal 4GB Per-Buffer Limit
+
+iOS Metal buffers cannot exceed 4096 MB regardless of entitlements. The 35B model weights (~2.5GB) fit; the 397B weights (~5.5GB) do not.
+
+**Attempted workarounds (all failed):**
+- Single 5.5GB Metal buffer -- Metal assertion crash
+- Two overlapping ~3GB Metal buffers -- OOM kill (8GB shared memory on 12GB device)
+- 50MB staging buffer with memcpy per dispatch -- data corruption from in-flight command buffer aliasing
+- CPU fallback -- works but 6 min/token
+
+**Solution:** Split `model_weights.bin` into two <4GB files at the Python packing stage (pending implementation).
+
+### Memory Management
+- Adaptive context length via `os_proc_available_memory()` -- reduces 262144 to 8192 based on available memory
+- KV cache sizing: `MAX_SEQ_LEN` (1M) replaced with runtime `g_kv_seq_len` (4096) per cache
+- Expert mmap disabled on iOS -- jetsam kills from 112GB mapped address space
+- Debug vs Release: Metal debug wrappers add ~2GB overhead, must build Release for on-device testing
+- `isExcludedFromBackup` on all model files to prevent iOS purging 200GB+ of data
+
+### ARC Cleanup
+MetalCtx `free()` without nil-ing `id<>` Objective-C fields caused heap corruption on model switch. Fix: nil all `id<>` fields before `free`.
+
+### 2-Bit Auto-Detection
+iOS load path was missing 2-bit directory check. Added auto-detection in `flashmoe_load()`.
+
+## 397B on iPhone -- What We Tried
+
+| Approach | Result | Notes |
+|----------|--------|-------|
+| Metal 4GB buffer workarounds | All failed | See above |
+| K=2 on 397B (trained K=10) | Gibberish | 20% of trained expert capacity |
+| K=4 on 397B (trained K=10) | Degenerate ("!!!!") | 40% capacity insufficient |
+| K=6+ on 397B | Untested | Needs GPU path (split weights) |
+| File Provider Storage | +latency | File coordination overhead on every pread |
+
+### Performance Projections (After Split Weights Enable GPU Path)
+
+| Configuration | Expert I/O | Expected tok/s |
+|--------------|-----------|----------------|
+| K=10, 4-bit | 4.1 GB/token | ~0.5 |
+| K=4, 4-bit | 1.6 GB/token | ~1.0 |
+| K=4, tiered | 1.1 GB/token | ~1.2 |
+
+## Next Steps
+
+1. **Split `model_weights.bin` into two <4GB files** -- enables GPU path on iOS for 397B
+2. **Test K=6/8/10 with GPU path** -- find minimum viable K for coherent 397B output
+3. **Upload split 397B model to HuggingFace**
+4. **Adaptive K** -- auto-select based on device RAM and thermal state
+5. **Thermal throttling awareness** -- monitor `ProcessInfo.ThermalState`, reduce K when throttling

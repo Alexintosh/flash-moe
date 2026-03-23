@@ -222,11 +222,17 @@ progress.py            # Results visualization (Q2/Q4 tracks)
 results.tsv            # Experiment log (58 experiments)
 
 metal_infer/
-  infer.m              # Complete inference engine (~7500 lines)
-                       #   - ModelConfig struct + config.json parser
-                       #   - Runtime model auto-detection
-                       #   - Metal compute pipeline
-  shaders.metal        # Metal compute kernels (~1200 lines)
+  infer.m              # Unity build entry point (86 lines, #includes all modules)
+  config.h             # ModelConfig struct, constants, macros (438 lines)
+  timing.h             # Timing, telemetry, tracking globals (256 lines)
+  weights.h            # Tensor manifest, hash table, mmap, bf16 conversion (205 lines)
+  cpu_kernels.h        # Vocabulary, tokenizer, CPU compute kernels (387 lines)
+  metal_ctx.h          # MetalCtx, metal_setup(), buffer management (603 lines)
+  gpu_dispatch.h       # BatchMatvecSpec, batched GPU matmul, expert forward (721 lines)
+  expert_io.h          # I/O thread pool, parallel pread, cache (827 lines)
+  layer_forward.h      # RoPE, KVCache, attention, MoE, fused pipeline (3068 lines)
+  generate.h           # Inference loop, sampling, HTTP serve, main() (1717 lines)
+  shaders.metal        # Metal compute kernels (~1300 lines)
   chat.m               # Interactive chat TUI with tool calling
   tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
   main.m               # MoE-only benchmark
@@ -278,6 +284,19 @@ autoresearch/              # Automated experiment loop
 | Half-precision x_shared (2-bit kernel) | Same occupancy trick | **+3.3% tok/s** |
 | SIMD reduction in rms_norm_qk | simd_sum replaces serial loop | **+2.1% tok/s** |
 
+### Vulkan Fork Analysis (Phases 1-4, All Complete)
+
+Analyzed the [Vulkan fork](https://github.com/fluxism/flash-moe-vulkan) and identified 4 optimization phases. Key finding: GPU linear attention was already implemented in our code. All 4 phases have been completed:
+
+| Phase | Optimization | Impact | Status |
+|-------|-------------|--------|--------|
+| 1 | Delta-net kernel fusion (merge pass 2+3 in gated_delta_net_step) | Eliminates ~1M device memory reads/token | **Done** |
+| 2 | CMD1+CMD2 merging for linear attention layers | Saves 2.25-4.5ms/token (45 layers x 1 sync point) | **Done** |
+| 3 | Modular decomposition (8081-line infer.m -> 9 focused modules) | 0% perf, major maintainability | **Done** |
+| 4 | Dynamic SIMD width (`[[threads_per_simdgroup]]` in all dequant kernels) | Future-proofing for non-32 SIMD hardware | **Done** |
+
+Full analysis: [docs/vulkan-learnings-plan.md](docs/vulkan-learnings-plan.md)
+
 ### Kept (Manual)
 | Approach | Result | Impact |
 |----------|--------|--------|
@@ -316,6 +335,18 @@ autoresearch/              # Automated experiment loop
 | K=2 on 397B (trained K=10) | Gibberish | Only 20% of trained expert capacity fires, output distribution collapses |
 | K=4 on 397B (trained K=10) | Degenerate ("!!!!") | 40% capacity insufficient for 512-expert model |
 | File Provider Storage for model access | +latency | File coordination layer adds overhead to every pread |
+
+## Notable Bug Fixes
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| Metal shader loading on iOS | `newDefaultLibrary` returns nil when shaders.metal in Resources instead of Sources | Fall back to pre-compiled metallib in bundle; move shader to Sources build phase |
+| KV cache OOM (2GB per cache) | `MAX_SEQ_LEN=1M` used for allocation | Adaptive runtime cap via `os_proc_available_memory()` |
+| ARC heap corruption on model switch | MetalCtx `free()` without nil-ing `id<>` fields | Nil all Objective-C fields before `free` |
+| Expert mmap jetsam kills on iOS | mmap'ing 112GB of expert files | Disabled expert mmap on iOS, pread-only |
+| 2-bit auto-detection missing in iOS | iOS load path skipped 2-bit directory check | Added 2-bit auto-detection in `flashmoe_load()` |
+| String format mismatch warnings | `%d` for `size_t`, `%f` for `int` | Corrected format specifiers throughout |
+| MAX_K buffer overflow on 397B | Hardcoded `MAX_K=8`, 397B needs K=10 | Bumped to `MAX_K=16` with runtime cap |
 
 ## Safety
 
