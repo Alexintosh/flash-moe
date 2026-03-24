@@ -196,11 +196,11 @@ struct ChatView: View {
 
             if engine.canContinue {
                 // Reuse KV cache — only process the new user turn
-                stream = engine.generateContinuation(userMessage: text, maxTokens: 500)
+                stream = engine.generateContinuation(userMessage: text, maxTokens: 2048)
             } else {
                 // First message — full chat template with system prompt
                 let formattedPrompt = buildChatPrompt(userMessage: text)
-                stream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+                stream = engine.generate(prompt: formattedPrompt, maxTokens: 2048)
             }
 
             var gotTokens = false
@@ -228,7 +228,7 @@ struct ChatView: View {
             if !gotTokens && engine.canContinue {
                 engine.reset()
                 let formattedPrompt = buildChatPrompt(userMessage: text)
-                let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+                let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 2048)
                 tokenCount = 0
                 for await token in fallbackStream {
                     tokenCount += 1
