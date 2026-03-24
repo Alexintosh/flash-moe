@@ -49,6 +49,8 @@ typedef struct {
     int fp8_kv_cache;           // 1 = FP8 E4M3 KV cache (4x less memory, longer context), 0 = float32
     int sliding_window;         // >0 = sliding window size for full attention layers, 0 = unlimited
     int h2o_budget;             // >0 = H2O KV cache budget (sinks + recent + heavy hitters), 0 = disabled
+    int rope_scaling_mode;      // 0 = off, 1 = linear, 2 = NTK-aware, 3 = YaRN
+    float rope_scale_factor;    // context extension factor (e.g. 2.0 = 2x context, 4.0 = 4x)
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 

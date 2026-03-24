@@ -7,17 +7,87 @@
 // Rotary position embedding (for full attention layers)
 // ============================================================================
 
+// Compute the effective RoPE base frequency for dimension index i, applying
+// the selected scaling mode (none, linear, NTK-aware, or YaRN).
+//
+// Linear:    scale position instead of base (handled in caller)
+// NTK-aware: base_scaled = base * (scale_factor ^ (dim / (dim - 2)))
+// YaRN:      per-dimension interpolation between original and NTK frequencies,
+//            based on wavelength vs. original context length.
+//
+// References:
+//   NTK-aware: https://arxiv.org/abs/2306.15595
+//   YaRN:      https://arxiv.org/abs/2309.00071
+
+static inline float rope_scaled_freq(float base, int i, int rotary_dim, int mode, float scale_factor) {
+    if (mode == 0 || scale_factor <= 1.0f) {
+        // No scaling
+        return 1.0f / powf(base, (float)(2 * i) / rotary_dim);
+    }
+    if (mode == 1) {
+        // Linear: freq unchanged; position is divided in caller
+        return 1.0f / powf(base, (float)(2 * i) / rotary_dim);
+    }
+    if (mode == 2) {
+        // NTK-aware: scale the base frequency
+        float base_scaled = base * powf(scale_factor, (float)rotary_dim / (rotary_dim - 2));
+        return 1.0f / powf(base_scaled, (float)(2 * i) / rotary_dim);
+    }
+    // mode == 3: YaRN — per-dimension NTK with wavelength-based interpolation
+    {
+        float base_ntk = base * powf(scale_factor, (float)rotary_dim / (rotary_dim - 2));
+        float freq_orig = 1.0f / powf(base, (float)(2 * i) / rotary_dim);
+        float freq_ntk  = 1.0f / powf(base_ntk, (float)(2 * i) / rotary_dim);
+
+        // Wavelength of the original frequency in token positions
+        float wavelength = 2.0f * M_PI / freq_orig;
+
+        // Thresholds: YaRN uses low and high frequency wavelength bounds
+        // Typical: beta_fast = 32, beta_slow = 1 (from the paper)
+        float original_max_pos = (float)cfg.max_seq_len;
+        float low_freq_wavelen  = original_max_pos;         // beta_slow * original_context
+        float high_freq_wavelen = original_max_pos / 32.0f; // beta_fast factor
+
+        if (wavelength < high_freq_wavelen) {
+            // High frequency dim: keep original (no scaling needed)
+            return freq_orig;
+        } else if (wavelength > low_freq_wavelen) {
+            // Low frequency dim: use full NTK scaling
+            return freq_ntk;
+        } else {
+            // Interpolation band: smooth ramp between original and NTK
+            float ramp = (wavelength - high_freq_wavelen) / (low_freq_wavelen - high_freq_wavelen);
+            return freq_orig * (1.0f - ramp) + freq_ntk * ramp;
+        }
+    }
+}
+
+// YaRN attention temperature factor: sqrt(0.1 * ln(s) + 1.0)
+// Applied as a multiplicative scale to attention logits in full-attention layers.
+static inline float rope_yarn_attn_factor(float scale_factor) {
+    if (g_rope_scaling_mode != 3 || scale_factor <= 1.0f) return 1.0f;
+    return sqrtf(0.1f * logf(scale_factor) + 1.0f);
+}
+
 static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num_kv_heads,
                               int head_dim, int rotary_dim) {
     // Apply RoPE to the first rotary_dim dimensions of each head
     // NON-TRADITIONAL (MLX default): pairs are (x[i], x[i + half_dim])
     // where half_dim = rotary_dim / 2
     int half = rotary_dim / 2;
+
+    // Linear scaling: divide position by scale factor
+    float pos_f = (float)pos;
+    if (g_rope_scaling_mode == 1 && g_rope_scale_factor > 1.0f) {
+        pos_f = (float)pos / g_rope_scale_factor;
+    }
+
     for (int h = 0; h < num_heads; h++) {
         float *qh = q + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(cfg.rope_theta, (float)(2 * i) / rotary_dim);
-            float angle = (float)pos * freq;
+            float freq = rope_scaled_freq(cfg.rope_theta, i, rotary_dim,
+                                          g_rope_scaling_mode, g_rope_scale_factor);
+            float angle = pos_f * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
 
@@ -30,8 +100,9 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
     for (int h = 0; h < num_kv_heads; h++) {
         float *kh = k + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(cfg.rope_theta, (float)(2 * i) / rotary_dim);
-            float angle = (float)pos * freq;
+            float freq = rope_scaled_freq(cfg.rope_theta, i, rotary_dim,
+                                          g_rope_scaling_mode, g_rope_scale_factor);
+            float angle = pos_f * freq;
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
 
@@ -562,6 +633,8 @@ static void full_attention_forward(
     // Each group of 16 query heads shares 1 kv head
     int heads_per_kv = cfg.num_attn_heads / cfg.num_kv_heads;
     float scale = 1.0f / sqrtf((float)cfg.head_dim);
+    // YaRN attention temperature: scale logits for extended context
+    scale *= rope_yarn_attn_factor(g_rope_scale_factor);
 
     float *attn_out = calloc(q_dim, sizeof(float));
 
@@ -2514,6 +2587,8 @@ static void fused_layer_forward(
         // Scaled dot-product attention (GQA) — GPU or CPU
         int heads_per_kv = cfg.num_attn_heads / cfg.num_kv_heads;
         float scale = 1.0f / sqrtf((float)cfg.head_dim);
+        // YaRN attention temperature: scale logits for extended context
+        scale *= rope_yarn_attn_factor(g_rope_scale_factor);
         float *attn_out = s_attn_out;
         memset(attn_out, 0, q_dim * sizeof(float));
 
@@ -2890,6 +2965,8 @@ static void fused_layer_forward(
             int kv_dim = cfg.num_kv_heads * cfg.head_dim;
             int heads_per_kv = cfg.num_attn_heads / cfg.num_kv_heads;
             float scale = 1.0f / sqrtf((float)cfg.head_dim);
+            // YaRN attention temperature: scale logits for extended context
+            scale *= rope_yarn_attn_factor(g_rope_scale_factor);
             uint32_t hd = cfg.head_dim;
             uint32_t kvd = (uint32_t)kv_dim;
             uint32_t sl = kv->h2o_active ? (uint32_t)kv->h2o_num_valid : (uint32_t)kv->len;

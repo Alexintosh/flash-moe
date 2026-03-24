@@ -84,6 +84,11 @@ static int g_h2o_budget = 0;             // 0 = disabled, >0 = total H2O KV cach
 static int g_h2o_num_sinks = 4;          // attention sink tokens to keep (first N, typically 4)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
+// RoPE scaling for context extension
+// 0=none (default), 1=linear, 2=NTK-aware, 3=YaRN
+static int g_rope_scaling_mode = 0;
+static float g_rope_scale_factor = 1.0f;  // context extension factor (e.g. 2.0 = 2x context)
+
 // Cross-layer expert prefetch: after CMD3(N) commit, start pread'ing next layer's
 // predicted experts into buf_B. When layer N+1 reaches I/O, hits skip pread.
 static int *g_layer_fds_global = NULL;           // [cfg.num_layers] warm fds (set by generate.h or FlashMoEEngine.m)

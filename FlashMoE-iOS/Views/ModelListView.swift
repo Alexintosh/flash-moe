@@ -107,6 +107,12 @@ struct SettingInfo: Identifiable {
             analogy: "Instead of remembering everything or only recent things, H\u{2082}O is like a smart student who keeps notes on the most important points from the whole lecture plus the last few minutes. It tracks which tokens the model pays most attention to and keeps those, dropping the rest.",
             technical: "H\u{2082}O (Heavy Hitter Oracle) eviction keeps 3 categories: attention sink tokens (first 4, always high-attention), recent tokens (last N), and heavy hitters (highest cumulative attention score). When the cache exceeds the budget, the lowest-scored non-protected positions are evicted. Reduces KV memory by 50-70% with minimal quality loss. Based on 'H\u{2082}O: Heavy-Hitter Oracle' (Zhang et al., 2023)."
         ),
+        "ropeScaling": SettingInfo(
+            id: "ropeScaling",
+            title: "RoPE Scaling",
+            analogy: "The model learns position by spinning numbers at specific speeds. Beyond the training window, these numbers 'go off the map' and output degrades. RoPE scaling adjusts the spin speeds so longer conversations stay on-map. Linear is the simplest (just slow everything down). NTK-aware is smarter (adjusts different dimensions differently). YaRN is best (combines NTK with an attention temperature fix).",
+            technical: "Rotary Position Embeddings encode position as frequency-domain rotations: freq_i = 1/base^(2i/d). Linear scaling divides position by the scale factor. NTK-aware scales the base: base' = base * s^(d/(d-2)), spreading frequencies more evenly. YaRN adds per-dimension interpolation based on wavelength vs. original context, plus an attention logit temperature t = sqrt(0.1*ln(s)+1). References: NTK-aware (arXiv:2306.15595), YaRN (arXiv:2309.00071)."
+        ),
     ]
 }
 
@@ -131,6 +137,7 @@ struct ModelListView: View {
     @AppStorage("maxContext") private var maxContext: Int = 0
     @AppStorage("slidingWindow") private var slidingWindow: Int = 0
     @AppStorage("h2oBudget") private var h2oBudget: Int = 0
+    @AppStorage("ropeScaling") private var ropeScaling: Int = 0  // encoded: mode * 10 + factor_index
     @State private var settingInfo: SettingInfo? = nil
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
@@ -312,6 +319,17 @@ struct ModelListView: View {
                     Text("1024").tag(1024)
                     Text("2048").tag(2048)
                 } label: { settingLabel("KV Cache Budget (H\u{2082}O)", key: "h2oBudget") }
+                .pickerStyle(.menu)
+
+                Picker(selection: $ropeScaling) {
+                    Text("Off").tag(0)
+                    Text("Linear 2x").tag(12)
+                    Text("Linear 4x").tag(14)
+                    Text("NTK-aware 2x").tag(22)
+                    Text("NTK-aware 4x").tag(24)
+                    Text("YaRN 2x").tag(32)
+                    Text("YaRN 4x").tag(34)
+                } label: { settingLabel("RoPE Scaling", key: "ropeScaling") }
                 .pickerStyle(.menu)
 
                 Toggle(isOn: $thinkingEnabled) { settingLabel("Thinking", key: "thinking") }
@@ -569,6 +587,11 @@ struct ModelListView: View {
             activeK = (is397B && deviceRAM <= 16) ? 4 : 0
         }
 
+        // Decode ropeScaling tag: tens digit = mode, ones digit encodes factor
+        // 0 = off, 12 = linear 2x, 14 = linear 4x, 22 = NTK 2x, 24 = NTK 4x, 32 = YaRN 2x, 34 = YaRN 4x
+        let ropeMode = ropeScaling / 10
+        let ropeFactor: Float = ropeScaling == 0 ? 1.0 : Float(ropeScaling % 10)
+
         Task {
             do {
                 try await engine.loadModel(
@@ -586,6 +609,8 @@ struct ModelListView: View {
                     fp8KVCache: fp8KVCache,
                     slidingWindow: slidingWindow,
                     h2oBudget: h2oBudget,
+                    ropeScalingMode: ropeMode,
+                    ropeScaleFactor: ropeFactor,
                     verbose: true
                 )
             } catch {

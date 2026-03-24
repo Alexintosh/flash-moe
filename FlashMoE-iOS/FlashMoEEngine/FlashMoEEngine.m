@@ -255,6 +255,10 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         g_sliding_window = config->sliding_window;  // Caps KV buffer capacity
         g_h2o_budget = config->h2o_budget;           // H2O eviction budget (0 = disabled)
 
+        // RoPE scaling for context extension
+        g_rope_scaling_mode = config->rope_scaling_mode;
+        g_rope_scale_factor = config->rope_scale_factor > 0.0f ? config->rope_scale_factor : 1.0f;
+
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {
@@ -416,6 +420,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         g_use_fp8_kv = config->fp8_kv_cache;
         g_sliding_window = config->sliding_window;
         g_h2o_budget = config->h2o_budget;
+        g_rope_scaling_mode = config->rope_scaling_mode;
+        g_rope_scale_factor = config->rope_scale_factor > 0.0f ? config->rope_scale_factor : 1.0f;
         g_prefetch_active = 0;
         g_prefetch_layer = -1;
         g_prefetch_hits_total = 0;

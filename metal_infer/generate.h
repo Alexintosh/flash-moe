@@ -1066,6 +1066,7 @@ static void print_usage(const char *prog) {
     printf("  --collect-activations F  Dump expert activations to binary file F (for GPTQ calibration)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --fp16               Use half-precision accumulation in dequant kernels (experimental)\n");
+    printf("  --rope-scale MODE:FACTOR  RoPE scaling for context extension (e.g. ntk:4, yarn:2, linear:4)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
@@ -1111,6 +1112,7 @@ int main(int argc, char **argv) {
             {"collect-routing", required_argument, 0, 'Z'},
             {"collect-activations", required_argument, 0, 'A'},
             {"fp16",          no_argument,       0, 'H'},
+            {"rope-scale",    required_argument, 0, 0x101},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -1133,6 +1135,35 @@ int main(int argc, char **argv) {
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case 0x100: g_freq_json_path = optarg; g_freq_tracking = 1; break;
+                case 0x101: {
+                    // Parse --rope-scale MODE:FACTOR (e.g. "ntk:4", "yarn:2", "linear:4")
+                    char mode_str[16] = {0};
+                    float factor = 1.0f;
+                    const char *colon = strchr(optarg, ':');
+                    if (colon) {
+                        size_t len = colon - optarg;
+                        if (len >= sizeof(mode_str)) len = sizeof(mode_str) - 1;
+                        memcpy(mode_str, optarg, len);
+                        mode_str[len] = '\0';
+                        factor = atof(colon + 1);
+                    } else {
+                        strlcpy(mode_str, optarg, sizeof(mode_str));
+                        factor = 2.0f;  // default factor if not specified
+                    }
+                    if (strcasecmp(mode_str, "linear") == 0) {
+                        g_rope_scaling_mode = 1;
+                    } else if (strcasecmp(mode_str, "ntk") == 0) {
+                        g_rope_scaling_mode = 2;
+                    } else if (strcasecmp(mode_str, "yarn") == 0) {
+                        g_rope_scaling_mode = 3;
+                    } else {
+                        fprintf(stderr, "ERROR: unknown rope-scale mode '%s' (use linear, ntk, or yarn)\n", mode_str);
+                        return 1;
+                    }
+                    g_rope_scale_factor = factor;
+                    fprintf(stderr, "[config] RoPE scaling: mode=%s factor=%.1f\n", mode_str, factor);
+                    break;
+                }
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
                 case 'Q': g_use_tiered = 1; break;

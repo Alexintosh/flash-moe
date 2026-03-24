@@ -81,6 +81,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                    expertPrefetch: Bool = false, fusedExpert: Bool = true,
                    fp16Accumulation: Bool = false, fp8KVCache: Bool = false,
                    slidingWindow: Int = 0, h2oBudget: Int = 0,
+                   ropeScalingMode: Int = 0, ropeScaleFactor: Float = 1.0,
                    verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
@@ -122,6 +123,8 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.fp8_kv_cache = fp8KVCache ? 1 : 0
                 config.sliding_window = Int32(slidingWindow)
                 config.h2o_budget = Int32(h2oBudget)
+                config.rope_scaling_mode = Int32(ropeScalingMode)
+                config.rope_scale_factor = ropeScaleFactor
                 config.verbose = verbose ? 1 : 0
 
                 // Load
