@@ -773,6 +773,7 @@ def repack_tiered(
     # Per-layer hot sets: maps layer_idx -> set of hot expert indices
     # If freq_file has per-layer data, use it. Otherwise use a single global set.
     per_layer_hot = {}
+    hot_data = None
 
     if freq_file:
         freq_path = Path(freq_file)
@@ -815,7 +816,7 @@ def repack_tiered(
     avg_cold = num_experts - avg_hot
     print(f"  Hot experts (4-bit): avg {avg_hot:.0f}/layer ({avg_hot/num_experts:.0%})")
     print(f"  Cold experts (2-bit): avg {avg_cold:.0f}/layer ({avg_cold/num_experts:.0%})")
-    if freq_file and "layers" in (hot_data if isinstance(hot_data, dict) else {}):
+    if freq_file and hot_data and isinstance(hot_data, dict) and "layers" in hot_data:
         print(f"  Per-layer assignment: YES (different experts per layer)")
 
     # For backward compat
