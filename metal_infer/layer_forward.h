@@ -2106,8 +2106,15 @@ static void fused_layer_forward(
         // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
         // Skip if cross-layer prefetch already has buf_B in-flight for this layer.
         if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
-            g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0 &&
-            !(g_prefetch_active && g_prefetch_layer == layer_idx)) {
+            g_metal->buf_multi_expert_data_B[0] && PRED_COUNT(layer_idx) > 0) {
+            // Drain any in-flight cross-layer prefetch before reusing g_async_pread.
+            // The async pread is a singleton — two concurrent users would race on
+            // the task array and GCD dispatch group.
+            if (g_prefetch_active) {
+                async_pread_wait();
+                g_prefetch_active = 0;
+                g_prefetch_layer = -1;
+            }
             async_pread_start(packed_fd, &PRED_EXPERT(layer_idx, 0),
                               PRED_COUNT(layer_idx),
                               g_metal->buf_multi_expert_data_B, mmap_base,
