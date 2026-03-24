@@ -118,6 +118,18 @@ Qwen3.5 MoE models use a hybrid attention architecture with GatedDeltaNet (linea
 
 21. **Paper-Guided Autoresearch v2** — Automated experiment loop that reads the research paper, identifies optimization opportunities, implements them, benchmarks with quality gates, and logs results. See `autoresearch/program_v2.md`.
 
+### GPTQ/JANG Quantization Pipeline
+
+A 4-phase pipeline for producing high-quality 2-bit experts using GPTQ (Data-aware Weight Quantization) with optional JANG (Jang Adaptive N-bit Grading) mixed-precision assignment. GPTQ uses calibration data to build a Hessian proxy (H = X^T @ X) per expert, then applies blocked column-wise error compensation during quantization. The result: same 2-bit format, but output reconstruction error is dramatically lower than RTN (Round To Nearest). This fixes the broken JSON problem at 2-bit.
+
+**Phases:**
+- **Phase 0: MSE-Optimal Clipping** — Grid search over 20 clipping ratios per group of 64 values. 15-30% RMSE reduction. In `repack_experts_2bit.py`.
+- **Phase 1: Calibration Collection** — `--collect-activations` flag dumps expert input vectors. `build_hessian.py` accumulates H = X^T @ X per expert online. `calibrate.sh` runner. 16K tokens minimum.
+- **Phase 2: GPTQ Requantization** — `gptq_requantize.py`. Blocked GPTQ (block_size=128). Automatic fallback to MSE-clip for uncalibrated experts. Safety check: only uses GPTQ if it beats RTN RMSE.
+- **Phase 3: Sensitivity Analysis** — `sensitivity_analysis.py` computes freq x quant_error x layer_weight per expert. Assigns 4-bit to most sensitive experts until target GB budget. `repack_experts_tiered.py` updated with `--gptq-dir` and `--hot-experts` flags.
+
+See [docs/quantization-guide.md](docs/quantization-guide.md) for the full technical writeup including the GPTQ algorithm, DWQ vs JANG comparison, and pipeline commands.
+
 ### Expert Settings UI
 
 The iOS/Mac app includes a comprehensive Expert Settings panel with info modals for every toggle. Each setting has an analogy (plain-language explanation) and technical details. The UI uses a compact layout with an info icon to the left of each label. Settings include: Active Experts (K), I/O Fanout, CMD1+CMD2 Merge, Fused Attention, Fused Expert Kernel, Expert Prefetch, FP16 Accumulation, FP8 KV Cache, Max Context Length (4K-32K), Sliding Window, Thinking Mode, and H2O Budget (coming soon). Max generation tokens bumped to 2048. See [docs/expert-settings-guide.md](docs/expert-settings-guide.md).
@@ -274,7 +286,11 @@ metal_infer/
   main.m               # MoE-only benchmark
   Makefile             # Build system
   extract_weights.py   # Creates model_weights.bin from safetensors
-  repack_experts_2bit.py  # 4-bit → 2-bit expert requantization
+  repack_experts_2bit.py  # 4-bit → 2-bit expert requantization (with MSE-optimal clipping)
+  gptq_requantize.py   # Blocked GPTQ 2-bit requantization with Hessian-guided error compensation
+  build_hessian.py     # Online Hessian accumulation (H = X^T @ X) per expert from calibration data
+  sensitivity_analysis.py  # Expert sensitivity scoring (freq × quant_error × layer_weight) and bit-width assignment
+  calibrate.sh         # Calibration runner — collects expert activations over diverse prompts
   train_predictor.py   # Expert routing prediction analysis
   model_weights.bin    # Non-expert weights (model-specific, mmap'd)
   model_weights.json   # Tensor manifest
@@ -319,6 +335,7 @@ docs/
   vulkan-learnings-plan.md # Vulkan fork analysis (all 4 phases complete)
   oom-prevention.md        # OOM prevention architecture
   tiered-expert-quantization.md   # Tiered quantization experiment writeup
+  quantization-guide.md  # DWQ/JANG comparison, GPTQ pipeline, quantization formats
 ```
 
 ## What We Tried (and What Worked)
