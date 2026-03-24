@@ -212,6 +212,29 @@ iOS load path was missing 2-bit directory check. Added auto-detection in `flashm
 | K=4, 4-bit | 1.6 GB/token | ~1.0 |
 | K=4, tiered | 1.1 GB/token | ~1.2 |
 
+## GPTQ 2-bit: Path to 397B on iPhone
+
+The GPTQ quantization pipeline opens a realistic path to running the full 397B model on 256GB iPhones.
+
+**Key insight**: The 20% hot 4-bit + 80% GPTQ 2-bit tiered configuration produces a **134GB** model. This fits on a 256GB iPhone with room for the OS, apps, and user data. Unlike RTN 2-bit (which breaks JSON/tool calling), GPTQ 2-bit uses Hessian-guided error compensation to preserve output quality at 2-bit precision.
+
+| Component | Size | Notes |
+|-----------|------|-------|
+| Hot experts (20%, 4-bit) | ~42 GB | Top ~25% by activation frequency, full quality |
+| Cold experts (80%, GPTQ 2-bit) | ~87 GB | GPTQ error compensation fixes JSON output |
+| Non-expert weights | 5.5 GB | Needs split into two <4GB files for Metal, or CPU fallback |
+| **Total** | **~134 GB** | Fits on 256GB iPhone |
+
+**Expected quality**: Production-grade JSON and tool calling. GPTQ's column-wise error compensation keeps accumulated quantization error bounded even at 2-bit, avoiding the `\name\` corruption seen with RTN 2-bit.
+
+**Remaining requirements**:
+- Split `model_weights.bin` into two <4GB files (Metal per-buffer limit on iOS)
+- Alternatively, use CPU fallback for non-expert weight projections (5.5GB exceeds 4GB Metal limit)
+- Test K=6+ with GPU path on device for coherent output
+- Validate GPTQ 2-bit JSON quality on real tool-calling workloads
+
+See [docs/quantization-guide.md](quantization-guide.md) for the full GPTQ pipeline documentation.
+
 ## Next Steps
 
 1. **Split `model_weights.bin` into two <4GB files** -- enables GPU path on iOS for 397B

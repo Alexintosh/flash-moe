@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Repack experts into tiered quantization: hot @ 4-bit, cold @ 2-bit.
 
-Reads packed_experts/ (all 4-bit) and hot_experts.json,
-produces packed_experts_tiered/ with mixed-quant layer files + manifest.
+Reads packed_experts/ (all 4-bit) and a hot_experts.json (from sensitivity
+analysis or threshold-based profiling), produces packed_experts_tiered/
+with mixed-quant layer files + manifest.
+
+Cold experts can use either:
+  - GPTQ-quantized 2-bit data from --gptq-dir (best quality)
+  - Inline MSE-optimal clipping requantization (fallback)
 
 File format per layer:
   [expert_0_data][expert_1_data]...[expert_N_data]
@@ -10,9 +15,21 @@ File format per layer:
   tiered_manifest.json records per-expert: {offset, size, bits}
 
 Usage:
-    python repack_experts_tiered.py \
-      --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
+    # Sensitivity-based with GPTQ 2-bit data:
+    python repack_experts_tiered.py \\
+      --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \\
+      --hot-experts hot_experts.json \\
+      --gptq-dir packed_experts_gptq_2bit/
+
+    # Sensitivity-based without GPTQ (inline RTN requant):
+    python repack_experts_tiered.py \\
+      --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \\
       --hot-experts hot_experts.json
+
+    # Legacy threshold-based (backward compatible):
+    python repack_experts_tiered.py \\
+      --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \\
+      --threshold 100
 """
 import argparse
 import json
@@ -102,7 +119,7 @@ def compute_offsets(moe_intermediate, hidden_dim, group_size, bits):
 
 def requantize_expert(expert_4bit_blob, off4, size4, off2, size2,
                        moe_intermediate, hidden_dim, group_size=64):
-    """Requantize a single expert from 4-bit to 2-bit."""
+    """Requantize a single expert from 4-bit to 2-bit (inline MSE-optimal clipping)."""
     output = bytearray(size2)
 
     projs = [
@@ -147,16 +164,118 @@ def requantize_expert(expert_4bit_blob, off4, size4, off2, size2,
     return bytes(output)
 
 
+def load_gptq_expert(gptq_dir, layer_idx, expert_idx, size2):
+    """Load a pre-quantized GPTQ 2-bit expert blob from the gptq directory.
+
+    Expected layout: gptq_dir/layer_XX.bin with experts packed sequentially,
+    each of size2 bytes.
+
+    Returns bytes or None if not available.
+    """
+    layer_path = Path(gptq_dir) / f"layer_{layer_idx:02d}.bin"
+    if not layer_path.exists():
+        return None
+
+    file_size = layer_path.stat().st_size
+    expert_offset = expert_idx * size2
+    if expert_offset + size2 > file_size:
+        return None
+
+    with open(layer_path, "rb") as f:
+        f.seek(expert_offset)
+        blob = f.read(size2)
+
+    if len(blob) != size2:
+        return None
+
+    return blob
+
+
+def build_hot_experts_from_threshold(freq_data, threshold):
+    """Build hot_experts dict from frequency data using a threshold.
+
+    Legacy backward-compatible path: any expert with activation count >= threshold
+    is considered hot.
+
+    freq_data: dict with structure matching profile_experts.py output
+    threshold: minimum activation count
+
+    Returns: dict {str(layer_idx): [list of hot expert indices]}
+    """
+    hot_experts = {}
+    # freq_data may have various structures; try common ones
+    if "expert_counts" in freq_data:
+        # profile_experts.py format: {"expert_counts": {"layer": {"expert": count}}}
+        for layer_str, expert_counts in freq_data["expert_counts"].items():
+            hot = []
+            for expert_str, count in expert_counts.items():
+                if count >= threshold:
+                    hot.append(int(expert_str))
+            hot_experts[layer_str] = sorted(hot)
+    elif "hot_experts" in freq_data:
+        # Already in hot_experts format
+        return freq_data["hot_experts"]
+    else:
+        # Assume flat {layer: {expert: count}} structure
+        for layer_str, expert_counts in freq_data.items():
+            if not isinstance(expert_counts, dict):
+                continue
+            hot = []
+            for expert_str, count in expert_counts.items():
+                if isinstance(count, (int, float)) and count >= threshold:
+                    hot.append(int(expert_str))
+            hot_experts[layer_str] = sorted(hot)
+
+    return hot_experts
+
+
 def main():
     parser = argparse.ArgumentParser(description="Repack experts with tiered quantization")
     parser.add_argument("--model", required=True, help="Path to model directory with packed_experts/")
-    parser.add_argument("--hot-experts", required=True, help="Path to hot_experts.json from profile_experts.py")
+    parser.add_argument("--hot-experts", default=None,
+                        help="Path to hot_experts.json from sensitivity_analysis.py or profile_experts.py")
+    parser.add_argument("--threshold", type=int, default=None,
+                        help="Legacy: activation count threshold for hot/cold split. "
+                             "Requires --hot-experts to point to frequency data.")
+    parser.add_argument("--gptq-dir", default=None,
+                        help="Directory with GPTQ-quantized 2-bit expert files (layer_XX.bin). "
+                             "If provided, cold experts use GPTQ data instead of inline RTN requant.")
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--dry-run", action="store_true", help="Compute sizes without writing files")
     args = parser.parse_args()
 
+    # Validate arguments
+    if args.hot_experts is None and args.threshold is None:
+        print("ERROR: Must provide either --hot-experts or --threshold.", file=sys.stderr)
+        sys.exit(1)
+
     model_path = Path(args.model)
-    hot_data = json.loads(Path(args.hot_experts).read_text())
+
+    # Load hot expert assignment
+    if args.hot_experts is not None:
+        hot_file_data = json.loads(Path(args.hot_experts).read_text())
+    else:
+        hot_file_data = None
+
+    if args.threshold is not None:
+        # Legacy threshold-based mode
+        if hot_file_data is None:
+            print("ERROR: --threshold requires --hot-experts pointing to frequency data.",
+                  file=sys.stderr)
+            sys.exit(1)
+        hot_expert_map = build_hot_experts_from_threshold(hot_file_data, args.threshold)
+        threshold_value = args.threshold
+        print(f"Using threshold-based assignment (threshold={args.threshold})")
+    else:
+        # Sensitivity-based mode (from sensitivity_analysis.py output)
+        if "hot_experts" in hot_file_data:
+            hot_expert_map = hot_file_data["hot_experts"]
+        else:
+            print("ERROR: --hot-experts file must contain 'hot_experts' key.", file=sys.stderr)
+            sys.exit(1)
+        threshold_value = hot_file_data.get("threshold", None)
+        desc = hot_file_data.get("description", "unknown source")
+        print(f"Using hot expert assignment from: {desc}")
 
     # Read model config
     config_path = model_path / "config.json"
@@ -185,12 +304,25 @@ def main():
     print(f"  2-bit expert: {size2:,} bytes ({size2/1024/1024:.2f} MB)")
     print(f"  Reduction per cold expert: {(size4-size2)/1024/1024:.2f} MB ({100*(size4-size2)/size4:.1f}%)")
 
+    # GPTQ info
+    gptq_dir = args.gptq_dir
+    if gptq_dir:
+        gptq_path = Path(gptq_dir)
+        if gptq_path.exists():
+            gptq_files = list(gptq_path.glob("layer_*.bin"))
+            print(f"  GPTQ dir: {gptq_dir} ({len(gptq_files)} layer files)")
+        else:
+            print(f"  WARNING: GPTQ dir {gptq_dir} does not exist, falling back to inline requant")
+            gptq_dir = None
+    else:
+        print(f"  GPTQ dir: not provided (using inline MSE-optimal clipping)")
+
     # Compute total sizes
     total_4bit = num_layers * num_experts * size4
     total_hot = 0
     total_cold = 0
     for l in range(num_layers):
-        hot_set = set(hot_data["hot_experts"].get(str(l), []))
+        hot_set = set(hot_expert_map.get(str(l), []))
         n_hot = len(hot_set)
         n_cold = num_experts - n_hot
         total_hot += n_hot * size4
@@ -215,9 +347,13 @@ def main():
         "expert_size_2bit": size2,
         "num_layers": num_layers,
         "num_experts": num_experts,
-        "threshold": hot_data["threshold"],
+        "threshold": threshold_value,
+        "gptq_source": gptq_dir if gptq_dir else None,
         "layers": {},
     }
+
+    gptq_used = 0
+    gptq_fallback = 0
 
     for l in range(num_layers):
         src_path = experts_dir / f"layer_{l:02d}.bin"
@@ -227,7 +363,7 @@ def main():
             print(f"  WARNING: {src_path} not found, skipping layer {l}")
             continue
 
-        hot_set = set(hot_data["hot_experts"].get(str(l), []))
+        hot_set = set(hot_expert_map.get(str(l), []))
         n_hot = len(hot_set)
         n_cold = num_experts - n_hot
         print(f"  Layer {l:2d}: {n_hot} hot (4-bit), {n_cold} cold (2-bit)...",
@@ -255,11 +391,22 @@ def main():
                 })
                 output_offset += size4
             else:
-                # Requantize to 2-bit
-                blob_2bit = requantize_expert(
-                    expert_blob, off4, size4, off2, size2,
-                    moe_intermediate, hidden_dim, group_size
-                )
+                # Cold expert: try GPTQ data first, then fall back to inline requant
+                blob_2bit = None
+                if gptq_dir:
+                    blob_2bit = load_gptq_expert(gptq_dir, l, e, size2)
+                    if blob_2bit is not None:
+                        gptq_used += 1
+                    else:
+                        gptq_fallback += 1
+
+                if blob_2bit is None:
+                    # Inline requantization (MSE-optimal clipping)
+                    blob_2bit = requantize_expert(
+                        expert_blob, off4, size4, off2, size2,
+                        moe_intermediate, hidden_dim, group_size
+                    )
+
                 layer_chunks.append(blob_2bit)
                 layer_manifest["experts"].append({
                     "offset": output_offset,
@@ -283,6 +430,11 @@ def main():
     manifest_path.write_text(json.dumps(manifest, indent=2))
     print(f"\nWrote manifest: {manifest_path}")
     print(f"Total tiered: {total_tiered/1024/1024/1024:.2f} GB (was {total_4bit/1024/1024/1024:.2f} GB)")
+
+    if gptq_dir:
+        total_cold_experts = gptq_used + gptq_fallback
+        print(f"\nGPTQ 2-bit source: {gptq_used}/{total_cold_experts} cold experts "
+              f"({gptq_fallback} fell back to inline requant)")
 
 
 if __name__ == "__main__":
