@@ -50,6 +50,11 @@ static uint64_t g_pred_layers = 0;
 static FILE *g_routing_log = NULL;
 static int g_routing_log_samples = 0;
 
+// GPTQ calibration: activation collection for Hessian computation
+// Binary format per token per layer: int32 layer_idx, int32 K, [K x {int32 expert_idx, float32[hidden_dim] h_post}]
+static FILE *g_activation_dump = NULL;
+static int g_activation_dump_samples = 0;
+
 // LZ4 compressed expert support
 // File format: [LZ4IndexEntry × 512] + [compressed blobs]
 typedef struct {

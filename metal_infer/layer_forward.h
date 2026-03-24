@@ -1082,6 +1082,23 @@ static void moe_forward(
         fprintf(stderr, "]\n");
     }
 
+    // Dump activations for GPTQ Hessian calibration
+    if (g_activation_dump) {
+        int32_t li = layer_idx;
+        int32_t ki = K;
+        fwrite(&li, sizeof(int32_t), 1, g_activation_dump);
+        fwrite(&ki, sizeof(int32_t), 1, g_activation_dump);
+        for (int k = 0; k < ki; k++) {
+            int32_t eidx = expert_indices[k];
+            fwrite(&eidx, sizeof(int32_t), 1, g_activation_dump);
+            fwrite(h_post, sizeof(float), cfg.hidden_dim, g_activation_dump);
+        }
+        g_activation_dump_samples++;
+        if (g_activation_dump_samples % 100 == 0) {
+            fflush(g_activation_dump);
+        }
+    }
+
     // ---- Routed expert computation ----
     float *moe_out = calloc(cfg.hidden_dim, sizeof(float));
 
@@ -3239,6 +3256,23 @@ static void fused_layer_forward(
         fwrite(hidden, sizeof(float), cfg.hidden_dim, g_routing_log);
         fwrite(expert_indices, sizeof(int32_t), ki, g_routing_log);
         g_routing_log_samples++;
+    }
+
+    // Dump activations for GPTQ Hessian calibration
+    if (g_activation_dump) {
+        int32_t li = layer_idx;
+        int32_t ki = (K > MAX_K) ? MAX_K : K;
+        fwrite(&li, sizeof(int32_t), 1, g_activation_dump);
+        fwrite(&ki, sizeof(int32_t), 1, g_activation_dump);
+        for (int k = 0; k < ki; k++) {
+            int32_t eidx = expert_indices[k];
+            fwrite(&eidx, sizeof(int32_t), 1, g_activation_dump);
+            fwrite(h_post, sizeof(float), cfg.hidden_dim, g_activation_dump);
+        }
+        g_activation_dump_samples++;
+        if (g_activation_dump_samples % 100 == 0) {
+            fflush(g_activation_dump);
+        }
     }
 
     // ---- Parallel pread + GPU experts ----

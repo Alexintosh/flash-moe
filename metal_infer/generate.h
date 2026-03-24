@@ -1023,6 +1023,7 @@ static void print_usage(const char *prog) {
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --no-prefetch        Disable cross-layer expert prefetch (default: ON)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
+    printf("  --collect-activations F  Dump expert activations to binary file F (for GPTQ calibration)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --fp16               Use half-precision accumulation in dequant kernels (experimental)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
@@ -1067,13 +1068,14 @@ int main(int argc, char **argv) {
             {"predict",       no_argument,       0, 'D'},
             {"no-prefetch",   no_argument,       0, 'X'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"collect-activations", required_argument, 0, 'A'},
             {"fp16",          no_argument,       0, 'H'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2GHh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:A:LSTFE2GHh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -1100,6 +1102,13 @@ int main(int argc, char **argv) {
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
                         fprintf(stderr, "ERROR: cannot open routing log: %s\n", optarg);
+                        return 1;
+                    }
+                    break;
+                case 'A':
+                    g_activation_dump = fopen(optarg, "wb");
+                    if (!g_activation_dump) {
+                        fprintf(stderr, "ERROR: cannot open activation dump file: %s\n", optarg);
                         return 1;
                     }
                     break;
@@ -1744,6 +1753,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[routing] Logged %d samples to routing data file\n",
                     g_routing_log_samples);
             g_routing_log = NULL;
+        }
+        if (g_activation_dump) {
+            fclose(g_activation_dump);
+            fprintf(stderr, "[activations] Dumped %d activation records for GPTQ calibration\n",
+                    g_activation_dump_samples);
+            g_activation_dump = NULL;
         }
 
         // ---- Cleanup ----
