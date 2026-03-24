@@ -151,7 +151,7 @@ static PromptTokens *tokenize_continuation_turn_shared(const char *user_content)
 #ifndef CHAT_MODE
 
 // ============================================================================
-// HTTP Serve Mode — OpenAI-compatible /v1/chat/completions (SSE streaming)
+// HTTP Serve Mode — OpenAI-compatible API (/v1/chat/completions, /v1/completions)
 // ============================================================================
 
 // Read exactly n bytes from fd, returns 0 on success, -1 on error/EOF
@@ -248,6 +248,113 @@ static int extract_max_tokens(const char *buf, int default_val) {
     p = strchr(p, ':');
     if (!p) return default_val;
     return atoi(p + 1);
+}
+
+// Extract "temperature" from JSON body. Returns value or default_val.
+static float extract_temperature(const char *buf, float default_val) {
+    const char *p = strstr(buf, "\"temperature\"");
+    if (!p) return default_val;
+    p = strchr(p, ':');
+    if (!p) return default_val;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return (float)atof(p);
+}
+
+// Extract "stream" boolean from JSON body. Returns 1 if true, 0 if false/absent.
+static int extract_stream(const char *buf) {
+    const char *p = strstr(buf, "\"stream\"");
+    if (!p) return 0;
+    p += 8; // skip "stream"
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    return (*p == 't') ? 1 : 0;  // "true" vs anything else
+}
+
+// Extract "prompt" string from JSON body (for /v1/completions).
+// Returns pointer into buf (null-terminated in place), or NULL.
+static char *extract_prompt(char *buf) {
+    char *p = strstr(buf, "\"prompt\"");
+    if (!p) return NULL;
+    p += 8; // skip "prompt"
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p != '"') return NULL;
+    p++; // skip opening quote
+    char *start = p;
+    // Find closing quote (handle escapes)
+    while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
+    *p = '\0';
+    // Unescape inline
+    char *r = start, *w = start;
+    while (*r) {
+        if (*r == '\\' && *(r+1)) {
+            r++;
+            switch (*r) {
+                case 'n':  *w++ = '\n'; r++; break;
+                case 't':  *w++ = '\t'; r++; break;
+                case '"':  *w++ = '"';  r++; break;
+                case '\\': *w++ = '\\'; r++; break;
+                default:   *w++ = '\\'; *w++ = *r++; break;
+            }
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+    return start;
+}
+
+// Temperature sampling: sample from logits with temperature scaling.
+// temperature <= 0 or very small => argmax (greedy).
+// Returns sampled token index.
+static int sample_with_temperature(float *logits, int vocab_size, float temperature) {
+    if (temperature < 1e-6f) {
+        return cpu_argmax(logits, vocab_size);
+    }
+
+    // Apply temperature
+    float inv_temp = 1.0f / temperature;
+    float max_val = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > max_val) max_val = logits[i];
+    }
+
+    // Compute softmax with temperature
+    float sum = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] = expf((logits[i] - max_val) * inv_temp);
+        sum += logits[i];
+    }
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] *= inv_sum;
+    }
+
+    // Sample from the distribution
+    float r = (float)arc4random() / (float)UINT32_MAX;
+    float cumulative = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        cumulative += logits[i];
+        if (cumulative >= r) return i;
+    }
+    return vocab_size - 1;  // fallback
+}
+
+// JSON-escape a string into a pre-allocated buffer (dst must be at least 2*src_len + 1).
+// Returns number of bytes written (not including null terminator).
+static int json_escape(const char *src, int src_len, char *dst, int dst_size) {
+    int j = 0;
+    for (int i = 0; i < src_len && j < dst_size - 8; i++) {
+        switch (src[i]) {
+            case '"':  dst[j++] = '\\'; dst[j++] = '"';  break;
+            case '\\': dst[j++] = '\\'; dst[j++] = '\\'; break;
+            case '\n': dst[j++] = '\\'; dst[j++] = 'n';  break;
+            case '\r': dst[j++] = '\\'; dst[j++] = 'r';  break;
+            case '\t': dst[j++] = '\\'; dst[j++] = 't';  break;
+            default:   dst[j++] = src[i]; break;
+        }
+    }
+    dst[j] = '\0';
+    return j;
 }
 
 // Save a conversation turn to ~/.flash-moe/sessions/<session_id>.jsonl
@@ -511,7 +618,11 @@ static void serve_loop(
     }
 
     printf("[serve] Listening on http://0.0.0.0:%d\n", port);
-    printf("[serve] Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health\n");
+    printf("[serve] Endpoints:\n");
+    printf("[serve]   POST /v1/chat/completions  (OpenAI-compatible, streaming + non-streaming)\n");
+    printf("[serve]   POST /v1/completions        (text completions, streaming + non-streaming)\n");
+    printf("[serve]   GET  /v1/models\n");
+    printf("[serve]   GET  /health\n");
     fflush(stdout);
 
     static uint64_t req_counter = 0;
@@ -688,7 +799,7 @@ static void serve_loop(
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"status\":\"ok\",\"model\":\"qwen3.5-35b-a3b\"}\n";
+                "{\"status\":\"ok\",\"model\":\"flash-moe\"}\n";
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
             continue;
@@ -696,15 +807,17 @@ static void serve_loop(
 
         // GET /v1/models
         if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/models") == 0) {
-            const char *resp =
+            char models_resp[1024];
+            long now_ts = (long)time(NULL);
+            snprintf(models_resp, sizeof(models_resp),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-35b-a3b\","
-                "\"object\":\"model\",\"owned_by\":\"local\"}]}\n";
-            http_write_str(client_fd, resp);
+                "{\"object\":\"list\",\"data\":[{\"id\":\"flash-moe\","
+                "\"object\":\"model\",\"created\":%ld,\"owned_by\":\"flash-moe\"}]}\n", now_ts);
+            http_write_str(client_fd, models_resp);
             free(reqbuf); close(client_fd);
             continue;
         }
@@ -721,10 +834,12 @@ static void serve_loop(
             }
             body += 4;
 
-            // Extract session_id and max_tokens BEFORE content extraction
+            // Extract all JSON fields BEFORE content extraction
             // (extract_last_content mutates the body buffer in place)
             int max_gen = extract_max_tokens(body, 8192);
             if (max_gen > 32768) max_gen = 32768;
+            float temperature = extract_temperature(body, 0.7f);
+            int want_stream = extract_stream(body);
             char req_session_id[64] = {0};
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
 
@@ -745,8 +860,8 @@ static void serve_loop(
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
-                    request_id, strlen(content), max_gen,
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, temp=%.2f, stream=%d, session=%s%s\n",
+                    request_id, strlen(content), max_gen, temperature, want_stream,
                     has_session ? req_session_id : "(none)",
                     is_continuation ? " [CONTINUE]" : " [NEW]");
 
@@ -832,8 +947,11 @@ static void serve_loop(
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
-            // ---- Send SSE headers ----
-            http_write_str(client_fd, SSE_HEADERS);
+            // ---- Send headers (SSE for streaming, defer for non-streaming) ----
+            if (want_stream) {
+                http_write_str(client_fd, SSE_HEADERS);
+            }
+            int prompt_tokens = pt->count;
 
             // ---- Batch prefill ----
             double t_prefill = now_ms();
@@ -913,9 +1031,9 @@ static void serve_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            int next_token = cpu_argmax(logits, cfg.vocab_size);
+            int next_token = sample_with_temperature(logits, cfg.vocab_size, temperature);
 
-            // ---- Auto-regressive generation with SSE streaming ----
+            // ---- Auto-regressive generation ----
             if (g_pred_enabled) {
                 g_pred_generating = 1;
                 g_pred_valid = 0;
@@ -966,9 +1084,11 @@ static void serve_loop(
                     gen_resp_len += tlen;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
-                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
-                    break;
+                if (want_stream) {
+                    if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                        fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                        break;
+                    }
                 }
                 gen_count++;
 
@@ -994,10 +1114,40 @@ static void serve_loop(
                     free(normed);
                 }
                 lm_head_forward(wf, hidden, logits);
-                next_token = cpu_argmax(logits, cfg.vocab_size);
+                next_token = sample_with_temperature(logits, cfg.vocab_size, temperature);
             }
 
-            sse_send_done(client_fd, request_id);
+            // ---- Send final response ----
+            if (want_stream) {
+                sse_send_done(client_fd, request_id);
+            } else {
+                // Non-streaming: send complete JSON response
+                long created_ts = (long)time(NULL);
+                // JSON-escape the accumulated response
+                char *escaped_resp = malloc(gen_resp_len * 2 + 1);
+                int escaped_len = json_escape(gen_response, gen_resp_len, escaped_resp, gen_resp_len * 2 + 1);
+                (void)escaped_len;
+
+                // Build the full response
+                int resp_buf_size = gen_resp_len * 2 + 1024;
+                char *full_resp = malloc(resp_buf_size);
+                int n = snprintf(full_resp, resp_buf_size,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,"
+                    "\"model\":\"flash-moe\","
+                    "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},"
+                    "\"finish_reason\":\"stop\"}],"
+                    "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n",
+                    request_id, created_ts, escaped_resp,
+                    prompt_tokens, gen_count, prompt_tokens + gen_count);
+                http_write(client_fd, full_resp, n);
+                free(escaped_resp);
+                free(full_resp);
+            }
 
             // ---- Save session state ----
             free(gen_response);
@@ -1018,6 +1168,261 @@ static void serve_loop(
                 cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
             }
 
+            free(pt->ids);
+            free(pt);
+            free(reqbuf);
+            close(client_fd);
+            continue;
+        }
+
+        // POST /v1/completions (text completions — no chat template)
+        if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/completions") == 0) {
+            // Find body (after \r\n\r\n)
+            char *body = strstr(reqbuf, "\r\n\r\n");
+            if (!body) {
+                http_write_str(client_fd,
+                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"no body\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+            body += 4;
+
+            // Extract fields BEFORE prompt extraction (which mutates buffer)
+            int max_gen = extract_max_tokens(body, 256);
+            if (max_gen > 32768) max_gen = 32768;
+            float temperature = extract_temperature(body, 0.7f);
+            int want_stream = extract_stream(body);
+
+            // Extract prompt text (mutates body — must be last)
+            char *prompt_text = extract_prompt(body);
+            if (!prompt_text || strlen(prompt_text) == 0) {
+                http_write_str(client_fd,
+                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"no prompt\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+
+            char request_id[64];
+            snprintf(request_id, sizeof(request_id), "cmpl-%llu", ++req_counter);
+            fprintf(stderr, "[serve] %s completions prompt=%zu chars, max_tokens=%d, temp=%.2f, stream=%d\n",
+                    request_id, strlen(prompt_text), max_gen, temperature, want_stream);
+
+            // Tokenize the raw prompt (no chat template)
+            PromptTokens *pt = encode_prompt_text_to_tokens(prompt_text);
+            if (!pt) {
+                http_write_str(client_fd,
+                    "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                    "{\"error\":\"tokenization failed\"}\n");
+                free(reqbuf); close(client_fd); continue;
+            }
+            int prompt_tokens = pt->count;
+
+            // Always restore from system prompt snapshot (no session for completions)
+            for (int i = 0; i < cfg.num_layers; i++) {
+                if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
+                    size_t sz = sys_prompt_len * kv_dim * sizeof(float);
+                    memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
+                    memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
+                    kv_caches[i]->len = kv_snapshots[i].len;
+                    if (g_metal) {
+                        int fa_idx = cfg.full_attn_index[i];
+                        if (fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
+                            memcpy([g_metal->buf_kv_k[fa_idx] contents],
+                                   kv_snapshots[i].k_snapshot, sz);
+                            memcpy([g_metal->buf_kv_v[fa_idx] contents],
+                                   kv_snapshots[i].v_snapshot, sz);
+                        }
+                    }
+                } else if (kv_caches[i]) {
+                    kv_caches[i]->len = 0;
+                }
+                if (layer_states[i] && la_conv_snapshots[i]) {
+                    LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                    memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
+                    memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
+                } else if (layer_states[i]) {
+                    LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                    memset(s->conv_state, 0, conv_state_size);
+                    memset(s->ssm_state, 0, ssm_state_size);
+                }
+            }
+            if (g_metal && g_metal->delta_net_step) {
+                for (int i = 0; i < cfg.num_linear_layers; i++) {
+                    if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
+                        memcpy([g_metal->buf_delta_state[i] contents],
+                               gpu_delta_snapshots[i], (size_t)cfg.linear_num_v_heads*cfg.linear_value_dim*cfg.linear_key_dim*sizeof(float));
+                    if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
+                        memcpy([g_metal->buf_conv_state[i] contents],
+                               gpu_conv_snapshots[i], (cfg.conv_kernel_size-1)*(size_t)cfg.linear_conv_dim*sizeof(float));
+                }
+            } else {
+                reset_delta_net_state();
+            }
+            int pos = sys_prompt_len;
+            active_session_id[0] = '\0';
+
+            if (want_stream) {
+                http_write_str(client_fd, SSE_HEADERS);
+            }
+
+            // ---- Batch prefill ----
+            if (pt->count > cfg.max_seq_len) {
+                pt->count = cfg.max_seq_len;
+            }
+            float *comp_embed_batch = NULL;
+            if (pt->count > 1) {
+                comp_embed_batch = malloc((size_t)pt->count * cfg.hidden_dim * sizeof(float));
+                if (comp_embed_batch) {
+                    for (int i = 0; i < pt->count; i++) {
+                        embed_lookup(wf, pt->ids[i], comp_embed_batch + (size_t)i * cfg.hidden_dim);
+                    }
+                }
+            }
+            for (int i = 0; i < pt->count - 1; i++) {
+                cache_telemetry_note_token();
+                if (comp_embed_batch) {
+                    memcpy(hidden, comp_embed_batch + (size_t)i * cfg.hidden_dim,
+                           cfg.hidden_dim * sizeof(float));
+                } else {
+                    embed_lookup(wf, pt->ids[i], hidden);
+                }
+                for (int layer = 0; layer < cfg.num_layers; layer++) {
+                    int is_full = cfg.is_full_attn[layer];
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                discard_deferred_experts();
+                pos++;
+            }
+            // Last prefill token
+            {
+                cache_telemetry_note_token();
+                if (comp_embed_batch) {
+                    memcpy(hidden, comp_embed_batch + (size_t)(pt->count - 1) * cfg.hidden_dim,
+                           cfg.hidden_dim * sizeof(float));
+                } else {
+                    embed_lookup(wf, pt->ids[0], hidden);
+                }
+                for (int layer = 0; layer < cfg.num_layers; layer++) {
+                    int is_full = cfg.is_full_attn[layer];
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                complete_deferred_experts();
+                pos++;
+            }
+            if (comp_embed_batch) { free(comp_embed_batch); comp_embed_batch = NULL; }
+
+            // ---- Final norm + LM head ----
+            if (final_norm_w) {
+                float *normed = malloc(cfg.hidden_dim * sizeof(float));
+                cpu_rms_norm(hidden, final_norm_w, normed, cfg.hidden_dim, cfg.rms_norm_eps);
+                memcpy(hidden, normed, cfg.hidden_dim * sizeof(float));
+                free(normed);
+            }
+            lm_head_forward(wf, hidden, logits);
+            int next_token = sample_with_temperature(logits, cfg.vocab_size, temperature);
+
+            // ---- Auto-regressive generation ----
+            double t_gen = now_ms();
+            int gen_count = 0;
+            char *gen_text = calloc(1, 256 * 1024);
+            int gen_text_len = 0;
+
+            for (int gen = 0; gen < max_gen; gen++) {
+                if (next_token == cfg.eos_token_ids[0] || next_token == cfg.eos_token_ids[1]) {
+                    break;
+                }
+
+                const char *tok_str = decode_token(vocab, next_token);
+                if (tok_str && gen_text_len + (int)strlen(tok_str) < 256*1024 - 1) {
+                    int tlen = (int)strlen(tok_str);
+                    memcpy(gen_text + gen_text_len, tok_str, tlen);
+                    gen_text_len += tlen;
+                    gen_text[gen_text_len] = 0;
+                }
+                if (want_stream) {
+                    // For completions streaming, use text_completion format
+                    char chunk[4096];
+                    char escaped[2048];
+                    json_escape(tok_str, (int)strlen(tok_str), escaped, sizeof(escaped));
+                    int n = snprintf(chunk, sizeof(chunk),
+                        "data: {\"id\":\"%s\",\"object\":\"text_completion\","
+                        "\"choices\":[{\"index\":0,\"text\":\"%s\",\"finish_reason\":null}]}\n\n",
+                        request_id, escaped);
+                    if (write(client_fd, chunk, n) <= 0) break;
+                }
+                gen_count++;
+
+                cache_telemetry_note_token();
+                embed_lookup(wf, next_token, hidden);
+                for (int layer = 0; layer < cfg.num_layers; layer++) {
+                    int is_full = cfg.is_full_attn[layer];
+                    fused_layer_forward(wf, layer, hidden,
+                                        is_full ? kv_caches[layer] : NULL,
+                                        is_full ? NULL : layer_states[layer],
+                                        pos,
+                                        layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
+                                        K, layer_fds[layer]);
+                }
+                complete_deferred_experts();
+                pos++;
+
+                if (final_norm_w) {
+                    float *normed = malloc(cfg.hidden_dim * sizeof(float));
+                    cpu_rms_norm(hidden, final_norm_w, normed, cfg.hidden_dim, cfg.rms_norm_eps);
+                    memcpy(hidden, normed, cfg.hidden_dim * sizeof(float));
+                    free(normed);
+                }
+                lm_head_forward(wf, hidden, logits);
+                next_token = sample_with_temperature(logits, cfg.vocab_size, temperature);
+            }
+
+            // ---- Send final response ----
+            if (want_stream) {
+                char done_chunk[256];
+                int n = snprintf(done_chunk, sizeof(done_chunk),
+                    "data: {\"id\":\"%s\",\"object\":\"text_completion\","
+                    "\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n"
+                    "data: [DONE]\n\n", request_id);
+                http_write(client_fd, done_chunk, n);
+            } else {
+                long created_ts = (long)time(NULL);
+                char *escaped_text = malloc(gen_text_len * 2 + 1);
+                json_escape(gen_text, gen_text_len, escaped_text, gen_text_len * 2 + 1);
+                int resp_buf_size = gen_text_len * 2 + 1024;
+                char *full_resp = malloc(resp_buf_size);
+                int n = snprintf(full_resp, resp_buf_size,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,"
+                    "\"model\":\"flash-moe\","
+                    "\"choices\":[{\"index\":0,\"text\":\"%s\",\"finish_reason\":\"stop\"}],"
+                    "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n",
+                    request_id, created_ts, escaped_text,
+                    prompt_tokens, gen_count, prompt_tokens + gen_count);
+                http_write(client_fd, full_resp, n);
+                free(escaped_text);
+                free(full_resp);
+            }
+
+            double gen_ms = now_ms() - t_gen;
+            fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
+                    request_id, gen_count, gen_ms,
+                    gen_count > 0 ? gen_count * 1000.0 / gen_ms : 0.0);
+
+            free(gen_text);
             free(pt->ids);
             free(pt);
             free(reqbuf);
@@ -1068,6 +1473,7 @@ static void print_usage(const char *prog) {
     printf("  --fp16               Use half-precision accumulation in dequant kernels (experimental)\n");
     printf("  --rope-scale MODE:FACTOR  RoPE scaling for context extension (e.g. ntk:4, yarn:2, linear:4)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
+    printf("  --openai-api[=PORT]  Run OpenAI-compatible API server (default port: 8080)\n");
     printf("  --help               This message\n");
 }
 
@@ -1107,6 +1513,7 @@ int main(int argc, char **argv) {
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
+            {"openai-api",    optional_argument, 0, 0x102},
             {"predict",       no_argument,       0, 'D'},
             {"no-prefetch",   no_argument,       0, 'X'},
             {"collect-routing", required_argument, 0, 'Z'},
@@ -1187,6 +1594,7 @@ int main(int argc, char **argv) {
                     break;
                 case 'B': g_think_budget = atoi(optarg); break;
                 case 'R': serve_port = atoi(optarg); break;
+                case 0x102: serve_port = optarg ? atoi(optarg) : 8080; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
