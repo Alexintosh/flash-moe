@@ -52,6 +52,8 @@ struct ModelListView: View {
     @State private var modelToDelete: LocalModel? = nil
     @State private var customRepoURL: String = ""
     @State private var showCustomURLError: String? = nil
+    @State private var customEntries: [CatalogEntry] = []
+    @State private var isResolvingURL = false
     private let downloadManager = DownloadManager.shared
 
     var body: some View {
@@ -123,10 +125,15 @@ struct ModelListView: View {
                     Button {
                         startCustomDownload()
                     } label: {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .font(.title3)
+                        if isResolvingURL {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.title3)
+                        }
                     }
-                    .disabled(customRepoURL.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(customRepoURL.trimmingCharacters(in: .whitespaces).isEmpty || isResolvingURL)
                 }
                 if let error = showCustomURLError {
                     Text(error)
@@ -138,16 +145,27 @@ struct ModelListView: View {
                     .foregroundStyle(.secondary)
             }
 
-            // Download section
-            Section("Download from HuggingFace") {
-                ForEach(ModelCatalog.models) { entry in
-                    let hasActiveDownload = downloadManager.activeDownload?.catalogId == entry.id
-                        && downloadManager.activeDownload?.status != .complete
-                    ModelDownloadRow(
-                        entry: entry,
-                        downloadManager: downloadManager,
-                        isDownloaded: !hasActiveDownload && downloadManager.isModelDownloaded(entry.id)
-                    )
+            // Download section — hide models already on device
+            let localNames = Set(localModels.map { $0.name.lowercased() })
+            let allEntries = ModelCatalog.models + customEntries
+            let availableEntries = allEntries.filter { entry in
+                // Hide if already downloaded on device
+                let isOnDevice = downloadManager.isModelDownloaded(entry.id) || localNames.contains(entry.id.lowercased())
+                let hasActiveDownload = downloadManager.activeDownload?.catalogId == entry.id
+                    && downloadManager.activeDownload?.status != .complete
+                return !isOnDevice || hasActiveDownload
+            }
+            if !availableEntries.isEmpty {
+                Section("Download from HuggingFace") {
+                    ForEach(availableEntries) { entry in
+                        let hasActiveDownload = downloadManager.activeDownload?.catalogId == entry.id
+                            && downloadManager.activeDownload?.status != .complete
+                        ModelDownloadRow(
+                            entry: entry,
+                            downloadManager: downloadManager,
+                            isDownloaded: !hasActiveDownload && downloadManager.isModelDownloaded(entry.id)
+                        )
+                    }
                 }
             }
 
@@ -472,6 +490,7 @@ struct ModelListView: View {
 
     private func startCustomDownload() {
         showCustomURLError = nil
+        isResolvingURL = true
         var input = customRepoURL.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Accept full URLs or repo IDs
@@ -491,6 +510,7 @@ struct ModelListView: View {
         let parts = input.split(separator: "/")
         guard parts.count >= 2 else {
             showCustomURLError = "Invalid format. Use 'user/model' or a HuggingFace URL."
+            isResolvingURL = false
             return
         }
         let repoId = "\(parts[0])/\(parts[1])"
@@ -502,12 +522,12 @@ struct ModelListView: View {
             do {
                 let (data, response) = try await URLSession.shared.data(from: apiURL)
                 guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                    await MainActor.run { showCustomURLError = "Repository not found: \(repoId)" }
+                    await MainActor.run { showCustomURLError = "Repository not found: \(repoId)"; isResolvingURL = false }
                     return
                 }
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let siblings = json["siblings"] as? [[String: Any]] else {
-                    await MainActor.run { showCustomURLError = "Failed to parse repository metadata." }
+                    await MainActor.run { showCustomURLError = "Failed to parse repository metadata."; isResolvingURL = false }
                     return
                 }
 
@@ -540,7 +560,7 @@ struct ModelListView: View {
                 }
 
                 guard !files.isEmpty else {
-                    await MainActor.run { showCustomURLError = "No files found in repository." }
+                    await MainActor.run { showCustomURLError = "No files found in repository."; isResolvingURL = false }
                     return
                 }
 
@@ -551,6 +571,7 @@ struct ModelListView: View {
                 guard hasConfig && hasWeights else {
                     await MainActor.run {
                         showCustomURLError = "Not a Flash-MoE model (missing config.json or model_weights.bin)."
+                        isResolvingURL = false
                     }
                     return
                 }
@@ -572,10 +593,14 @@ struct ModelListView: View {
                 await MainActor.run {
                     customRepoURL = ""
                     showCustomURLError = nil
-                    downloadManager.startDownload(entry: entry)
+                    isResolvingURL = false
+                    // Add to the download list — user taps the row to start
+                    if !customEntries.contains(where: { $0.id == entry.id }) {
+                        customEntries.append(entry)
+                    }
                 }
             } catch {
-                await MainActor.run { showCustomURLError = "Network error: \(error.localizedDescription)" }
+                await MainActor.run { showCustomURLError = "Network error: \(error.localizedDescription)"; isResolvingURL = false }
             }
         }
     }
