@@ -90,6 +90,46 @@ static void freq_print_analysis(int K) {
         }
         fprintf(stderr, "\n");
     }
+
+    // JSON frequency dump (--freq-json FILE)
+    if (g_freq_json_path) {
+        FILE *jf = fopen(g_freq_json_path, "w");
+        if (jf) {
+            fprintf(jf, "{\n  \"tokens\": %d,\n  \"K\": %d,\n  \"layers\": {\n",
+                    g_freq_total_tokens, K);
+            for (int l = 0; l < cfg.num_layers; l++) {
+                // Sort experts by frequency descending for this layer
+                typedef struct { int idx; int freq; } EF;
+                EF sorted_ef[cfg.num_experts];
+                for (int e = 0; e < cfg.num_experts; e++) {
+                    sorted_ef[e].idx = e;
+                    sorted_ef[e].freq = FREQ(l, e);
+                }
+                // Simple insertion sort (only ~256-512 experts)
+                for (int i = 1; i < cfg.num_experts; i++) {
+                    EF tmp = sorted_ef[i];
+                    int j = i - 1;
+                    while (j >= 0 && sorted_ef[j].freq < tmp.freq) {
+                        sorted_ef[j+1] = sorted_ef[j]; j--;
+                    }
+                    sorted_ef[j+1] = tmp;
+                }
+                fprintf(jf, "    \"%d\": [", l);
+                int first = 1;
+                for (int e = 0; e < cfg.num_experts; e++) {
+                    if (sorted_ef[e].freq > 0) {
+                        if (!first) fprintf(jf, ", ");
+                        fprintf(jf, "%d", sorted_ef[e].idx);
+                        first = 0;
+                    }
+                }
+                fprintf(jf, "]%s\n", l < cfg.num_layers - 1 ? "," : "");
+            }
+            fprintf(jf, "  }\n}\n");
+            fclose(jf);
+            fprintf(stderr, "\nFrequency data written to %s\n", g_freq_json_path);
+        }
+    }
 }
 
 // Tokenize a continuation turn (available in both CLI and iOS modes).
@@ -1058,6 +1098,7 @@ int main(int argc, char **argv) {
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
             {"freq",          no_argument,       0, 'F'},
+            {"freq-json",     required_argument, 0, 0x100},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
             {"tiered",        no_argument,       0, 'Q'},
@@ -1089,6 +1130,7 @@ int main(int argc, char **argv) {
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
+                case 0x100: g_freq_json_path = optarg; g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
                 case 'Q': g_use_tiered = 1; break;

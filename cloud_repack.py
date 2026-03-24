@@ -770,29 +770,56 @@ def repack_tiered(
 
     num_hot = max(1, int(num_experts * hot_ratio))
 
+    # Per-layer hot sets: maps layer_idx -> set of hot expert indices
+    # If freq_file has per-layer data, use it. Otherwise use a single global set.
+    per_layer_hot = {}
+
     if freq_file:
-        # Load explicit hot expert list from file
         freq_path = Path(freq_file)
         if freq_path.exists():
             hot_data = json.load(open(freq_path))
-            # hot_experts.json can be {"hot": [list of indices]} or a flat list
-            if isinstance(hot_data, dict) and "hot" in hot_data:
-                hot_set = set(hot_data["hot"][:num_hot])
+
+            # Format 1: {"layers": {"0": [sorted expert indices], ...}} (from --freq-json)
+            if isinstance(hot_data, dict) and "layers" in hot_data:
+                print(f"  Using per-layer frequency data from {freq_file}")
+                for l_str, expert_list in hot_data["layers"].items():
+                    l = int(l_str)
+                    per_layer_hot[l] = set(expert_list[:num_hot])
+
+            # Format 2: {"hot": [list of indices]} — global hot set
+            elif isinstance(hot_data, dict) and "hot" in hot_data:
+                global_hot = set(hot_data["hot"][:num_hot])
+                for l in range(num_layers):
+                    per_layer_hot[l] = global_hot
+
+            # Format 3: flat list of indices — global hot set
             elif isinstance(hot_data, list):
-                hot_set = set(hot_data[:num_hot])
+                global_hot = set(hot_data[:num_hot])
+                for l in range(num_layers):
+                    per_layer_hot[l] = global_hot
+
             else:
                 print(f"  WARNING: Unrecognized freq file format, falling back to index-based")
-                hot_set = set(range(num_hot))
         else:
             print(f"  WARNING: freq file {freq_file} not found, falling back to index-based")
-            hot_set = set(range(num_hot))
-    else:
-        # Default: top `hot_ratio` by index (low indices = most frequently routed)
-        hot_set = set(range(num_hot))
 
-    num_cold = num_experts - len(hot_set)
-    print(f"  Hot experts (4-bit): {len(hot_set)} ({len(hot_set)/num_experts:.0%})")
-    print(f"  Cold experts (2-bit): {num_cold} ({num_cold/num_experts:.0%})")
+    # Fallback: index-based (first num_hot experts are hot)
+    if not per_layer_hot:
+        global_hot = set(range(num_hot))
+        for l in range(num_layers):
+            per_layer_hot[l] = global_hot
+
+    # Summary
+    hot_counts = [len(per_layer_hot.get(l, set())) for l in range(num_layers)]
+    avg_hot = sum(hot_counts) / len(hot_counts)
+    avg_cold = num_experts - avg_hot
+    print(f"  Hot experts (4-bit): avg {avg_hot:.0f}/layer ({avg_hot/num_experts:.0%})")
+    print(f"  Cold experts (2-bit): avg {avg_cold:.0f}/layer ({avg_cold/num_experts:.0%})")
+    if freq_file and "layers" in (hot_data if isinstance(hot_data, dict) else {}):
+        print(f"  Per-layer assignment: YES (different experts per layer)")
+
+    # For backward compat
+    hot_set = per_layer_hot.get(0, set(range(num_hot)))
 
     # ------------------------------------------------------------------
     # Step 5: Tiered repack — hot at 4-bit, cold requantized to 2-bit
@@ -834,7 +861,7 @@ def repack_tiered(
 
         with open(layer_path, 'wb') as out_f:
             for expert in range(num_experts):
-                is_hot = expert in hot_set
+                is_hot = expert in per_layer_hot.get(layer, set())
 
                 # Read 4-bit expert data from safetensors
                 expert_block_4bit = bytearray(expert_size_4bit)

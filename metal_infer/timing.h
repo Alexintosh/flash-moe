@@ -66,6 +66,7 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 // ============================================================================
 
 static int g_freq_tracking = 0;  // enabled by --freq flag
+static const char *g_freq_json_path = NULL;  // --freq-json FILE: write per-layer hot experts as JSON
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // >1: split each routed expert pread into N page-aligned chunks (fanout)
