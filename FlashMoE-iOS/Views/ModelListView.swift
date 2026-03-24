@@ -43,6 +43,8 @@ struct ModelListView: View {
     @AppStorage("expertPrefetch") private var expertPrefetch: Bool = false
     @AppStorage("fusedExpert") private var fusedExpert: Bool = true
     @AppStorage("fp16Accumulation") private var fp16Accumulation: Bool = false
+    @AppStorage("fp8KVCache") private var fp8KVCache: Bool = false
+    @AppStorage("maxContext") private var maxContext: Int = 0
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
@@ -234,6 +236,32 @@ struct ModelListView: View {
                 Text(fp16Accumulation
                      ? "Uses half-precision math in weight matmuls. ~5-10% faster but may reduce output quality."
                      : "Standard float32 accumulation. Maximum precision.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("FP8 KV Cache", isOn: $fp8KVCache)
+                Text(fp8KVCache
+                     ? "Stores attention KV cache in FP8 (1 byte/element). 4x less memory → longer context. Reload model to apply."
+                     : "Standard float32 KV cache. Maximum attention precision.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("Max Context Length", selection: $maxContext) {
+                    Text("Auto (adaptive)").tag(0)
+                    Text("4,096 tokens").tag(4096)
+                    Text("8,192 tokens").tag(8192)
+                    Text("16,384 tokens").tag(16384)
+                    Text("32,768 tokens").tag(32768)
+                }
+                .pickerStyle(.menu)
+                Text({
+                    if maxContext == 0 {
+                        return "Automatically set based on available memory. Reload model to apply."
+                    }
+                    let kvPerPos = fp8KVCache ? 10 : 40  // KB per position (35B model)
+                    let kvMB = maxContext * kvPerPos / 1024
+                    return "\(maxContext) positions = ~\(kvMB) MB KV cache (\(fp8KVCache ? "FP8" : "FP32")). Reload model to apply."
+                }())
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -469,6 +497,7 @@ struct ModelListView: View {
             do {
                 try await engine.loadModel(
                     at: model.path,
+                    maxContext: maxContext,
                     thinkBudget: thinkingEnabled ? thinkBudget : -1,
                     useTiered: model.hasTiered,
                     activeExpertsK: activeK,
@@ -478,6 +507,7 @@ struct ModelListView: View {
                     expertPrefetch: expertPrefetch,
                     fusedExpert: fusedExpert,
                     fp16Accumulation: fp16Accumulation,
+                    fp8KVCache: fp8KVCache,
                     verbose: true
                 )
             } catch {

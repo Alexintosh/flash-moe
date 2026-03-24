@@ -407,6 +407,7 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         g_expert_prefetch_enabled = config->expert_prefetch;
         g_fused_expert_enabled = config->fused_expert;
         g_use_fp16_accum = config->fp16_accumulation;
+        g_use_fp8_kv = config->fp8_kv_cache;
         g_prefetch_active = 0;
         g_prefetch_layer = -1;
         g_prefetch_hits_total = 0;
