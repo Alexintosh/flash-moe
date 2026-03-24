@@ -514,6 +514,7 @@ def repack_tiered(
     hf_token: str = "",
     hot_ratio: float = 0.2,
     freq_file: str = "",
+    freq_data_json: str = "",  # JSON string of freq data (uploaded from local)
 ):
     """Download, repack with tiered quantization (hot=4-bit, cold=2-bit), and upload.
 
@@ -775,7 +776,11 @@ def repack_tiered(
     per_layer_hot = {}
     hot_data = None
 
-    if freq_file:
+    # Try uploaded JSON string first (from local machine), then file path
+    if freq_data_json:
+        hot_data = json.loads(freq_data_json)
+        print(f"  Using frequency data uploaded from local machine")
+    elif freq_file:
         freq_path = Path(freq_file)
         if freq_path.exists():
             hot_data = json.load(open(freq_path))
@@ -1292,9 +1297,18 @@ def main(
     if mode == "4bit":
         repack_model.remote(source=source, dest=dest, split_gb=split, hf_token=hf_token)
     elif mode == "tiered":
+        # Upload freq file contents to Modal (local path won't exist on remote)
+        freq_data_json = ""
+        if freq_file:
+            local_freq = Path(freq_file)
+            if local_freq.exists():
+                freq_data_json = local_freq.read_text()
+                print(f"Uploading freq data ({len(freq_data_json)} bytes) to Modal...")
+            else:
+                print(f"WARNING: freq file {freq_file} not found locally, using index-based assignment")
         repack_tiered.remote(
             source=source, dest=dest, split_gb=split, hf_token=hf_token,
-            hot_ratio=hot_ratio, freq_file=freq_file,
+            hot_ratio=hot_ratio, freq_data_json=freq_data_json,
         )
     elif mode == "gptq":
         repack_gptq.remote(
