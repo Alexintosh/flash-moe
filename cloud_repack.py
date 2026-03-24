@@ -862,6 +862,24 @@ def repack_tiered(
 
     for layer in range(num_layers):
         layer_path = expert_dir / f"layer_{layer:02d}.bin"
+
+        # --- Checkpoint: skip layers already completed ---
+        checkpoint_marker = expert_dir / f".layer_{layer:02d}.done"
+        if checkpoint_marker.exists() and layer_path.exists():
+            # Recover manifest from checkpoint
+            import json as json_mod
+            ckpt_manifest_path = expert_dir / f".layer_{layer:02d}.manifest.json"
+            if ckpt_manifest_path.exists():
+                with open(ckpt_manifest_path) as f:
+                    saved = json_mod.load(f)
+                    tiered_manifest["layers"][str(layer)] = saved["entries"]
+                    total_hot += saved["hot"]
+                    total_cold += saved["cold"]
+            fsize = layer_path.stat().st_size
+            print(f"  Layer {layer}/{num_layers}: SKIPPED (checkpoint exists, {fsize/1e9:.2f} GB)")
+            vol.commit()
+            continue
+
         t_layer = time.time()
         layer_manifest = []
         current_offset = 0
@@ -965,6 +983,16 @@ def repack_tiered(
         layer_size = os.path.getsize(layer_path)
         layer_ms = (time.time() - t_layer) * 1000
         print(f"  Layer {layer:2d}/{num_layers}: {layer_size/1e9:.2f} GB ({layer_ms:.0f}ms)")
+
+        # --- Save checkpoint so we can resume if interrupted ---
+        import json as json_mod
+        ckpt_manifest_path = expert_dir / f".layer_{layer:02d}.manifest.json"
+        with open(ckpt_manifest_path, 'w') as f:
+            json_mod.dump({"entries": layer_manifest, "hot": total_hot, "cold": total_cold}, f)
+        checkpoint_marker = expert_dir / f".layer_{layer:02d}.done"
+        checkpoint_marker.touch()
+        vol.commit()
+        print(f"    Checkpoint saved for layer {layer}")
 
     # Write tiered manifest
     with open(expert_dir / "tiered_manifest.json", 'w') as f:
