@@ -252,9 +252,9 @@ struct ModelListView: View {
             }
 
             Section("Expert Settings") {
-                Picker("Active Experts (K)", selection: $activeExpertsK) {
+                Picker(selection: $activeExpertsK) {
                     Text("Model default").tag(0)
-                    Text("K=2 (fastest, lowest quality)").tag(2)
+                    Text("K=2 (fastest)").tag(2)
                     Text("K=3").tag(3)
                     Text("K=4").tag(4)
                     Text("K=5").tag(5)
@@ -262,94 +262,51 @@ struct ModelListView: View {
                     Text("K=7").tag(7)
                     Text("K=8").tag(8)
                     Text("K=9").tag(9)
-                    Text("K=10 (full quality)").tag(10)
-                }
+                    Text("K=10 (full)").tag(10)
+                } label: { settingLabel("Active Experts (K)", key: "activeExperts") }
                 .pickerStyle(.menu)
-                if activeExpertsK > 0 {
-                    infoCaption("Uses \(activeExpertsK) experts per token. Lower = faster but less accurate. Reload to apply.", key: "activeExperts")
-                }
 
-                Picker("Expert I/O Fanout", selection: $cacheIOSplit) {
-                    Text("Off (single pread)").tag(1)
+                Picker(selection: $cacheIOSplit) {
+                    Text("Off").tag(1)
                     Text("2 chunks").tag(2)
                     Text("4 chunks").tag(4)
                     Text("8 chunks").tag(8)
-                }
+                } label: { settingLabel("I/O Fanout", key: "ioFanout") }
                 .pickerStyle(.menu)
-                if cacheIOSplit > 1 {
-                    infoCaption("Splits each expert read into \(cacheIOSplit) parallel chunks. Reload to apply.", key: "ioFanout")
-                }
 
-                Toggle("CMD1+CMD2 Merge", isOn: $cmdMergeEnabled)
-                infoCaption(cmdMergeEnabled
-                     ? "Merges GPU command buffers for linear attention layers."
-                     : "Separate command buffers. Safer, slightly slower.", key: "cmdMerge")
+                Toggle(isOn: $cmdMergeEnabled) { settingLabel("CMD1+CMD2 Merge", key: "cmdMerge") }
+                Toggle(isOn: $fusedAttention) { settingLabel("Fused Attention", key: "fusedAttention") }
+                Toggle(isOn: $fusedExpert) { settingLabel("Fused Expert Kernel", key: "fusedExpert") }
+                Toggle(isOn: $expertPrefetch) { settingLabel("Expert Prefetch", key: "expertPrefetch") }
+                Toggle(isOn: $fp16Accumulation) { settingLabel("FP16 Accumulation", key: "fp16Accum") }
+                Toggle(isOn: $fp8KVCache) { settingLabel("FP8 KV Cache", key: "fp8KV") }
 
-                Toggle("Fused Attention", isOn: $fusedAttention)
-                infoCaption(fusedAttention
-                     ? "Single-kernel online softmax attention. Experimental."
-                     : "Standard 3-kernel attention pipeline. Proven correct.", key: "fusedAttention")
-
-                Toggle("Fused Expert Kernel", isOn: $fusedExpert)
-                infoCaption(fusedExpert
-                     ? "Fused gate+up+SwiGLU in one kernel."
-                     : "Separate gate, up, SwiGLU dispatches.", key: "fusedExpert")
-
-                Toggle("Expert Prefetch", isOn: $expertPrefetch)
-                infoCaption(expertPrefetch
-                     ? "Prefetches next layer's experts during GPU compute."
-                     : "Experts loaded on-demand only.", key: "expertPrefetch")
-
-                Toggle("FP16 Accumulation", isOn: $fp16Accumulation)
-                infoCaption(fp16Accumulation
-                     ? "Half-precision math. ~5-10% faster, may reduce quality."
-                     : "Standard float32 accumulation. Maximum precision.", key: "fp16Accum")
-
-                Toggle("FP8 KV Cache", isOn: $fp8KVCache)
-                infoCaption(fp8KVCache
-                     ? "FP8 KV cache: 4x less memory, longer context. Reload to apply."
-                     : "Standard float32 KV cache. Reload to apply.", key: "fp8KV")
-
-                Picker("Max Context Length", selection: $maxContext) {
-                    Text("Auto (adaptive)").tag(0)
-                    Text("4,096 tokens").tag(4096)
-                    Text("8,192 tokens").tag(8192)
-                    Text("16,384 tokens").tag(16384)
-                    Text("32,768 tokens").tag(32768)
-                }
+                Picker(selection: $maxContext) {
+                    Text("Auto").tag(0)
+                    Text("4K").tag(4096)
+                    Text("8K").tag(8192)
+                    Text("16K").tag(16384)
+                    Text("32K").tag(32768)
+                } label: { settingLabel("Max Context", key: "maxContext") }
                 .pickerStyle(.menu)
-                infoCaption({
-                    if maxContext == 0 {
-                        return "Auto-sized based on available memory. Reload to apply."
-                    }
-                    let kvPerPos = fp8KVCache ? 10 : 40
-                    let kvMB = maxContext * kvPerPos / 1024
-                    return "\(maxContext) positions = ~\(kvMB) MB KV (\(fp8KVCache ? "FP8" : "FP32")). Reload to apply."
-                }(), key: "maxContext")
 
-                Picker("Sliding Window", selection: $slidingWindow) {
-                    Text("Off (full context)").tag(0)
-                    Text("2,048 positions").tag(2048)
-                    Text("4,096 positions").tag(4096)
-                    Text("8,192 positions").tag(8192)
-                }
+                Picker(selection: $slidingWindow) {
+                    Text("Off").tag(0)
+                    Text("2K").tag(2048)
+                    Text("4K").tag(4096)
+                    Text("8K").tag(8192)
+                } label: { settingLabel("Sliding Window", key: "slidingWindow") }
                 .pickerStyle(.menu)
-                infoCaption(slidingWindow > 0
-                     ? "Circular KV cache of \(slidingWindow) positions. Linear layers keep full context. Reload to apply."
-                     : "Full attention over entire history. Reload to apply.", key: "slidingWindow")
 
-                Toggle("Thinking", isOn: $thinkingEnabled)
-                infoCaption(thinkingEnabled
-                     ? "Model reasons in <think> tags before answering."
-                     : "Thinking disabled — answers directly. Better for low K.", key: "thinking")
+                Toggle(isOn: $thinkingEnabled) { settingLabel("Thinking", key: "thinking") }
 
                 if thinkingEnabled {
                     Picker("Think Budget", selection: $thinkBudget) {
-                        Text("128 tokens").tag(128)
-                        Text("256 tokens").tag(256)
-                        Text("512 tokens").tag(512)
-                        Text("1024 tokens").tag(1024)
-                        Text("2048 tokens (default)").tag(2048)
+                        Text("128").tag(128)
+                        Text("256").tag(256)
+                        Text("512").tag(512)
+                        Text("1024").tag(1024)
+                        Text("2048").tag(2048)
                         Text("Unlimited").tag(0)
                     }
                     .pickerStyle(.menu)
@@ -739,15 +696,11 @@ struct ModelListView: View {
         }
     }
 
-    // MARK: - Info Caption Helper
+    // MARK: - Setting Label with Info Button
 
     @ViewBuilder
-    private func infoCaption(_ text: String, key: String) -> some View {
-        HStack(alignment: .top, spacing: 4) {
-            Text(text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 0)
+    private func settingLabel(_ title: String, key: String) -> some View {
+        HStack(spacing: 6) {
             Button {
                 settingInfo = SettingInfo.all[key]
             } label: {
@@ -756,6 +709,7 @@ struct ModelListView: View {
                     .foregroundStyle(.blue)
             }
             .buttonStyle(.plain)
+            Text(title)
         }
     }
 
