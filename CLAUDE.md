@@ -94,7 +94,7 @@ Qwen3.5 MoE models use a hybrid attention architecture with GatedDeltaNet (linea
 
 9. **iOS Unity Build** — The entire 7,500-line inference engine compiles into the iOS app via `#include "infer.m"`. No fork, no separate codebase. A thin C API (`FlashMoEEngine.h`) wraps the static globals, and a Swift `@Observable` bridge provides `AsyncStream<Token>` generation with automatic memory-adaptive context sizing.
 
-10. **FP8 E4M3 KV Cache** — Opt-in quantization of the KV cache from float32 to FP8 E4M3 (1 sign, 4 exponent, 3 mantissa bits). Per-position dynamic scales stored separately. Reduces KV memory from ~60KB/position to ~15KB/position for the 397B model (4x reduction), enabling longer context on memory-constrained devices. GPU inline dequant in the fused attention kernel reads FP8 bytes and scales on the fly. Enabled with `--fp8-kv` flag; default off to preserve float32 precision.
+10. **FP8 E4M3 KV Cache** — Opt-in quantization of the KV cache from float32 to FP8 E4M3 (1 sign, 4 exponent, 3 mantissa bits). Per-position dynamic scales stored separately. Reduces KV memory from ~60KB/position to ~15KB/position for the 397B model (4x reduction), enabling longer context on memory-constrained devices. GPU inline dequant in the fused attention kernel reads FP8 bytes and scales on the fly. Enabled with `--fp8-kv` flag; default off to preserve float32 precision. Note: FP8/sliding window flags must be set BEFORE `metal_setup()` to ensure correct buffer allocation.
 
 11. **Fused Online Softmax Attention** — Single-kernel FlashAttention-style implementation replaces the previous 3-dispatch pipeline (Q@K^T, softmax, scores@V) for full-attention layers. Iterates over KV positions in blocks of `BLOCK_SIZE=64`, maintaining online softmax state (running max `m`, running sum `l`, output accumulator `o`) per head. Each block computes partial scores, updates the running statistics, and rescales the accumulator — never materializing the full attention matrix. Reduces 3 GPU dispatches to 1 per full-attention layer.
 
@@ -105,6 +105,29 @@ Qwen3.5 MoE models use a hybrid attention architecture with GatedDeltaNet (linea
 14. **Wired Memory Limit** — Metal's `recommendedMaxWorkingSetSize` API queried at startup and stored in `MetalCtx.recommended_working_set`. Used to constrain KV cache allocation so GPU buffer totals stay within the device's wired memory budget, preventing Metal from evicting buffers to system memory (which causes severe latency spikes).
 
 15. **Universal App** — The SwiftUI shell compiles for both iPhone and Mac (via "Designed for iPad" / Mac Catalyst compatibility). Views use `#if os(iOS)` conditional compilation for platform-specific UI (toolbar placement, keyboard dismiss, document picker). The same C inference engine, Metal shaders, and Swift bridge run on both platforms without modification.
+
+16. **Sliding Window Attention** — Circular KV buffer for full attention layers. Write position cycles via `cache_pos = kv->len % window_size`. The 30 GatedDeltaNet linear attention layers maintain full context through their 128x128 state matrices (O(1) memory), while only the 10 full attention layers are windowed. With window 4096 + FP8: fixed 40MB KV regardless of conversation length. Enabled via `--sliding-window N` flag.
+
+17. **FP16 Accumulation** (experimental) — Optional half-precision accumulation in dequant matvec kernels. Apple's GPU has dedicated fp16 ALUs at 2x throughput. The FMA becomes `fma(half(nibble), half(scale*x), half(bias*x))` with final promotion to float32 via `simd_sum`. Risk: fp16 has ~3 decimal digits of precision; sums of 512+ elements may lose accuracy. Default OFF; toggle in Expert Settings.
+
+18. **H2O KV Cache Eviction** (in progress) — Heavy Hitter Oracle eviction for the full-attention KV cache. Tracks cumulative post-softmax attention scores per position. When the cache exceeds the budget, it protects sink tokens (first N, typically 4) and recent tokens (25% of budget), then keeps the highest-scoring "heavy hitter" positions. Compacts both CPU and GPU caches in-place so GPU kernels see a shorter contiguous sequence. Replaces sliding window when both are configured (H2O is strictly better). See [docs/context-optimization.md](docs/context-optimization.md).
+
+19. **Custom HuggingFace URL Download** — Users can paste any HuggingFace model URL (e.g. `mlx-community/Qwen3.5-35B-A3B-4bit`) in the iOS/Mac app to resolve and download compatible models not in the built-in catalog. The URL is validated, config.json is fetched to verify compatibility, and the model is added to the download list.
+
+20. **macOS Sandbox Entitlements** — The universal app includes sandbox entitlements for file access (`com.apple.security.files.user-selected.read-write`), networking (`com.apple.security.network.client`), extended virtual addressing, and increased memory limits.
+
+21. **Paper-Guided Autoresearch v2** — Automated experiment loop that reads the research paper, identifies optimization opportunities, implements them, benchmarks with quality gates, and logs results. See `autoresearch/program_v2.md`.
+
+### Expert Settings UI
+
+The iOS/Mac app includes a comprehensive Expert Settings panel with info modals for every toggle. Each setting has an analogy (plain-language explanation) and technical details. The UI uses a compact layout with an info icon to the left of each label. Settings include: Active Experts (K), I/O Fanout, CMD1+CMD2 Merge, Fused Attention, Fused Expert Kernel, Expert Prefetch, FP16 Accumulation, FP8 KV Cache, Max Context Length (4K-32K), Sliding Window, Thinking Mode, and H2O Budget (coming soon). Max generation tokens bumped to 2048. See [docs/expert-settings-guide.md](docs/expert-settings-guide.md).
+
+### Model Management
+
+- Downloaded models are hidden from the download catalog list (no duplicate entries)
+- Trash icon removed from download catalog rows
+- Custom HuggingFace URL download support
+- Import, export, and delete models on-device
 
 ### iOS-Specific Constraints
 
@@ -282,9 +305,20 @@ FlashMoE-iOS/              # Native iOS app
 
 autoresearch/              # Automated experiment loop
   program.md               # Agent instructions for autonomous optimization
+  program_v2.md            # Paper-guided autoresearch v2 instructions
   benchmark.sh             # Measurement harness with quality gates
   prepare.sh               # Baseline setup
   experiments.tsv          # Experiment log
+  findings.md              # Autoresearch findings and results
+
+docs/
+  context-optimization.md  # FP8 KV + sliding window + H2O context management
+  expert-settings-guide.md # All Expert Settings with analogies and technical details
+  ios-port.md              # iOS port overview
+  optimization-experiments-q4.md  # Q4 optimization experiments
+  vulkan-learnings-plan.md # Vulkan fork analysis (all 4 phases complete)
+  oom-prevention.md        # OOM prevention architecture
+  tiered-expert-quantization.md   # Tiered quantization experiment writeup
 ```
 
 ## What We Tried (and What Worked)

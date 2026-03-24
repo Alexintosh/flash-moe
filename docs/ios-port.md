@@ -14,9 +14,10 @@ A native SwiftUI iOS app that runs Qwen3.5 MoE models on iPhone, sharing 100% of
 |--------|-------|---|-------|-------|
 | iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B | 8 | **5.5** | Full quality, full GPU path |
 | iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B (tiered) | 8 | **5.5+** | 13.4GB download, same quality |
+| iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B | 4 | **~11*** | *Projected with K=4 + all optimizations (CMD merge, fused expert, prefetch) |
 | iPhone 17 (12GB, A19) | Qwen3.5-397B-A17B | 4 | ~0.003 | CPU fallback only (Metal 4GB buffer limit) |
 
-iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory.
+iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory. With K=4 and all Expert Settings optimizations enabled, projections reach ~11 tok/s on the 35B.
 
 ## iOS App Features
 
@@ -40,10 +41,21 @@ iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory.
 - Model info sheet (layers, experts, hidden dim, vocab, file sizes)
 
 ### Expert Settings
-- K value picker (2-10) for K-reduction (fewer experts = less I/O, lower quality)
-- Fanout chunks picker (off/2/4/8) for I/O splitting
-- Adaptive context length based on available device memory
-- K-reduction for memory-constrained devices (reduces expert I/O proportionally)
+All settings include info modals with plain-language analogies and technical explanations. Compact UI layout with info icon to the left of each label.
+
+- **Active Experts (K)** — K value picker (2-10) for K-reduction (fewer experts = less I/O, lower quality)
+- **I/O Fanout** — Chunks picker (off/2/4/8) for splitting expert reads into parallel chunks
+- **CMD1+CMD2 Merge** — Combine GPU command buffers for linear attention layers (saves one sync per layer)
+- **Fused Attention** — Single-kernel FlashAttention-style online softmax (replaces 3-dispatch pipeline)
+- **Fused Expert Kernel** — Combined gate+up+SwiGLU in one Metal dispatch per expert
+- **Expert Prefetch** — Overlap next-layer expert I/O with current-layer GPU compute
+- **FP16 Accumulation** — Experimental half-precision accumulation in dequant kernels (default OFF)
+- **FP8 KV Cache** — 4x KV memory reduction via FP8 E4M3 quantization
+- **Max Context Length** — Selector from 4K to 32K positions (Auto mode uses `os_proc_available_memory()`)
+- **Sliding Window** — Circular KV buffer for full attention layers (0/2048/4096/8192)
+- **Thinking Mode** — Enable/disable `<think>` chain-of-thought with configurable budget
+- **H2O Budget** — Heavy Hitter Oracle KV eviction (coming soon)
+- Max generation tokens bumped from 500 to 2048
 
 ### Profiler
 - Resource monitoring overlay
@@ -57,19 +69,35 @@ iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory.
 - 2-bit experts (faster, breaks JSON/tool calling)
 - Tiered quantization (4-bit hot / 2-bit cold experts, auto-detected)
 
-### FP8 KV Cache (opt-in)
-- FP8 E4M3 quantization of K and V caches: float32 (4 bytes/element) to uint8 (1 byte/element)
-- Per-position dynamic scales stored in separate Metal buffers
-- Reduces KV memory from ~60KB/position to ~15KB/position for the 397B model (4x)
-- On iPhone 17 (12GB): enables significantly longer context windows for the 35B model
-- GPU inline dequant in the fused attention kernel — no CPU decode overhead
-- Enabled with `--fp8-kv` flag; default off for maximum precision
+### Context Management
+- **FP8 KV Cache** — FP8 E4M3 quantization: float32 (4 bytes) to uint8 (1 byte) per element. Per-position dynamic scales in separate Metal buffers. 4x memory reduction (~60KB to ~15KB per position for 397B). GPU inline dequant in fused attention kernel. FP8/sliding window flags are set BEFORE `metal_setup()` to ensure correct buffer allocation.
+- **Sliding Window Attention** — Circular KV buffer for full attention layers. Only the 10 full attention layers are windowed; the 30 GatedDeltaNet layers maintain full context via 128x128 state matrices. With window 4096 + FP8: fixed 40MB KV regardless of conversation length.
+- **Max Context Length** — Configurable from 4K to 32K. Auto mode uses `os_proc_available_memory()` to pick the largest safe value. Memory cost: num_full_attn_layers x 2 x kv_heads x head_dim x bytes_per_elem x positions.
+- **H2O KV Cache Eviction** (in progress) — Heavy Hitter Oracle: tracks cumulative attention scores, protects sink tokens + recent tokens, evicts low-scoring positions. Replaces sliding window when both are configured. See [context-optimization.md](context-optimization.md).
+
+### Custom URL Download
+- Paste any HuggingFace model URL (e.g. `mlx-community/Qwen3.5-35B-A3B-4bit`) in the download section
+- URL is validated and config.json is fetched to verify Qwen3.5 MoE compatibility
+- Custom models appear in the download list alongside catalog entries
+- Downloaded models are hidden from the catalog (no duplicate entries)
+- Trash icon removed from catalog download rows
 
 ### Universal App Support
 - Same SwiftUI shell compiles for both iPhone and Mac destinations
 - `#if os(iOS)` conditional compilation for platform-specific UI (toolbar, keyboard dismiss, document picker)
 - C inference engine, Metal shaders, and Swift bridge are fully cross-platform
 - No code fork — one codebase serves both platforms
+- macOS sandbox entitlements: app-sandbox, extended-virtual-addressing, increased-memory-limit, user-selected file read-write, network client
+
+### Model Management
+- On-device model scanning (Documents directory)
+- HuggingFace download catalog with per-model K recommendations
+- Background URLSession downloads with progress tracking
+- Swipe-to-delete for downloaded models
+- Import from Files app (UIDocumentPickerViewController) with bookmark or move-to-Documents
+- Export/Move model to Files app for cross-app access
+- Model info sheet (layers, experts, hidden dim, vocab, file sizes)
+- Custom HuggingFace URL download (see above)
 
 ## Architecture
 

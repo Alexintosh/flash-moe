@@ -122,3 +122,34 @@ The 4-bit performance ceiling on M3 Max 48GB is approximately **4.4 tok/s** for 
 - 3% CPU overhead (0.1 ms/layer)
 
 Further improvement requires either hardware changes (more RAM for expert caching, faster SSD) or model architecture changes (fewer/smaller experts, larger shared expert to reduce per-token I/O).
+
+## iPhone Testing (A19, 12GB)
+
+The same optimization techniques were tested on iPhone 17 with the 35B model:
+
+### Applicable Optimizations
+
+| Optimization | Result on iPhone | Notes |
+|-------------|-----------------|-------|
+| FMA dequant kernel | Included in baseline | Same kernel runs on both platforms |
+| CMD1+CMD2 merge | +5-10% projected | Saves 30 sync points per token on 35B (30 linear layers) |
+| Fused expert kernel | +3-5% projected | Reduces dispatch overhead per expert |
+| Expert prefetch | Under validation | Depends on A19 NVMe characteristics |
+| FP16 accumulation | Under validation | A19 has fp16 ALUs, may be more impactful than M3 Max |
+| K-reduction (K=4 from K=8) | **~2x speedup** | Halves expert I/O, the dominant bottleneck |
+
+### iPhone-Specific Results
+
+| Configuration | tok/s | Notes |
+|--------------|-------|-------|
+| 35B, K=8, baseline | 5.5 | Full quality, 19.5GB model |
+| 35B, K=8, tiered | 5.5+ | 13.4GB model, same quality |
+| 35B, K=4, projected with all opts | ~11 | CMD merge + fused expert + K reduction |
+| 397B, K=4, CPU fallback | ~0.003 | Metal 4GB buffer limit blocks GPU path |
+
+### Key Differences from MacBook
+
+1. **NVMe bandwidth** -- iPhone ~2.5-3 GB/s vs MacBook 17.5 GB/s. Expert I/O takes proportionally longer, making K-reduction even more impactful on mobile.
+2. **Memory budget** -- 12GB vs 48GB. Less room for OS page cache, so expert cache hit rates are lower. FP8 KV cache and sliding window attention free up memory for the page cache.
+3. **Thermal constraints** -- iPhone thermal throttles sooner. Sustained generation speeds may be lower than burst measurements.
+4. **Metal buffer limits** -- 4GB per buffer on iOS vs unlimited on macOS. Prevents GPU path for 397B model without split weight files.
