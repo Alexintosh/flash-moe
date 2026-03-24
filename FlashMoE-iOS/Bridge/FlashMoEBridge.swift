@@ -80,7 +80,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                    cmdMerge: Bool = true, fusedAttention: Bool = false,
                    expertPrefetch: Bool = false, fusedExpert: Bool = true,
                    fp16Accumulation: Bool = false, fp8KVCache: Bool = false,
-                   verbose: Bool = false) async throws {
+                   slidingWindow: Int = 0, verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
         }
@@ -119,6 +119,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.fused_expert = fusedExpert ? 1 : 0
                 config.fp16_accumulation = fp16Accumulation ? 1 : 0
                 config.fp8_kv_cache = fp8KVCache ? 1 : 0
+                config.sliding_window = Int32(slidingWindow)
                 config.verbose = verbose ? 1 : 0
 
                 // Load

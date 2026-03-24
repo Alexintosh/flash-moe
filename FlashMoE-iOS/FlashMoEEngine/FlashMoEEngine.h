@@ -47,6 +47,7 @@ typedef struct {
     int fused_expert;           // 1 = fused gate+up+SwiGLU kernel (default), 0 = separate dispatches
     int fp16_accumulation;      // 1 = use half-precision accumulation in dequant kernels (experimental), 0 = float32
     int fp8_kv_cache;           // 1 = FP8 E4M3 KV cache (4x less memory, longer context), 0 = float32
+    int sliding_window;         // >0 = sliding window size for full attention layers, 0 = unlimited
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 

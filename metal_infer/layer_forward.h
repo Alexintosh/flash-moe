@@ -54,15 +54,21 @@ typedef struct {
     uint8_t *v_cache_fp8;  // [max_seq, num_kv_heads * head_dim] FP8 E4M3 (NULL when use_fp8=0)
     float *k_scales;     // [max_seq] per-position K scale (FP8 only)
     float *v_scales;     // [max_seq] per-position V scale (FP8 only)
-    int len;             // current number of cached entries
+    int len;             // total tokens written (monotonically increasing)
     int use_fp8;         // 1 = FP8 E4M3, 0 = float32
+    int window_size;     // >0: sliding window (circular buffer), 0: unlimited
+    int capacity;        // allocated size (= window_size if sliding, else max_seq)
 } KVCache;
 
 static KVCache *kv_cache_new(void) {
-    int seq = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
+    int max_seq = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
     KVCache *c = calloc(1, sizeof(KVCache));
     c->len = 0;
     c->use_fp8 = g_use_fp8_kv;
+    c->window_size = g_sliding_window;  // 0 = unlimited, >0 = circular buffer
+    // Capacity: if sliding window, only allocate window_size positions
+    int seq = (c->window_size > 0 && c->window_size < max_seq) ? c->window_size : max_seq;
+    c->capacity = seq;
     size_t kv_dim = (size_t)cfg.num_kv_heads * cfg.head_dim;
 
     if (c->use_fp8) {
@@ -291,28 +297,29 @@ static void full_attention_forward(
     // ---- RoPE ----
     apply_rotary_emb(q, k, pos, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
 
-    // ---- Update KV cache ----
-    int cache_pos = kv->len;
-    int kv_max = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
+    // ---- Update KV cache (circular buffer for sliding window) ----
+    int cache_pos;
+    if (kv->window_size > 0) {
+        cache_pos = kv->len % kv->capacity;  // circular write
+    } else {
+        cache_pos = kv->len;
+        if (cache_pos >= kv->capacity) {
+            fprintf(stderr, "ERROR: KV cache overflow (pos=%d >= cap=%d)\n", cache_pos, kv->capacity);
+            return;
+        }
+    }
     if (kv->use_fp8) {
         if (!kv->k_cache_fp8 || !kv->v_cache_fp8) {
             fprintf(stderr, "ERROR: FP8 KV cache is NULL (alloc failed)\n");
             return;
         }
+        kv->k_scales[cache_pos] = fp8_encode_vec(k, kv->k_cache_fp8 + cache_pos * kv_dim, kv_dim);
+        kv->v_scales[cache_pos] = fp8_encode_vec(v, kv->v_cache_fp8 + cache_pos * kv_dim, kv_dim);
     } else {
         if (!kv->k_cache || !kv->v_cache) {
             fprintf(stderr, "ERROR: KV cache is NULL (alloc failed)\n");
             return;
         }
-    }
-    if (cache_pos >= kv_max) {
-        fprintf(stderr, "ERROR: KV cache overflow (pos=%d >= max=%d)\n", cache_pos, kv_max);
-        return;
-    }
-    if (kv->use_fp8) {
-        kv->k_scales[cache_pos] = fp8_encode_vec(k, kv->k_cache_fp8 + cache_pos * kv_dim, kv_dim);
-        kv->v_scales[cache_pos] = fp8_encode_vec(v, kv->v_cache_fp8 + cache_pos * kv_dim, kv_dim);
-    } else {
         memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
     }
@@ -330,17 +337,33 @@ static void full_attention_forward(
     float *k_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
     float *v_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
 
+    // Determine attention range: all entries, or sliding window
+    int attn_len;  // number of positions to attend over
+    if (kv->window_size > 0 && kv->len > kv->window_size) {
+        attn_len = kv->window_size;  // attend only within window
+    } else {
+        attn_len = kv->len;          // attend to everything
+    }
+
     for (int h = 0; h < cfg.num_attn_heads; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = q + h * cfg.head_dim;
 
-        // Compute attention scores for all cached positions
-        float *scores = malloc(kv->len * sizeof(float));
+        // Compute attention scores for positions within window
+        float *scores = malloc(attn_len * sizeof(float));
         if (!scores) {
-            fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", kv->len);
+            fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", attn_len);
             continue;
         }
-        for (int p = 0; p < kv->len; p++) {
+        for (int i = 0; i < attn_len; i++) {
+            // Map logical index i → physical position in circular buffer
+            int p;
+            if (kv->window_size > 0 && kv->len > kv->window_size) {
+                // Circular: oldest valid entry is at (kv->len - window_size)
+                p = (kv->len - kv->window_size + i) % kv->capacity;
+            } else {
+                p = i;
+            }
             float dot = 0.0f;
             if (kv->use_fp8) {
                 fp8_decode_vec(kv->k_cache_fp8 + p * kv_dim, k_dequant, kv_dim, kv->k_scales[p]);
@@ -350,22 +373,28 @@ static void full_attention_forward(
                 float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
                 for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
             }
-            scores[p] = dot * scale;
+            scores[i] = dot * scale;
         }
 
-        // Softmax
-        cpu_softmax(scores, kv->len);
+        // Softmax over window
+        cpu_softmax(scores, attn_len);
 
-        // Weighted sum of values
+        // Weighted sum of values within window
         float *oh = attn_out + h * cfg.head_dim;
-        for (int p = 0; p < kv->len; p++) {
+        for (int i = 0; i < attn_len; i++) {
+            int p;
+            if (kv->window_size > 0 && kv->len > kv->window_size) {
+                p = (kv->len - kv->window_size + i) % kv->capacity;
+            } else {
+                p = i;
+            }
             if (kv->use_fp8) {
                 fp8_decode_vec(kv->v_cache_fp8 + p * kv_dim, v_dequant, kv_dim, kv->v_scales[p]);
                 float *vp = v_dequant + kv_h * cfg.head_dim;
-                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[i] * vp[d];
             } else {
                 float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
-                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[i] * vp[d];
             }
         }
         free(scores);
@@ -2152,18 +2181,22 @@ static void fused_layer_forward(
         // RoPE
         apply_rotary_emb(q, k_out, pos, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
 
-        // Update KV cache (CPU + GPU mirror)
-        int cache_pos = kv->len;
+        // Update KV cache (CPU + GPU mirror) — circular buffer for sliding window
+        int cache_pos;
+        if (kv->window_size > 0) {
+            cache_pos = kv->len % kv->capacity;  // circular write
+        } else {
+            cache_pos = kv->len;
+        }
         int fa_idx = cfg.full_attn_index[layer_idx];
-        int kv_max = g_kv_seq_len > 0 ? g_kv_seq_len : cfg.max_seq_len;
         int kv_cache_ok = kv->use_fp8
             ? (kv->k_cache_fp8 != NULL && kv->v_cache_fp8 != NULL)
             : (kv->k_cache != NULL && kv->v_cache != NULL);
         if (!kv_cache_ok) {
             fprintf(stderr, "ERROR: KV cache is NULL at layer %d\n", layer_idx);
-        } else if (cache_pos >= kv_max) {
-            fprintf(stderr, "ERROR: KV cache overflow at layer %d (pos=%d >= max=%d)\n",
-                    layer_idx, cache_pos, kv_max);
+        } else if (kv->window_size == 0 && cache_pos >= kv->capacity) {
+            fprintf(stderr, "ERROR: KV cache overflow at layer %d (pos=%d >= cap=%d)\n",
+                    layer_idx, cache_pos, kv->capacity);
         } else {
             if (kv->use_fp8) {
                 // FP8 CPU cache: quantize K and V
@@ -2201,11 +2234,19 @@ static void fused_layer_forward(
         float *attn_out = s_attn_out;
         memset(attn_out, 0, q_dim * sizeof(float));
 
+        // Effective attention length (sliding window or full)
+        int attn_seq_len;
+        if (kv->window_size > 0 && kv->len > kv->window_size) {
+            attn_seq_len = kv->window_size;
+        } else {
+            attn_seq_len = kv->len;
+        }
+
         // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers &&
-                              kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                              attn_seq_len >= 32 && attn_seq_len < GPU_KV_SEQ);
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
@@ -2213,18 +2254,24 @@ static void fused_layer_forward(
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
-            // CPU fallback (supports both float32 and FP8 KV cache)
+            // CPU fallback (supports both float32 and FP8 KV cache + sliding window)
             float *k_tmp = kv->use_fp8 ? s_k_dequant : NULL;
             float *v_tmp = kv->use_fp8 ? s_v_dequant : NULL;
             for (int h = 0; h < cfg.num_attn_heads; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * cfg.head_dim;
-                float *scores = malloc(kv->len * sizeof(float));
+                float *scores = malloc(attn_seq_len * sizeof(float));
                 if (!scores) {
-                    fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", kv->len);
+                    fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", attn_seq_len);
                     continue;
                 }
-                for (int p = 0; p < kv->len; p++) {
+                for (int i = 0; i < attn_seq_len; i++) {
+                    int p;
+                    if (kv->window_size > 0 && kv->len > kv->window_size) {
+                        p = (kv->len - kv->window_size + i) % kv->capacity;
+                    } else {
+                        p = i;
+                    }
                     float dot = 0.0f;
                     if (kv->use_fp8) {
                         fp8_decode_vec(kv->k_cache_fp8 + p * kv_dim, k_tmp, kv_dim, kv->k_scales[p]);
@@ -2234,18 +2281,24 @@ static void fused_layer_forward(
                         float *kp = kv->k_cache + p * kv_dim + kv_h * cfg.head_dim;
                         for (int d = 0; d < cfg.head_dim; d++) dot += qh[d] * kp[d];
                     }
-                    scores[p] = dot * scale;
+                    scores[i] = dot * scale;
                 }
-                cpu_softmax(scores, kv->len);
+                cpu_softmax(scores, attn_seq_len);
                 float *oh = attn_out + h * cfg.head_dim;
-                for (int p = 0; p < kv->len; p++) {
+                for (int i = 0; i < attn_seq_len; i++) {
+                    int p;
+                    if (kv->window_size > 0 && kv->len > kv->window_size) {
+                        p = (kv->len - kv->window_size + i) % kv->capacity;
+                    } else {
+                        p = i;
+                    }
                     if (kv->use_fp8) {
                         fp8_decode_vec(kv->v_cache_fp8 + p * kv_dim, v_tmp, kv_dim, kv->v_scales[p]);
                         float *vp = v_tmp + kv_h * cfg.head_dim;
-                        for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                        for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[i] * vp[d];
                     } else {
                         float *vp = kv->v_cache + p * kv_dim + kv_h * cfg.head_dim;
-                        for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[p] * vp[d];
+                        for (int d = 0; d < cfg.head_dim; d++) oh[d] += scores[i] * vp[d];
                     }
                 }
                 free(scores);

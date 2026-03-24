@@ -45,6 +45,7 @@ struct ModelListView: View {
     @AppStorage("fp16Accumulation") private var fp16Accumulation: Bool = false
     @AppStorage("fp8KVCache") private var fp8KVCache: Bool = false
     @AppStorage("maxContext") private var maxContext: Int = 0
+    @AppStorage("slidingWindow") private var slidingWindow: Int = 0
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
     @State private var importedBookmark: Data? = nil
@@ -262,6 +263,19 @@ struct ModelListView: View {
                     let kvMB = maxContext * kvPerPos / 1024
                     return "\(maxContext) positions = ~\(kvMB) MB KV cache (\(fp8KVCache ? "FP8" : "FP32")). Reload model to apply."
                 }())
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("Sliding Window", selection: $slidingWindow) {
+                    Text("Off (full context)").tag(0)
+                    Text("2,048 positions").tag(2048)
+                    Text("4,096 positions").tag(4096)
+                    Text("8,192 positions").tag(8192)
+                }
+                .pickerStyle(.menu)
+                Text(slidingWindow > 0
+                     ? "Full attention layers use a circular KV cache of \(slidingWindow) positions. Linear attention layers maintain full context via state matrices. Reload to apply."
+                     : "Full attention layers attend to the entire history. Reload to apply.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -508,6 +522,7 @@ struct ModelListView: View {
                     fusedExpert: fusedExpert,
                     fp16Accumulation: fp16Accumulation,
                     fp8KVCache: fp8KVCache,
+                    slidingWindow: slidingWindow,
                     verbose: true
                 )
             } catch {
