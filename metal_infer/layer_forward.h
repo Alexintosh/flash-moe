@@ -58,6 +58,15 @@ typedef struct {
     int use_fp8;         // 1 = FP8 E4M3, 0 = float32
     int window_size;     // >0: sliding window (circular buffer), 0: unlimited
     int capacity;        // allocated size (= window_size if sliding, else max_seq)
+    // H2O (Heavy Hitter Oracle) eviction state
+    float *attn_scores_accum;  // [capacity] cumulative attention score per position
+    int *token_positions;      // [capacity] original sequence position (for sink detection)
+    int h2o_budget;           // total positions to keep (sinks + recent + heavy hitters)
+    int h2o_num_sinks;        // number of sink tokens (first N, typically 4)
+    int h2o_num_recent;       // number of recent tokens to always keep
+    int h2o_active;           // 1 = H2O eviction enabled
+    int h2o_num_valid;        // current number of valid positions in cache
+    int *h2o_valid_indices;   // [capacity] indices of valid positions in contiguous order
 } KVCache;
 
 static KVCache *kv_cache_new(void) {
@@ -65,9 +74,23 @@ static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
     c->len = 0;
     c->use_fp8 = g_use_fp8_kv;
-    c->window_size = g_sliding_window;  // 0 = unlimited, >0 = circular buffer
+    // H2O replaces sliding window when both are set (H2O is strictly better)
+    if (g_h2o_budget > 0) {
+        c->window_size = 0;  // disable sliding window — H2O handles eviction
+    } else {
+        c->window_size = g_sliding_window;  // 0 = unlimited, >0 = circular buffer
+    }
     // Capacity: if sliding window, only allocate window_size positions
-    int seq = (c->window_size > 0 && c->window_size < max_seq) ? c->window_size : max_seq;
+    // For H2O: allocate full budget (we compact in-place, never exceed budget+1)
+    int seq;
+    if (g_h2o_budget > 0) {
+        // Allocate budget+1 so we can write one new token before evicting
+        seq = (g_h2o_budget + 1 < max_seq) ? g_h2o_budget + 1 : max_seq;
+    } else if (c->window_size > 0 && c->window_size < max_seq) {
+        seq = c->window_size;
+    } else {
+        seq = max_seq;
+    }
     c->capacity = seq;
     size_t kv_dim = (size_t)cfg.num_kv_heads * cfg.head_dim;
 
@@ -101,6 +124,28 @@ static KVCache *kv_cache_new(void) {
             return NULL;
         }
     }
+    // H2O initialization
+    c->h2o_active = (g_h2o_budget > 0) ? 1 : 0;
+    c->h2o_budget = g_h2o_budget;
+    c->h2o_num_sinks = g_h2o_num_sinks;
+    // Recent tokens = 25% of budget (after sinks), rest goes to heavy hitters
+    c->h2o_num_recent = c->h2o_active ? (c->h2o_budget - c->h2o_num_sinks) / 4 : 0;
+    c->h2o_num_valid = 0;
+    if (c->h2o_active) {
+        c->attn_scores_accum = calloc(seq, sizeof(float));
+        c->token_positions = calloc(seq, sizeof(int));
+        c->h2o_valid_indices = calloc(seq, sizeof(int));
+        if (!c->attn_scores_accum || !c->token_positions || !c->h2o_valid_indices) {
+            fprintf(stderr, "ERROR: H2O alloc failed (seq=%d)\n", seq);
+            free(c->attn_scores_accum); free(c->token_positions);
+            free(c->h2o_valid_indices);
+            c->h2o_active = 0;
+        }
+    } else {
+        c->attn_scores_accum = NULL;
+        c->token_positions = NULL;
+        c->h2o_valid_indices = NULL;
+    }
     return c;
 }
 
@@ -112,7 +157,182 @@ static void kv_cache_free(KVCache *c) {
         free(c->v_cache_fp8);
         free(c->k_scales);
         free(c->v_scales);
+        free(c->attn_scores_accum);
+        free(c->token_positions);
+        free(c->h2o_valid_indices);
         free(c);
+    }
+}
+
+// ============================================================================
+// H2O (Heavy Hitter Oracle) KV cache eviction
+// Keeps: attention sinks (first N) + recent tokens + heavy hitters (highest
+// cumulative attention score). Evicts lowest-scored non-protected positions.
+// ============================================================================
+
+// Accumulate post-softmax attention scores into H2O tracking.
+// Called after each attention step with the softmax scores for each position.
+// scores[i] is the attention weight for cache position i (0..attn_len-1).
+// For GQA, we sum across all query heads to get per-position importance.
+static void kv_cache_h2o_accumulate_scores(KVCache *kv, const float *scores, int attn_len) {
+    if (!kv->h2o_active || !kv->attn_scores_accum) return;
+    for (int i = 0; i < attn_len && i < kv->h2o_num_valid; i++) {
+        kv->attn_scores_accum[i] += scores[i];
+    }
+}
+
+// Perform H2O eviction: compact the KV cache to keep only the budget positions.
+// This is called after a new token is written and the cache exceeds the budget.
+// Strategy:
+//   1. Protect sink tokens (first h2o_num_sinks original positions)
+//   2. Protect recent tokens (last h2o_num_recent positions)
+//   3. Among the middle positions, keep the ones with highest cumulative attn score
+//   4. Compact: move surviving entries to contiguous positions [0..budget-1]
+//
+// After compaction, both CPU and GPU caches are contiguous, so GPU kernels
+// don't need modification — they just see a shorter sequence length.
+static void kv_cache_evict_h2o(KVCache *kv) {
+    if (!kv->h2o_active || kv->h2o_num_valid <= kv->h2o_budget) return;
+
+    int num_valid = kv->h2o_num_valid;
+    int budget = kv->h2o_budget;
+    int num_sinks = kv->h2o_num_sinks;
+    int num_recent = kv->h2o_num_recent;
+
+    // Clamp sinks and recent to not exceed budget
+    if (num_sinks > budget) num_sinks = budget;
+    if (num_sinks + num_recent > budget) num_recent = budget - num_sinks;
+    int num_heavy_hitters = budget - num_sinks - num_recent;
+
+    // Protected regions:
+    // - Sinks: positions 0..num_sinks-1 (identified by token_positions[i] < num_sinks)
+    // - Recent: last num_recent positions (indices num_valid-num_recent..num_valid-1)
+    // Evictable: everything in between (num_sinks..num_valid-num_recent-1)
+
+    int evictable_start = num_sinks;
+    int evictable_end = num_valid - num_recent;  // exclusive
+    int num_evictable = evictable_end - evictable_start;
+
+    if (num_evictable <= 0 || num_heavy_hitters >= num_evictable) {
+        // Nothing to evict — all middle positions fit within heavy hitter budget
+        return;
+    }
+
+    // Find the top-K heavy hitters among the evictable region by partial sort.
+    // We need to keep num_heavy_hitters entries. Use selection: find the threshold score.
+    // Simple approach: create index array, sort by score descending, keep top num_heavy_hitters.
+    int *evict_indices = malloc(num_evictable * sizeof(int));
+    float *evict_scores = malloc(num_evictable * sizeof(float));
+    if (!evict_indices || !evict_scores) {
+        free(evict_indices); free(evict_scores);
+        return;
+    }
+
+    for (int i = 0; i < num_evictable; i++) {
+        evict_indices[i] = evictable_start + i;
+        evict_scores[i] = kv->attn_scores_accum[evictable_start + i];
+    }
+
+    // Simple selection sort to find top num_heavy_hitters (small N, no need for nth_element)
+    // Actually, use a partial sort: find the num_heavy_hitters-th largest score as threshold,
+    // then keep everything >= threshold.
+    // For simplicity and correctness, sort descending and take first num_heavy_hitters.
+    for (int i = 0; i < num_heavy_hitters && i < num_evictable; i++) {
+        int max_idx = i;
+        for (int j = i + 1; j < num_evictable; j++) {
+            if (evict_scores[j] > evict_scores[max_idx]) max_idx = j;
+        }
+        if (max_idx != i) {
+            // Swap
+            float tmp_s = evict_scores[i]; evict_scores[i] = evict_scores[max_idx]; evict_scores[max_idx] = tmp_s;
+            int tmp_i = evict_indices[i]; evict_indices[i] = evict_indices[max_idx]; evict_indices[max_idx] = tmp_i;
+        }
+    }
+
+    // Build keep mask: sinks + heavy hitters (first num_heavy_hitters of sorted) + recent
+    // The keep set in order: [0..num_sinks-1] + sorted heavy hitter indices + [num_valid-num_recent..num_valid-1]
+    int *keep = malloc(budget * sizeof(int));
+    if (!keep) { free(evict_indices); free(evict_scores); return; }
+
+    int keep_count = 0;
+    // Sinks
+    for (int i = 0; i < num_sinks && i < num_valid; i++) {
+        keep[keep_count++] = i;
+    }
+    // Heavy hitters (sort their original indices to maintain temporal order for compaction)
+    // First, collect the heavy hitter indices
+    int *hh_indices = malloc(num_heavy_hitters * sizeof(int));
+    if (!hh_indices) { free(keep); free(evict_indices); free(evict_scores); return; }
+    for (int i = 0; i < num_heavy_hitters; i++) {
+        hh_indices[i] = evict_indices[i];
+    }
+    // Sort heavy hitter indices ascending (maintain temporal order)
+    for (int i = 0; i < num_heavy_hitters - 1; i++) {
+        for (int j = i + 1; j < num_heavy_hitters; j++) {
+            if (hh_indices[j] < hh_indices[i]) {
+                int tmp = hh_indices[i]; hh_indices[i] = hh_indices[j]; hh_indices[j] = tmp;
+            }
+        }
+    }
+    for (int i = 0; i < num_heavy_hitters; i++) {
+        keep[keep_count++] = hh_indices[i];
+    }
+    free(hh_indices);
+    // Recent
+    for (int i = num_valid - num_recent; i < num_valid; i++) {
+        keep[keep_count++] = i;
+    }
+
+    free(evict_indices);
+    free(evict_scores);
+
+    // Compact KV cache: move keep[i] -> position i
+    size_t kv_dim = (size_t)cfg.num_kv_heads * cfg.head_dim;
+
+    for (int dst = 0; dst < keep_count; dst++) {
+        int src = keep[dst];
+        if (src == dst) continue;  // already in place
+
+        if (kv->use_fp8) {
+            memmove(kv->k_cache_fp8 + dst * kv_dim, kv->k_cache_fp8 + src * kv_dim, kv_dim * sizeof(uint8_t));
+            memmove(kv->v_cache_fp8 + dst * kv_dim, kv->v_cache_fp8 + src * kv_dim, kv_dim * sizeof(uint8_t));
+            kv->k_scales[dst] = kv->k_scales[src];
+            kv->v_scales[dst] = kv->v_scales[src];
+        } else {
+            memmove(kv->k_cache + dst * kv_dim, kv->k_cache + src * kv_dim, kv_dim * sizeof(float));
+            memmove(kv->v_cache + dst * kv_dim, kv->v_cache + src * kv_dim, kv_dim * sizeof(float));
+        }
+        kv->attn_scores_accum[dst] = kv->attn_scores_accum[src];
+        kv->token_positions[dst] = kv->token_positions[src];
+    }
+
+    kv->h2o_num_valid = keep_count;
+
+    free(keep);
+}
+
+// Compact GPU KV mirror after H2O eviction.
+// Must be called after kv_cache_evict_h2o() when GPU attention is active.
+// Copies the compacted CPU cache data to the GPU KV buffers.
+static void kv_cache_h2o_sync_gpu(KVCache *kv, int fa_idx) {
+    if (!kv->h2o_active) return;
+    // Only sync if Metal context and buffers are available
+    // (checked by caller — g_metal && fa_idx >= 0)
+    size_t kv_dim = (size_t)cfg.num_kv_heads * cfg.head_dim;
+    int n = kv->h2o_num_valid;
+
+    if (kv->use_fp8) {
+        memcpy([g_metal->buf_kv_k[fa_idx] contents], kv->k_cache_fp8, n * kv_dim * sizeof(uint8_t));
+        memcpy([g_metal->buf_kv_v[fa_idx] contents], kv->v_cache_fp8, n * kv_dim * sizeof(uint8_t));
+        if (g_metal->buf_kv_k_scales[fa_idx]) {
+            memcpy([g_metal->buf_kv_k_scales[fa_idx] contents], kv->k_scales, n * sizeof(float));
+        }
+        if (g_metal->buf_kv_v_scales[fa_idx]) {
+            memcpy([g_metal->buf_kv_v_scales[fa_idx] contents], kv->v_scales, n * sizeof(float));
+        }
+    } else {
+        memcpy([g_metal->buf_kv_k[fa_idx] contents], kv->k_cache, n * kv_dim * sizeof(float));
+        memcpy([g_metal->buf_kv_v[fa_idx] contents], kv->v_cache, n * kv_dim * sizeof(float));
     }
 }
 
@@ -297,9 +517,16 @@ static void full_attention_forward(
     // ---- RoPE ----
     apply_rotary_emb(q, k, pos, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
 
-    // ---- Update KV cache (circular buffer for sliding window) ----
+    // ---- Update KV cache (circular buffer for sliding window, or H2O) ----
     int cache_pos;
-    if (kv->window_size > 0) {
+    if (kv->h2o_active) {
+        // H2O: write at the next contiguous position (h2o_num_valid)
+        cache_pos = kv->h2o_num_valid;
+        if (cache_pos >= kv->capacity) {
+            fprintf(stderr, "ERROR: H2O KV cache overflow (pos=%d >= cap=%d)\n", cache_pos, kv->capacity);
+            return;
+        }
+    } else if (kv->window_size > 0) {
         cache_pos = kv->len % kv->capacity;  // circular write
     } else {
         cache_pos = kv->len;
@@ -323,6 +550,11 @@ static void full_attention_forward(
         memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
     }
+    if (kv->h2o_active) {
+        kv->token_positions[cache_pos] = kv->len;
+        kv->attn_scores_accum[cache_pos] = 0.0f;
+        kv->h2o_num_valid++;
+    }
     kv->len++;
 
     // ---- Scaled dot-product attention ----
@@ -337,29 +569,35 @@ static void full_attention_forward(
     float *k_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
     float *v_dequant = kv->use_fp8 ? malloc(kv_dim * sizeof(float)) : NULL;
 
-    // Determine attention range: all entries, or sliding window
-    int attn_len;  // number of positions to attend over
-    if (kv->window_size > 0 && kv->len > kv->window_size) {
-        attn_len = kv->window_size;  // attend only within window
+    // Determine attention range
+    int attn_len;
+    if (kv->h2o_active) {
+        attn_len = kv->h2o_num_valid;  // H2O: attend over all valid (compacted) positions
+    } else if (kv->window_size > 0 && kv->len > kv->window_size) {
+        attn_len = kv->window_size;
     } else {
-        attn_len = kv->len;          // attend to everything
+        attn_len = kv->len;
+    }
+
+    // H2O score accumulator for this step (sum across all heads per position)
+    float *h2o_step_scores = NULL;
+    if (kv->h2o_active) {
+        h2o_step_scores = calloc(attn_len, sizeof(float));
     }
 
     for (int h = 0; h < cfg.num_attn_heads; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = q + h * cfg.head_dim;
 
-        // Compute attention scores for positions within window
         float *scores = malloc(attn_len * sizeof(float));
         if (!scores) {
             fprintf(stderr, "ERROR: attention scores alloc failed (len=%d)\n", attn_len);
             continue;
         }
         for (int i = 0; i < attn_len; i++) {
-            // Map logical index i → physical position in circular buffer
+            // H2O: positions are contiguous (compacted), no circular mapping needed
             int p;
-            if (kv->window_size > 0 && kv->len > kv->window_size) {
-                // Circular: oldest valid entry is at (kv->len - window_size)
+            if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
                 p = (kv->len - kv->window_size + i) % kv->capacity;
             } else {
                 p = i;
@@ -376,14 +614,19 @@ static void full_attention_forward(
             scores[i] = dot * scale;
         }
 
-        // Softmax over window
         cpu_softmax(scores, attn_len);
 
-        // Weighted sum of values within window
+        // Accumulate softmax scores for H2O (sum across heads)
+        if (h2o_step_scores) {
+            for (int i = 0; i < attn_len; i++) {
+                h2o_step_scores[i] += scores[i];
+            }
+        }
+
         float *oh = attn_out + h * cfg.head_dim;
         for (int i = 0; i < attn_len; i++) {
             int p;
-            if (kv->window_size > 0 && kv->len > kv->window_size) {
+            if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
                 p = (kv->len - kv->window_size + i) % kv->capacity;
             } else {
                 p = i;
@@ -398,6 +641,13 @@ static void full_attention_forward(
             }
         }
         free(scores);
+    }
+
+    // H2O: accumulate attention scores and evict if over budget
+    if (h2o_step_scores) {
+        kv_cache_h2o_accumulate_scores(kv, h2o_step_scores, attn_len);
+        free(h2o_step_scores);
+        kv_cache_evict_h2o(kv);
     }
     free(k_dequant);
     free(v_dequant);
@@ -2181,9 +2431,11 @@ static void fused_layer_forward(
         // RoPE
         apply_rotary_emb(q, k_out, pos, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim);
 
-        // Update KV cache (CPU + GPU mirror) — circular buffer for sliding window
+        // Update KV cache (CPU + GPU mirror) — H2O, circular buffer, or linear
         int cache_pos;
-        if (kv->window_size > 0) {
+        if (kv->h2o_active) {
+            cache_pos = kv->h2o_num_valid;  // H2O: append at next contiguous position
+        } else if (kv->window_size > 0) {
             cache_pos = kv->len % kv->capacity;  // circular write
         } else {
             cache_pos = kv->len;
@@ -2194,8 +2446,11 @@ static void fused_layer_forward(
             : (kv->k_cache != NULL && kv->v_cache != NULL);
         if (!kv_cache_ok) {
             fprintf(stderr, "ERROR: KV cache is NULL at layer %d\n", layer_idx);
-        } else if (kv->window_size == 0 && cache_pos >= kv->capacity) {
+        } else if (!kv->h2o_active && kv->window_size == 0 && cache_pos >= kv->capacity) {
             fprintf(stderr, "ERROR: KV cache overflow at layer %d (pos=%d >= cap=%d)\n",
+                    layer_idx, cache_pos, kv->capacity);
+        } else if (kv->h2o_active && cache_pos >= kv->capacity) {
+            fprintf(stderr, "ERROR: H2O KV cache overflow at layer %d (pos=%d >= cap=%d)\n",
                     layer_idx, cache_pos, kv->capacity);
         } else {
             if (kv->use_fp8) {
@@ -2206,16 +2461,20 @@ static void fused_layer_forward(
                 memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
                 memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
             }
-            // GPU mirror: always float32 for GPU attention kernels
-            // When FP8, GPU still stores float32 (dequant happens on CPU write)
+            // H2O: track position and init score
+            if (kv->h2o_active) {
+                kv->token_positions[cache_pos] = kv->len;
+                kv->attn_scores_accum[cache_pos] = 0.0f;
+                kv->h2o_num_valid++;
+            }
+            // GPU mirror: write the new position to GPU KV buffers
+            // For H2O: after eviction we do a full sync, so here just write the new position
             if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
                 if (kv->use_fp8) {
-                    // GPU KV buffers are uchar when FP8 — write quantized data + scales
                     memcpy((uint8_t *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                            kv->k_cache_fp8 + cache_pos * kv_dim, kv_dim * sizeof(uint8_t));
                     memcpy((uint8_t *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
                            kv->v_cache_fp8 + cache_pos * kv_dim, kv_dim * sizeof(uint8_t));
-                    // Write per-position scales to GPU scale buffers
                     ((float *)[g_metal->buf_kv_k_scales[fa_idx] contents])[cache_pos] = kv->k_scales[cache_pos];
                     ((float *)[g_metal->buf_kv_v_scales[fa_idx] contents])[cache_pos] = kv->v_scales[cache_pos];
                 } else {
@@ -2234,9 +2493,11 @@ static void fused_layer_forward(
         float *attn_out = s_attn_out;
         memset(attn_out, 0, q_dim * sizeof(float));
 
-        // Effective attention length (sliding window or full)
+        // Effective attention length (H2O, sliding window, or full)
         int attn_seq_len;
-        if (kv->window_size > 0 && kv->len > kv->window_size) {
+        if (kv->h2o_active) {
+            attn_seq_len = kv->h2o_num_valid;  // H2O: all compacted valid positions
+        } else if (kv->window_size > 0 && kv->len > kv->window_size) {
             attn_seq_len = kv->window_size;
         } else {
             attn_seq_len = kv->len;
@@ -2248,15 +2509,30 @@ static void fused_layer_forward(
                               fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers &&
                               attn_seq_len >= 32 && attn_seq_len < GPU_KV_SEQ);
 
+        // H2O score accumulator for GPU path: we read back softmax scores after GPU attn
+        // For GPU: we don't accumulate (GPU doesn't expose per-position softmax scores easily).
+        // Instead, for H2O with GPU attention, we force CPU fallback to collect scores.
+        // This is a small cost since H2O budgets are typically small (256-2048 positions).
+        if (kv->h2o_active && gpu_attn_ready && attn_seq_len <= 2048) {
+            gpu_attn_ready = 0;  // force CPU path for H2O score accumulation
+        }
+
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
-            // CPU fallback (supports both float32 and FP8 KV cache + sliding window)
+            // CPU fallback (supports float32, FP8, sliding window, and H2O)
             float *k_tmp = kv->use_fp8 ? s_k_dequant : NULL;
             float *v_tmp = kv->use_fp8 ? s_v_dequant : NULL;
+
+            // H2O: accumulate softmax scores across heads
+            float *h2o_step_scores = NULL;
+            if (kv->h2o_active) {
+                h2o_step_scores = calloc(attn_seq_len, sizeof(float));
+            }
+
             for (int h = 0; h < cfg.num_attn_heads; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * cfg.head_dim;
@@ -2266,8 +2542,9 @@ static void fused_layer_forward(
                     continue;
                 }
                 for (int i = 0; i < attn_seq_len; i++) {
+                    // H2O: positions are contiguous (compacted), no circular mapping
                     int p;
-                    if (kv->window_size > 0 && kv->len > kv->window_size) {
+                    if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
                         p = (kv->len - kv->window_size + i) % kv->capacity;
                     } else {
                         p = i;
@@ -2284,10 +2561,18 @@ static void fused_layer_forward(
                     scores[i] = dot * scale;
                 }
                 cpu_softmax(scores, attn_seq_len);
+
+                // Accumulate softmax scores for H2O
+                if (h2o_step_scores) {
+                    for (int i = 0; i < attn_seq_len; i++) {
+                        h2o_step_scores[i] += scores[i];
+                    }
+                }
+
                 float *oh = attn_out + h * cfg.head_dim;
                 for (int i = 0; i < attn_seq_len; i++) {
                     int p;
-                    if (kv->window_size > 0 && kv->len > kv->window_size) {
+                    if (!kv->h2o_active && kv->window_size > 0 && kv->len > kv->window_size) {
                         p = (kv->len - kv->window_size + i) % kv->capacity;
                     } else {
                         p = i;
@@ -2303,6 +2588,21 @@ static void fused_layer_forward(
                 }
                 free(scores);
             }
+
+            // H2O: accumulate and evict
+            if (h2o_step_scores) {
+                kv_cache_h2o_accumulate_scores(kv, h2o_step_scores, attn_seq_len);
+                free(h2o_step_scores);
+                int pre_evict = kv->h2o_num_valid;
+                kv_cache_evict_h2o(kv);
+                // If eviction happened, sync compacted data to GPU
+                if (kv->h2o_num_valid < pre_evict &&
+                    g_metal && g_metal->attn_scores_pipe &&
+                    fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers) {
+                    kv_cache_h2o_sync_gpu(kv, fa_idx);
+                }
+            }
+
             // k_tmp, v_tmp are static scratch buffers — no free needed
             for (int i = 0; i < q_dim; i++) {
                 float g = 1.0f / (1.0f + expf(-q_gate[i]));
@@ -2522,8 +2822,9 @@ static void fused_layer_forward(
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
+    int gpu_attn_fuse_seq = (kv && kv->h2o_active) ? kv->h2o_num_valid : (kv ? kv->len : 0);
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
-                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                         && kv && gpu_attn_fuse_seq >= 32 && gpu_attn_fuse_seq < GPU_KV_SEQ);
 
     if (!cmd1_cmd2_merged &&
         (attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
@@ -2567,7 +2868,7 @@ static void fused_layer_forward(
             float scale = 1.0f / sqrtf((float)cfg.head_dim);
             uint32_t hd = cfg.head_dim;
             uint32_t kvd = (uint32_t)kv_dim;
-            uint32_t sl = (uint32_t)kv->len;
+            uint32_t sl = kv->h2o_active ? (uint32_t)kv->h2o_num_valid : (uint32_t)kv->len;
             uint32_t seq_stride = GPU_KV_SEQ;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 

@@ -74,6 +74,8 @@ static int g_fused_attention_enabled = 0; // 1: fused online softmax attention (
 static int g_fused_expert_enabled = 1;   // 1: fused gate+up+SwiGLU kernel (default ON), 0: separate dispatches
 static int g_use_fp16_accum = 0;         // 1: use half-precision accumulation in dequant kernels (experimental)
 static int g_sliding_window = 0;         // >0: sliding window size for full attention KV cache (circular buffer)
+static int g_h2o_budget = 0;             // 0 = disabled, >0 = total H2O KV cache budget (sinks + recent + heavy hitters)
+static int g_h2o_num_sinks = 4;          // attention sink tokens to keep (first N, typically 4)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
 // Cross-layer expert prefetch: after CMD3(N) commit, start pread'ing next layer's

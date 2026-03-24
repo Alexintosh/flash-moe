@@ -101,6 +101,12 @@ struct SettingInfo: Identifiable {
             analogy: "Like a student who shows their work before giving the final answer. The model reasons step-by-step inside <think> tags before responding. This usually produces better answers, but takes more tokens (and time). At low K values, the model may get stuck thinking forever — disable it for speed.",
             technical: "The chat template includes a <think> tag after the assistant turn header. The model generates reasoning tokens inside the think block, then emits </think> before the actual response. Think budget caps the maximum thinking tokens and force-emits </think>. Set to -1 to disable thinking entirely (removes <think> from the template)."
         ),
+        "h2oBudget": SettingInfo(
+            id: "h2oBudget",
+            title: "KV Cache Budget (H\u{2082}O)",
+            analogy: "Instead of remembering everything or only recent things, H\u{2082}O is like a smart student who keeps notes on the most important points from the whole lecture plus the last few minutes. It tracks which tokens the model pays most attention to and keeps those, dropping the rest.",
+            technical: "H\u{2082}O (Heavy Hitter Oracle) eviction keeps 3 categories: attention sink tokens (first 4, always high-attention), recent tokens (last N), and heavy hitters (highest cumulative attention score). When the cache exceeds the budget, the lowest-scored non-protected positions are evicted. Reduces KV memory by 50-70% with minimal quality loss. Based on 'H\u{2082}O: Heavy-Hitter Oracle' (Zhang et al., 2023)."
+        ),
     ]
 }
 
@@ -124,6 +130,7 @@ struct ModelListView: View {
     @AppStorage("fp8KVCache") private var fp8KVCache: Bool = false
     @AppStorage("maxContext") private var maxContext: Int = 0
     @AppStorage("slidingWindow") private var slidingWindow: Int = 0
+    @AppStorage("h2oBudget") private var h2oBudget: Int = 0
     @State private var settingInfo: SettingInfo? = nil
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
@@ -296,6 +303,15 @@ struct ModelListView: View {
                     Text("4K").tag(4096)
                     Text("8K").tag(8192)
                 } label: { settingLabel("Sliding Window", key: "slidingWindow") }
+                .pickerStyle(.menu)
+
+                Picker(selection: $h2oBudget) {
+                    Text("Off").tag(0)
+                    Text("256").tag(256)
+                    Text("512").tag(512)
+                    Text("1024").tag(1024)
+                    Text("2048").tag(2048)
+                } label: { settingLabel("KV Cache Budget (H\u{2082}O)", key: "h2oBudget") }
                 .pickerStyle(.menu)
 
                 Toggle(isOn: $thinkingEnabled) { settingLabel("Thinking", key: "thinking") }
@@ -569,6 +585,7 @@ struct ModelListView: View {
                     fp16Accumulation: fp16Accumulation,
                     fp8KVCache: fp8KVCache,
                     slidingWindow: slidingWindow,
+                    h2oBudget: h2oBudget,
                     verbose: true
                 )
             } catch {
