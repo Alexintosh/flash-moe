@@ -26,6 +26,9 @@ Prioritized techniques to test, extracted from papers. Checked items have been t
 
 ## Priority 4 — Novel Techniques (from paper search)
 
-_This section is populated by WebSearch during the research phase. Add new techniques here as papers are discovered._
-
-- [ ] _[PLACEHOLDER — to be filled by agent]_
+- [ ] **Layer circuit duplication (adaptive depth)** — Repeat specific contiguous layer blocks (e.g. layers 20-25) during inference for harder prompts without any extra weights. "Functional circuits" across consecutive layers amplify reasoning ability. Use math/logic probes as heatmaps to identify which layer blocks to repeat. For simple prompts run once, for complex prompts run the circuit twice. Zero memory overhead. From DNH blog post (2025) on dense transformer layer duplication — needs adaptation for hybrid GatedDeltaNet + full attention architecture. Our 30 linear + 10 full attention layers may have different circuit patterns. Key question: does delta-net state accumulation remain stable through repeated layers?
+- [ ] **Workload-aware page cache priming** — Use calibration-derived expert activation mass data to `madvise(MADV_WILLNEED)` on the hottest expert files at startup, improving cold-start cache hit rate from ~71% to potentially 85%+. From REAP-swap (Sero et al., 2025). Low effort (~20 lines), needs freq_data.json from calibration run.
+- [ ] **MSE-optimal clipping for 2-bit** — Search 20 clipping ratios (0.7-1.0 of weight range) to minimize reconstruction MSE instead of using raw min/max. 15-30% RMSE reduction at 2-bit. May fix JSON corruption. From JANG (2025). Already implemented in `repack_experts_2bit.py --mse-clip` — needs benchmarking.
+- [ ] **3-bit expert quantization** — Sweet spot between 2-bit (broken JSON) and 4-bit (209GB). 25% less I/O per expert with likely good-enough quality. Requires new Metal kernel for cross-byte-boundary bit extraction. From JANG adaptive quantization profiles.
+- [ ] **DWQ/GPTQ error compensation** — Column-by-column Hessian-guided quantization that distributes rounding errors optimally. Makes 2-bit usable for JSON/tool calling. Already implemented in `gptq_requantize.py` — needs end-to-end validation with tool calling test.
+- [ ] **Kahan compensated fp16 accumulation** — Use Kahan summation with fp16 accumulators to get fp16 throughput with fp32 accuracy bounds. Different from our current fp16 toggle which has no error compensation. From numerical analysis literature.
