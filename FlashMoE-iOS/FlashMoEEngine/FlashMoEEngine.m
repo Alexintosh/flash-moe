@@ -249,6 +249,11 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             }
         }
 
+        // ---- Set GPU-affecting flags BEFORE metal_setup() ----
+        // These flags affect buffer allocation sizes in metal_setup():
+        g_use_fp8_kv = config->fp8_kv_cache;       // FP8 KV = 1 byte vs 4 bytes per element
+        g_sliding_window = config->sliding_window;  // Caps KV buffer capacity
+
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {

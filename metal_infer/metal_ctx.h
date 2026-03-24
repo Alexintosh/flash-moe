@@ -426,6 +426,8 @@ static MetalCtx *metal_setup(void) {
         size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;  // 512
         int gpu_kv = GPU_KV_SEQ;
         if (g_kv_seq_len > 0 && g_kv_seq_len < gpu_kv) gpu_kv = g_kv_seq_len;
+        // Sliding window: cap GPU KV buffer to window size
+        if (g_sliding_window > 0 && g_sliding_window < gpu_kv) gpu_kv = g_sliding_window;
         size_t elem_size = g_use_fp8_kv ? sizeof(uint8_t) : sizeof(float);
         size_t kv_cache_size = (size_t)gpu_kv * kv_dim * elem_size;
         for (int i = 0; i < cfg.num_full_attn_layers; i++) {
