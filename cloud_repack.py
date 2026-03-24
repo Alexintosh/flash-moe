@@ -35,6 +35,7 @@ Usage:
 
 import modal
 import os
+from pathlib import Path
 
 app = modal.App("flash-moe-repack")
 
