@@ -113,6 +113,12 @@ struct SettingInfo: Identifiable {
             analogy: "The model learns position by spinning numbers at specific speeds. Beyond the training window, these numbers 'go off the map' and output degrades. RoPE scaling adjusts the spin speeds so longer conversations stay on-map. Linear is the simplest (just slow everything down). NTK-aware is smarter (adjusts different dimensions differently). YaRN is best (combines NTK with an attention temperature fix).",
             technical: "Rotary Position Embeddings encode position as frequency-domain rotations: freq_i = 1/base^(2i/d). Linear scaling divides position by the scale factor. NTK-aware scales the base: base' = base * s^(d/(d-2)), spreading frequencies more evenly. YaRN adds per-dimension interpolation based on wavelength vs. original context, plus an attention logit temperature t = sqrt(0.1*ln(s)+1). References: NTK-aware (arXiv:2306.15595), YaRN (arXiv:2309.00071)."
         ),
+        "prefillBatch": SettingInfo(
+            id: "prefillBatch",
+            title: "Prefill Batch Size",
+            analogy: "Normally the model reads each prompt word one at a time. Batched prefill reads multiple words simultaneously, sharing the weight data across all of them. It is like a teacher reading one textbook page to the whole class at once instead of whispering it to each student individually.",
+            technical: "Converts per-token GEMV (matrix-vector multiply) into batched GEMM (matrix-matrix multiply) during the prefill phase. Each weight row is read once from SSD and multiplied against N input vectors simultaneously, amortizing I/O cost. Uses dedicated Metal kernels with per-token accumulators. Memory overhead: ~33 MB for pfb=32. Causal attention uses the FlashAttention-2 unnormalized accumulator pattern for numerical stability."
+        ),
     ]
 }
 
@@ -138,6 +144,7 @@ struct ModelListView: View {
     @AppStorage("slidingWindow") private var slidingWindow: Int = 0
     @AppStorage("h2oBudget") private var h2oBudget: Int = 0
     @AppStorage("ropeScaling") private var ropeScaling: Int = 0  // encoded: mode * 10 + factor_index
+    @AppStorage("prefillBatch") private var prefillBatch: Int = 1
     @State private var settingInfo: SettingInfo? = nil
     @State private var showFilePicker = false
     @State private var modelToExport: LocalModel? = nil
@@ -294,6 +301,14 @@ struct ModelListView: View {
                 Toggle(isOn: $expertPrefetch) { settingLabel("Expert Prefetch", key: "expertPrefetch") }
                 Toggle(isOn: $fp16Accumulation) { settingLabel("FP16 Accumulation", key: "fp16Accum") }
                 Toggle(isOn: $fp8KVCache) { settingLabel("FP8 KV Cache", key: "fp8KV") }
+
+                Picker(selection: $prefillBatch) {
+                    Text("Off (1)").tag(1)
+                    Text("8 tokens").tag(8)
+                    Text("16 tokens").tag(16)
+                    Text("32 tokens").tag(32)
+                } label: { settingLabel("Prefill Batch Size", key: "prefillBatch") }
+                .pickerStyle(.menu)
 
                 Picker(selection: $maxContext) {
                     Text("Auto").tag(0)
@@ -611,6 +626,7 @@ struct ModelListView: View {
                     h2oBudget: h2oBudget,
                     ropeScalingMode: ropeMode,
                     ropeScaleFactor: ropeFactor,
+                    prefillBatch: prefillBatch,
                     verbose: true
                 )
             } catch {

@@ -130,6 +130,26 @@ typedef struct {
     id<MTLBuffer> buf_conv_output;    // [cfg.linear_conv_dim=8192] float
     // Wired memory budget from Metal device
     size_t recommended_working_set;   // [ctx->device recommendedMaxWorkingSetSize]
+    // ---- Batched prefill pipelines ----
+    id<MTLComputePipelineState> pfb_gemm_4bit;          // dequant_gemm_4bit_batch
+    id<MTLComputePipelineState> pfb_causal_attn;        // prefill_causal_attn
+    id<MTLComputePipelineState> pfb_q_rope_norm;        // prefill_q_rope_norm_bf16
+    id<MTLComputePipelineState> pfb_kv_cache;           // prefill_kv_cache_bf16
+    id<MTLComputePipelineState> pfb_rms_norm;           // prefill_rms_norm_bf16
+    id<MTLComputePipelineState> pfb_residual_norm;      // prefill_residual_norm_bf16
+    id<MTLComputePipelineState> pfb_swiglu;             // prefill_swiglu
+    id<MTLComputePipelineState> pfb_combine;            // prefill_combine
+    id<MTLComputePipelineState> pfb_conv1d_step;        // conv1d_step_batched
+    id<MTLComputePipelineState> pfb_rms_norm_qk;        // rms_norm_qk_batched
+    id<MTLComputePipelineState> pfb_compute_decay_beta; // compute_decay_beta_batched
+    id<MTLComputePipelineState> pfb_delta_net_step;     // gated_delta_net_step_batched
+    id<MTLComputePipelineState> pfb_gated_rms_norm;     // gated_rms_norm_batched
+    // ---- Batched prefill buffers ----
+    // Ping-pong hidden state buffers: [pfb * hidden_dim * 4]
+    #define MAX_PFB_GPU 32
+    #define MAX_PFB 256
+    id<MTLBuffer> buf_pfb_input;       // [MAX_PFB_GPU * hidden_dim] float
+    id<MTLBuffer> buf_pfb_out[8];      // scratch output buffers [MAX_PFB_GPU * max_dim] float
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -275,6 +295,23 @@ static MetalCtx *metal_setup(void) {
     if (!ctx->rms_norm_qk)       fprintf(stderr, "[metal] WARNING: rms_norm_qk pipeline failed (CPU fallback)\n");
     if (!ctx->compute_decay_beta) fprintf(stderr, "[metal] WARNING: compute_decay_beta pipeline failed (CPU fallback)\n");
     if (!ctx->gated_rms_norm)     fprintf(stderr, "[metal] WARNING: gated_rms_norm pipeline failed (CPU fallback)\n");
+
+    // ---- Batched prefill pipelines (optional — warn on failure) ----
+    ctx->pfb_gemm_4bit          = makePipe(@"dequant_gemm_4bit_batch");
+    ctx->pfb_causal_attn        = makePipe(@"prefill_causal_attn");
+    ctx->pfb_q_rope_norm        = makePipe(@"prefill_q_rope_norm_bf16");
+    ctx->pfb_kv_cache           = makePipe(@"prefill_kv_cache_bf16");
+    ctx->pfb_rms_norm           = makePipe(@"prefill_rms_norm_bf16");
+    ctx->pfb_residual_norm      = makePipe(@"prefill_residual_norm_bf16");
+    ctx->pfb_swiglu             = makePipe(@"prefill_swiglu");
+    ctx->pfb_combine            = makePipe(@"prefill_combine");
+    ctx->pfb_conv1d_step        = makePipe(@"conv1d_step_batched");
+    ctx->pfb_rms_norm_qk        = makePipe(@"rms_norm_qk_batched");
+    ctx->pfb_compute_decay_beta = makePipe(@"compute_decay_beta_batched");
+    ctx->pfb_delta_net_step     = makePipe(@"gated_delta_net_step_batched");
+    ctx->pfb_gated_rms_norm     = makePipe(@"gated_rms_norm_batched");
+    if (!ctx->pfb_gemm_4bit) fprintf(stderr, "[metal] WARNING: batched prefill GEMM pipeline failed (token-by-token fallback)\n");
+    else printf("[metal] Batched prefill pipelines ready (13 kernels)\n");
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
         fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
@@ -521,6 +558,30 @@ static MetalCtx *metal_setup(void) {
         if (allocated > ctx->recommended_working_set) {
             fprintf(stderr, "[metal] WARNING: GPU allocation (%.1f MB) exceeds recommended working set (%.1f MB)\n",
                     allocated / 1e6, ctx->recommended_working_set / 1e6);
+        }
+    }
+
+    // ---- Batched prefill buffers ----
+    // Only allocate if the GEMM kernel compiled successfully
+    if (ctx->pfb_gemm_4bit) {
+        size_t pfb_hidden = (size_t)MAX_PFB_GPU * cfg.hidden_dim * sizeof(float);
+        ctx->buf_pfb_input = [ctx->device newBufferWithLength:pfb_hidden
+                                                      options:MTLResourceStorageModeShared];
+        // Scratch output buffers — each large enough for biggest batched projection
+        size_t max_proj_dim = cfg.num_attn_heads * cfg.head_dim;  // q_proj
+        if ((size_t)cfg.linear_conv_dim > max_proj_dim) max_proj_dim = cfg.linear_conv_dim;
+        if ((size_t)cfg.shared_intermediate > max_proj_dim) max_proj_dim = cfg.shared_intermediate;
+        if ((size_t)cfg.moe_intermediate > max_proj_dim) max_proj_dim = cfg.moe_intermediate;
+        size_t pfb_out_size = (size_t)MAX_PFB_GPU * max_proj_dim * sizeof(float);
+        for (int i = 0; i < 8; i++) {
+            ctx->buf_pfb_out[i] = [ctx->device newBufferWithLength:pfb_out_size
+                                                           options:MTLResourceStorageModeShared];
+        }
+        if (ctx->buf_pfb_input) {
+            printf("[metal] Batched prefill buffers: input=%.1f MB, 8x scratch=%.1f MB each\n",
+                   pfb_hidden / 1e6, pfb_out_size / 1e6);
+        } else {
+            fprintf(stderr, "[metal] WARNING: Failed to allocate batched prefill buffers\n");
         }
     }
 

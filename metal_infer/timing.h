@@ -84,6 +84,11 @@ static int g_h2o_budget = 0;             // 0 = disabled, >0 = total H2O KV cach
 static int g_h2o_num_sinks = 4;          // attention sink tokens to keep (first N, typically 4)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
+// Batched prefill configuration
+static int g_prefill_batch = 1;             // 1 = no batching (default), >1 = GEMM prefill
+static int g_prefill_skip_experts = 0;      // skip routed experts during prefill (shared only)
+static int g_prefill_experts_full_only = 0; // experts only at full-attention layers
+
 // RoPE scaling for context extension
 // 0=none (default), 1=linear, 2=NTK-aware, 3=YaRN
 static int g_rope_scaling_mode = 0;

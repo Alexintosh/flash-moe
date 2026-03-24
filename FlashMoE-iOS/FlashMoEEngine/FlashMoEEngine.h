@@ -51,6 +51,7 @@ typedef struct {
     int h2o_budget;             // >0 = H2O KV cache budget (sinks + recent + heavy hitters), 0 = disabled
     int rope_scaling_mode;      // 0 = off, 1 = linear, 2 = NTK-aware, 3 = YaRN
     float rope_scale_factor;    // context extension factor (e.g. 2.0 = 2x context, 4.0 = 4x)
+    int prefill_batch;          // >1 = batched GEMM prefill (e.g. 8, 16, 32). 0/1 = token-by-token (default)
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 

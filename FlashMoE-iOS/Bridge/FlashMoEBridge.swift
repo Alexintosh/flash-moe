@@ -82,6 +82,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                    fp16Accumulation: Bool = false, fp8KVCache: Bool = false,
                    slidingWindow: Int = 0, h2oBudget: Int = 0,
                    ropeScalingMode: Int = 0, ropeScaleFactor: Float = 1.0,
+                   prefillBatch: Int = 1,
                    verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
@@ -125,6 +126,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.h2o_budget = Int32(h2oBudget)
                 config.rope_scaling_mode = Int32(ropeScalingMode)
                 config.rope_scale_factor = ropeScaleFactor
+                config.prefill_batch = Int32(prefillBatch)
                 config.verbose = verbose ? 1 : 0
 
                 // Load

@@ -85,4 +85,5 @@
 #include "gpu_dispatch.h"    // BatchMatvecSpec, batched GPU matmul, expert GPU forward
 #include "expert_io.h"       // I/O thread pool, parallel pread, LRU cache, prefetch
 #include "layer_forward.h"   // RoPE, KVCache, attention, MoE, fused_layer_forward
+#include "batched_prefill.h" // Batched prefill: GEMV->GEMM for N-token prefill
 #include "generate.h"        // Frequency analysis, HTTP serve, main()
