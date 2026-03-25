@@ -2333,6 +2333,7 @@ kernel void prefill_q_rope_norm_bf16(
     uint tgid_flat [[threadgroup_position_in_grid]],
     uint lid       [[thread_position_in_threadgroup]]
 ) {
+    const uint tg_size = 256;  // always dispatched with 256 threads
     uint h = tgid_flat % num_heads;
     uint t = tgid_flat / num_heads;
     if (h >= num_heads || t >= batch_n) return;
@@ -2418,6 +2419,7 @@ kernel void prefill_kv_cache_bf16(
     uint tgid_flat [[threadgroup_position_in_grid]],
     uint lid       [[thread_position_in_threadgroup]]
 ) {
+    const uint tg_size = 256;  // always dispatched with 256 threads
     uint kv_h = tgid_flat % num_kv_heads;
     uint t = tgid_flat / num_kv_heads;
     if (kv_h >= num_kv_heads || t >= batch_n) return;
