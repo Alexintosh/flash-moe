@@ -208,6 +208,23 @@ static int batched_prefill(
                 }
             }
 
+            // Check if we can run GPU post-projection for linear attention layers.
+            // Requires: conv1d, rms_norm_qk, decay/beta, delta-net, gated_rms_norm kernels,
+            //           residual norm kernel, O projection weights, conv state + delta state buffers.
+            int can_gpu_linear_post = 0;
+            if (!is_full && g_metal->pfb_conv1d_step && g_metal->pfb_rms_norm_qk &&
+                g_metal->pfb_compute_decay_beta && g_metal->pfb_delta_net_step &&
+                g_metal->pfb_gated_rms_norm && g_metal->pfb_residual_norm &&
+                lc->conv1d_w && lc->A_log && lc->dt_bias && lc->gated_norm_w &&
+                lc->out_proj_w && lc->out_proj_s && lc->out_proj_b && lc->post_attn_norm_w) {
+                int li = cfg.linear_index[layer];
+                if (li >= 0 && li < cfg.num_linear_layers &&
+                    g_metal->buf_conv_state && g_metal->buf_delta_state &&
+                    g_metal->buf_conv_state[li] && g_metal->buf_delta_state[li]) {
+                    can_gpu_linear_post = 1;
+                }
+            }
+
             // Process tokens in GPU-batch-sized chunks
             for (int chunk_start = 0; chunk_start < num_tokens; chunk_start += gpu_batch) {
                 int chunk_n = num_tokens - chunk_start;
@@ -227,7 +244,7 @@ static int batched_prefill(
                 metal_staging_reset(g_metal);
 
                 // Save residual: blit buf_pfb_input -> buf_pfb_out[6] (needed for residual add later)
-                if (can_gpu_full_post) {
+                if (can_gpu_full_post || can_gpu_linear_post) {
                     id<MTLBlitCommandEncoder> blit = [cmd_pfb blitCommandEncoder];
                     size_t copy_size = (size_t)batch_n * cfg.hidden_dim * sizeof(float);
                     [blit copyFromBuffer:g_metal->buf_pfb_input sourceOffset:0
@@ -549,6 +566,296 @@ static int batched_prefill(
                         complete_deferred_experts();
 
                         // Copy result back to hidden_states
+                        memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
+                    }
+
+                    continue;  // skip the per-token fallback below
+                }
+
+                // ================================================================
+                // GPU POST-PROJECTION: Linear attention layers
+                // ================================================================
+                // After batched QKV/Z/beta/alpha GEMM, dispatch GPU kernels for:
+                //   conv1d (sequential through N) -> CPU deinterleave Q/K/V ->
+                //   rms_norm_qk -> compute_decay_beta -> gated_delta_net_step (sequential) ->
+                //   gated_rms_norm -> O projection GEMM -> residual + RMS norm
+                // Then read back h_post (normed) and h_mid for per-token routing + experts.
+                if (!is_full && can_gpu_linear_post) {
+                    int li = cfg.linear_index[layer];
+                    int conv_dim = cfg.linear_conv_dim;
+                    int total_key = cfg.linear_total_key;
+                    int total_value = cfg.linear_total_value;
+                    int num_v_heads = cfg.linear_num_v_heads;
+                    int num_k_heads = cfg.linear_num_k_heads;
+                    int key_dim = cfg.linear_key_dim;
+                    int value_dim = cfg.linear_value_dim;
+
+                    // ---- Dispatch: conv1d_step_batched (slot 0 = QKV GEMM -> slot 3 = conv output) ----
+                    // conv1d processes tokens sequentially, maintaining causal state.
+                    // Input: slot 0 [N, conv_dim], Output: slot 3 [N, conv_dim]
+                    {
+                        id<MTLCommandBuffer> cmd_conv = [g_metal->queue commandBuffer];
+                        metal_staging_reset(g_metal);
+
+                        id<MTLBuffer> conv1d_w_buf; NSUInteger conv1d_w_off;
+                        metal_find_chunk_sized(g_metal, lc->conv1d_w,
+                            (size_t)conv_dim * cfg.conv_kernel_size * 2, &conv1d_w_buf, &conv1d_w_off);
+
+                        uint32_t cd = (uint32_t)conv_dim;
+                        id<MTLComputeCommandEncoder> enc = [cmd_conv computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_conv1d_step];
+                        [enc setBuffer:g_metal->buf_conv_state[li]  offset:0             atIndex:0];
+                        [enc setBuffer:g_metal->buf_pfb_out[0]      offset:0             atIndex:1];  // QKV GEMM
+                        [enc setBuffer:conv1d_w_buf                 offset:conv1d_w_off  atIndex:2];
+                        [enc setBuffer:g_metal->buf_pfb_out[3]      offset:0             atIndex:3];  // conv output
+                        [enc setBytes:&cd       length:4 atIndex:4];
+                        [enc setBytes:&batch_n  length:4 atIndex:5];
+                        uint32_t conv_tgs = (cd + 255) / 256;
+                        [enc dispatchThreadgroups:MTLSizeMake(conv_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc endEncoding];
+
+                        [cmd_conv commit];
+                        [cmd_conv waitUntilCompleted];
+                    }
+
+                    // ---- CPU deinterleave conv output into Q, K, V arrays ----
+                    // Conv output: [N, conv_dim] where each row = [Q(total_key), K(total_key), V(total_value)]
+                    // Deinterleave to: slot 4 = Q [N, total_key], slot 5 = K [N, total_key],
+                    //                  and V into buf_pfb_out[0] [N, total_value] (reuse slot 0)
+                    {
+                        float *conv_out = (float *)[g_metal->buf_pfb_out[3] contents];
+                        float *q_out = (float *)[g_metal->buf_pfb_out[4] contents];
+                        float *k_out = (float *)[g_metal->buf_pfb_out[5] contents];
+                        float *v_out = (float *)[g_metal->buf_pfb_out[0] contents];  // reuse slot 0
+                        for (int t = 0; t < chunk_n; t++) {
+                            float *src = conv_out + (size_t)t * conv_dim;
+                            memcpy(q_out + (size_t)t * total_key,   src,                     total_key * sizeof(float));
+                            memcpy(k_out + (size_t)t * total_key,   src + total_key,          total_key * sizeof(float));
+                            memcpy(v_out + (size_t)t * total_value, src + 2 * total_key,      total_value * sizeof(float));
+                        }
+                    }
+
+                    // ---- GPU command buffer for RMS norm QK + decay/beta + delta-net + gated_rms_norm ----
+                    id<MTLCommandBuffer> cmd_linear = [g_metal->queue commandBuffer];
+                    metal_staging_reset(g_metal);
+
+                    // ---- Dispatch: rms_norm_qk_batched (in-place on slots 4,5) ----
+                    {
+                        uint32_t kd = (uint32_t)key_dim;
+                        float inv_scale = 1.0f / sqrtf((float)key_dim);
+                        uint32_t nkh = (uint32_t)num_k_heads;
+
+                        id<MTLComputeCommandEncoder> enc = [cmd_linear computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_rms_norm_qk];
+                        [enc setBuffer:g_metal->buf_pfb_out[4]  offset:0 atIndex:0];  // Q
+                        [enc setBuffer:g_metal->buf_pfb_out[5]  offset:0 atIndex:1];  // K
+                        [enc setBytes:&kd        length:4 atIndex:2];
+                        [enc setBytes:&inv_scale length:4 atIndex:3];
+                        [enc setBytes:&nkh       length:4 atIndex:4];
+                        [enc setBytes:&batch_n   length:4 atIndex:5];
+                        uint32_t num_tgs = nkh * batch_n;
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        [enc endEncoding];
+                    }
+
+                    // ---- Dispatch: compute_decay_beta_batched ----
+                    // alpha=slot 3 (reused for alpha, but we put it in slot 3 from GEMM),
+                    // beta=slot 2 from GEMM -> g_decay/beta into slot 3 (reuse)
+                    {
+                        id<MTLBuffer> alog_buf, dtb_buf; NSUInteger alog_off, dtb_off;
+                        metal_find_chunk_sized(g_metal, lc->A_log,
+                            (size_t)num_v_heads * sizeof(float), &alog_buf, &alog_off);
+                        metal_find_chunk_sized(g_metal, lc->dt_bias,
+                            (size_t)num_v_heads * sizeof(uint16_t), &dtb_buf, &dtb_off);
+                        uint32_t nvh = (uint32_t)num_v_heads;
+
+                        id<MTLComputeCommandEncoder> enc = [cmd_linear computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_compute_decay_beta];
+                        [enc setBuffer:g_metal->buf_pfb_out[3]  offset:0           atIndex:0];  // alpha (GEMM slot 3)
+                        [enc setBuffer:g_metal->buf_pfb_out[2]  offset:0           atIndex:1];  // beta (GEMM slot 2)
+                        [enc setBuffer:alog_buf                 offset:alog_off    atIndex:2];
+                        [enc setBuffer:dtb_buf                  offset:dtb_off     atIndex:3];
+                        [enc setBuffer:g_metal->buf_pfb_out[3]  offset:0           atIndex:4];  // g_decay out (reuse slot 3)
+                        [enc setBuffer:g_metal->buf_pfb_out[2]  offset:0           atIndex:5];  // beta_gate out (reuse slot 2)
+                        [enc setBytes:&nvh      length:4 atIndex:6];
+                        [enc setBytes:&batch_n  length:4 atIndex:7];
+                        uint32_t total_threads = nvh * batch_n;
+                        uint32_t tgs = (total_threads + 255) / 256;
+                        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc endEncoding];
+                    }
+
+                    [cmd_linear commit];
+                    [cmd_linear waitUntilCompleted];
+
+                    // ---- Dispatch: gated_delta_net_step_batched (sequential per head) ----
+                    // One workgroup per v-head, tokens processed sequentially.
+                    // Q=slot4, K=slot5, V=slot0, g_decay=slot3, beta=slot2 -> output=slot4 (reuse)
+                    {
+                        id<MTLCommandBuffer> cmd_delta = [g_metal->queue commandBuffer];
+
+                        uint32_t khpv = (uint32_t)(num_k_heads > 0 ? (num_v_heads / num_k_heads) : 1);
+                        uint32_t kd = (uint32_t)key_dim;
+                        uint32_t vd = (uint32_t)value_dim;
+                        uint32_t tk = (uint32_t)total_key;
+                        uint32_t tv = (uint32_t)total_value;
+                        uint32_t nvh = (uint32_t)num_v_heads;
+
+                        id<MTLComputeCommandEncoder> enc = [cmd_delta computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_delta_net_step];
+                        [enc setBuffer:g_metal->buf_delta_state[li]  offset:0 atIndex:0];  // persistent state
+                        [enc setBuffer:g_metal->buf_pfb_out[4]       offset:0 atIndex:1];  // Q
+                        [enc setBuffer:g_metal->buf_pfb_out[5]       offset:0 atIndex:2];  // K
+                        [enc setBuffer:g_metal->buf_pfb_out[0]       offset:0 atIndex:3];  // V
+                        [enc setBuffer:g_metal->buf_pfb_out[3]       offset:0 atIndex:4];  // g_decay
+                        [enc setBuffer:g_metal->buf_pfb_out[2]       offset:0 atIndex:5];  // beta_gate
+                        [enc setBuffer:g_metal->buf_pfb_out[7]       offset:0 atIndex:6];  // output (slot 7, avoids Q overlap)
+                        [enc setBytes:&khpv     length:4 atIndex:7];
+                        [enc setBytes:&kd       length:4 atIndex:8];
+                        [enc setBytes:&vd       length:4 atIndex:9];
+                        [enc setBytes:&tk       length:4 atIndex:10];
+                        [enc setBytes:&tv       length:4 atIndex:11];
+                        [enc setBytes:&nvh      length:4 atIndex:12];
+                        [enc setBytes:&batch_n  length:4 atIndex:13];
+                        [enc dispatchThreadgroups:MTLSizeMake(nvh, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(vd, 1, 1)];
+                        [enc endEncoding];
+
+                        [cmd_delta commit];
+                        [cmd_delta waitUntilCompleted];
+                    }
+
+                    // ---- Dispatch: gated_rms_norm_batched + O proj GEMM + residual_norm ----
+                    {
+                        id<MTLCommandBuffer> cmd_post_lin = [g_metal->queue commandBuffer];
+                        metal_staging_reset(g_metal);
+
+                        // gated_rms_norm: values=slot4 (delta output), z=slot1 (Z GEMM), weight=gated_norm_w
+                        // -> output=slot5 (reuse)
+                        {
+                            id<MTLBuffer> gnw_buf; NSUInteger gnw_off;
+                            metal_find_chunk_sized(g_metal, lc->gated_norm_w,
+                                (size_t)total_value * sizeof(uint16_t), &gnw_buf, &gnw_off);
+                            uint32_t vd = (uint32_t)value_dim;
+                            float eps = cfg.rms_norm_eps;
+                            uint32_t nvh = (uint32_t)num_v_heads;
+
+                            id<MTLComputeCommandEncoder> enc = [cmd_post_lin computeCommandEncoder];
+                            [enc setComputePipelineState:g_metal->pfb_gated_rms_norm];
+                            [enc setBuffer:g_metal->buf_pfb_out[7]  offset:0       atIndex:0];  // delta output (slot 7)
+                            [enc setBuffer:g_metal->buf_pfb_out[1]  offset:0       atIndex:1];  // Z (GEMM slot 1)
+                            [enc setBuffer:gnw_buf                  offset:gnw_off atIndex:2];  // weight
+                            [enc setBuffer:g_metal->buf_pfb_out[5]  offset:0       atIndex:3];  // output
+                            [enc setBytes:&vd       length:4 atIndex:4];
+                            [enc setBytes:&eps      length:4 atIndex:5];
+                            [enc setBytes:&nvh      length:4 atIndex:6];
+                            [enc setBytes:&batch_n  length:4 atIndex:7];
+                            uint32_t num_tgs = nvh * batch_n;
+                            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(vd, 1, 1)];
+                            [enc endEncoding];
+                        }
+
+                        // Blit: gated_rms_norm output (slot 5, [N, total_value]) -> buf_pfb_input for O proj GEMM
+                        {
+                            id<MTLBlitCommandEncoder> blit = [cmd_post_lin blitCommandEncoder];
+                            size_t copy_size = (size_t)batch_n * total_value * sizeof(float);
+                            [blit copyFromBuffer:g_metal->buf_pfb_out[5] sourceOffset:0
+                                        toBuffer:g_metal->buf_pfb_input destinationOffset:0
+                                            size:copy_size];
+                            [blit endEncoding];
+                        }
+
+                        // O projection batched GEMM: buf_pfb_input [N, total_value] -> slot 0 [N, hidden_dim]
+                        pfb_encode_gemm(g_metal, cmd_post_lin,
+                                        lc->out_proj_w, lc->out_proj_s, lc->out_proj_b,
+                                        (uint32_t)cfg.hidden_dim, (uint32_t)total_value,
+                                        (uint32_t)cfg.group_size, 0, batch_n);
+
+                        // Dispatch: prefill_residual_norm_bf16
+                        // residual=slot 6, x=slot 0 (O proj), weight=post_attn_norm_w
+                        // -> out=slot 7 (normed/h_post), hidden=buf_pfb_input (h_mid)
+                        {
+                            id<MTLBuffer> panw_buf; NSUInteger panw_off;
+                            metal_find_chunk_sized(g_metal, lc->post_attn_norm_w,
+                                (size_t)cfg.hidden_dim * 2, &panw_buf, &panw_off);
+                            uint32_t dim = (uint32_t)cfg.hidden_dim;
+                            float eps = cfg.rms_norm_eps;
+
+                            id<MTLComputeCommandEncoder> enc = [cmd_post_lin computeCommandEncoder];
+                            [enc setComputePipelineState:g_metal->pfb_residual_norm];
+                            [enc setBuffer:g_metal->buf_pfb_out[6]  offset:0       atIndex:0];  // residual
+                            [enc setBuffer:g_metal->buf_pfb_out[0]  offset:0       atIndex:1];  // x (O proj out)
+                            [enc setBuffer:panw_buf                 offset:panw_off atIndex:2];  // weight
+                            [enc setBuffer:g_metal->buf_pfb_out[7]  offset:0       atIndex:3];  // out (normed)
+                            [enc setBuffer:g_metal->buf_pfb_input   offset:0       atIndex:4];  // hidden (h_mid)
+                            [enc setBytes:&dim     length:4 atIndex:5];
+                            [enc setBytes:&eps     length:4 atIndex:6];
+                            [enc setBytes:&batch_n length:4 atIndex:7];
+                            [enc dispatchThreadgroups:MTLSizeMake(batch_n, 1, 1)
+                                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                            [enc endEncoding];
+                        }
+
+                        [cmd_post_lin commit];
+                        [cmd_post_lin waitUntilCompleted];
+                    }
+
+                    // ---- Read back h_post and h_mid, sync conv/delta state to CPU ----
+                    float *h_post_gpu = (float *)[g_metal->buf_pfb_out[7] contents];
+                    float *h_mid_gpu = (float *)[g_metal->buf_pfb_input contents];
+
+                    // Sync GPU conv_state and delta_state back to CPU LinearAttnState
+                    {
+                        LinearAttnState *las = (LinearAttnState *)layer_states[layer];
+                        if (las) {
+                            float *gpu_conv = (float *)[g_metal->buf_conv_state[li] contents];
+                            float *gpu_delta = (float *)[g_metal->buf_delta_state[li] contents];
+                            size_t conv_state_size = (cfg.conv_kernel_size - 1) * (size_t)conv_dim * sizeof(float);
+                            size_t delta_state_size = (size_t)num_v_heads * value_dim * key_dim * sizeof(float);
+                            memcpy(las->conv_state, gpu_conv, conv_state_size);
+                            memcpy(las->ssm_state, gpu_delta, delta_state_size);
+                        }
+                    }
+
+                    // ---- Per-token: routing + expert I/O + combine ----
+                    for (int t = 0; t < chunk_n; t++) {
+                        int global_t = chunk_start + t;
+                        int pos = start_pos + global_t;
+                        float *h = hidden_states + (size_t)global_t * cfg.hidden_dim;
+
+                        float *hp = h_post_gpu + (size_t)t * cfg.hidden_dim;
+                        float *hm = h_mid_gpu + (size_t)t * cfg.hidden_dim;
+
+                        memcpy(token_hidden, hm, cfg.hidden_dim * sizeof(float));
+                        memcpy(s_h_post, hp, cfg.hidden_dim * sizeof(float));
+                        memcpy(s_h_mid, hm, cfg.hidden_dim * sizeof(float));
+
+                        // Routing + shared expert projections (matvecs on h_post)
+                        memset(s_gate_scores, 0, cfg.num_experts * sizeof(float));
+                        memset(s_shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+                        memset(s_shared_up, 0, cfg.shared_intermediate * sizeof(float));
+                        g_pfb_shared_gate_score = 0.0f;
+
+                        BatchMatvecSpec moe_specs[4] = {
+                            { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,            (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                            { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,            (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                            { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,              (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                            { lc->seg_w,  lc->seg_s,  lc->seg_b,  &g_pfb_shared_gate_score, 1,                               cfg.hidden_dim, cfg.group_size, 3 },
+                        };
+                        fast_batch_matvec(hp, cfg.hidden_dim, moe_specs, 4);
+
+                        g_pfb_precomputed_post_attn = 1;
+                        fused_layer_forward(wf, layer, token_hidden,
+                                            NULL, (LinearAttnState *)layer_states[layer],
+                                            pos, mmap_base,
+                                            K, layer_fds[layer]);
+                        g_pfb_precomputed_post_attn = 0;
+
+                        complete_deferred_experts();
                         memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
                     }
 
