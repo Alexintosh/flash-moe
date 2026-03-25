@@ -110,13 +110,13 @@ static int batched_prefill(
                                 mmap_base,
                                 K, layer_fds[layer]);
 
-            // Copy result back (fused_layer_forward modifies hidden in-place)
-            memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
+            // Complete deferred expert work — experts contribute ~80% of each
+            // layer's computation. Discarding them corrupts the hidden state.
+            complete_deferred_experts();
 
-            // Discard deferred expert GPU work — we only need the side effects
-            // (KV cache updates, delta-net state updates), not the final expert
-            // output for intermediate tokens. This saves ~57ms per token.
-            discard_deferred_experts();
+            // Copy result back (fused_layer_forward modifies token_hidden in-place,
+            // and complete_deferred_experts applies expert output to it)
+            memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
         }
     }
 
