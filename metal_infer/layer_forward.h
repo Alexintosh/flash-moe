@@ -1751,6 +1751,14 @@ static float *s_k_dequant      = NULL;   // [cfg.num_kv_heads * cfg.head_dim] (F
 static float *s_v_dequant      = NULL;   // [cfg.num_kv_heads * cfg.head_dim] (FP8 attention)
 static int    s_scratch_initialized = 0;
 
+// ---- Batched prefill: pre-computed QKV bypass ----
+// When g_pfb_precomputed_qkv is non-zero, fused_layer_forward skips the
+// input norm + Q/K/V projection for full attention layers and uses data
+// already in s_q_proj_out, s_k_proj_out, s_v_proj_out, s_normed, s_residual.
+// The caller (batched_prefill.h) is responsible for filling these buffers
+// from the batched GEMM output before each per-token call.
+static int g_pfb_precomputed_qkv = 0;
+
 static int init_layer_scratch(void) {
     if (s_scratch_initialized) return 0;  // already initialized
 
@@ -2220,6 +2228,22 @@ static void fused_layer_forward(
         // No input_norm needed — CMD3 already computed it into buf_input.
         // normed is only needed if speculative routing is enabled (currently disabled).
         // Skip the readback to avoid unnecessary overhead.
+    } else if (g_pfb_precomputed_qkv && is_full) {
+        // ---- BATCHED PREFILL PATH: Q/K/V already computed by batched GEMM ----
+        // s_normed, s_residual, s_q_proj_out, s_k_proj_out, s_v_proj_out are
+        // pre-filled by batched_prefill.h. Skip norm + CMD1 projection dispatch.
+        // Still need to complete deferred experts from previous layer.
+        if (g_timing_enabled) { t0 = now_ms(); }
+        wait_deferred_experts_gpu();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_wait += t1 - t0; }
+
+        if (g_timing_enabled) { t0 = now_ms(); }
+        finalize_deferred_experts();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
+
+        // normed and residual already set by caller — skip input norm and CMD1.
+        // cmd1 stays nil. Q/K/V results are already in s_q_proj_out etc.
+        if (g_timing_enabled) { t0 = now_ms(); t1 = t0; }
     } else {
         // ---- ORIGINAL PATH: CPU deferred completion + input norm ----
         // Complete deferred experts from previous layer

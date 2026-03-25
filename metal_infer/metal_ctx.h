@@ -568,7 +568,8 @@ static MetalCtx *metal_setup(void) {
         ctx->buf_pfb_input = [ctx->device newBufferWithLength:pfb_hidden
                                                       options:MTLResourceStorageModeShared];
         // Scratch output buffers — each large enough for biggest batched projection
-        size_t max_proj_dim = cfg.num_attn_heads * cfg.head_dim;  // q_proj
+        // q_proj outputs num_attn_heads * head_dim * 2 (includes gate), so use that
+        size_t max_proj_dim = (size_t)cfg.num_attn_heads * cfg.head_dim * 2;  // q_proj_dim (16384)
         if ((size_t)cfg.linear_conv_dim > max_proj_dim) max_proj_dim = cfg.linear_conv_dim;
         if ((size_t)cfg.shared_intermediate > max_proj_dim) max_proj_dim = cfg.shared_intermediate;
         if ((size_t)cfg.moe_intermediate > max_proj_dim) max_proj_dim = cfg.moe_intermediate;
