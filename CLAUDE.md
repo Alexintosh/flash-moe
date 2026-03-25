@@ -21,6 +21,24 @@ Any **Qwen3.5 MoE** model with MLX quantization (`model_type: qwen3_5_moe`) is s
 
 The engine auto-detects architecture, dimensions, expert counts, quantization, and layer types from `config.json`. No recompilation needed.
 
+## Development Workflow (MANDATORY)
+
+**NEVER merge feature branches into `develop` without explicit approval.** The flow is:
+
+1. **Create `feature/branch-name`** from `develop`
+2. Implement, commit, push to the feature branch
+3. **Notify** the user that it's ready for testing
+4. User tests on device and requests changes if needed
+5. Iterate on the feature branch until the user confirms it works
+6. **Only merge when the user explicitly says "merge it"**
+
+**Why:** Merging untested code (batched prefill, fused expert, CMD merge) caused repeated gibberish output and crashes that wasted hours of debugging and device restarts. QA happens on the feature branch, not on develop.
+
+**Also:**
+- Always add a **settings toggle** (default OFF for experimental features) so broken features can be disabled without reverting code
+- Before any `git rebase` or destructive git operation, **ask the user first**
+- The `develop` branch should always produce correct output
+
 ## Results
 
 ![Progress](progress.png)
