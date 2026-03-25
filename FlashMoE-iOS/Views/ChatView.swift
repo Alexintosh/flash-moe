@@ -205,14 +205,29 @@ struct ChatView: View {
 
             var gotTokens = false
             var tokenCount = 0
+            var inThinkBlock = false
             for await token in stream {
                 gotTokens = true
                 tokenCount += 1
                 // Strip special tokens that leak through
-                let clean = token.text
+                var clean = token.text
                     .replacingOccurrences(of: "<|im_end|>", with: "")
                     .replacingOccurrences(of: "<|im_start|>", with: "")
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
+
+                // When thinking is OFF, suppress <think>...</think> content
+                if !thinkingEnabled {
+                    if clean.contains("<think>") {
+                        inThinkBlock = true
+                        clean = clean.replacingOccurrences(of: "<think>", with: "")
+                    }
+                    if clean.contains("</think>") {
+                        inThinkBlock = false
+                        clean = clean.replacingOccurrences(of: "</think>", with: "")
+                    }
+                    if inThinkBlock { clean = "" }
+                }
+
                 if !clean.isEmpty {
                     messages[assistantIndex].text += clean
                     // Auto-scroll every few tokens (not every token to avoid scroll jank)
@@ -230,12 +245,18 @@ struct ChatView: View {
                 let formattedPrompt = buildChatPrompt(userMessage: text)
                 let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 2048)
                 tokenCount = 0
+                inThinkBlock = false
                 for await token in fallbackStream {
                     tokenCount += 1
-                    let clean = token.text
+                    var clean = token.text
                         .replacingOccurrences(of: "<|im_end|>", with: "")
                         .replacingOccurrences(of: "<|im_start|>", with: "")
                         .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    if !thinkingEnabled {
+                        if clean.contains("<think>") { inThinkBlock = true; clean = clean.replacingOccurrences(of: "<think>", with: "") }
+                        if clean.contains("</think>") { inThinkBlock = false; clean = clean.replacingOccurrences(of: "</think>", with: "") }
+                        if inThinkBlock { clean = "" }
+                    }
                     if !clean.isEmpty {
                         messages[assistantIndex].text += clean
                         if tokenCount % 3 == 0 {
