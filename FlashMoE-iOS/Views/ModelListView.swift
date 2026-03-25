@@ -360,6 +360,20 @@ struct ModelListView: View {
                     }
                     .pickerStyle(.menu)
                 }
+
+                // Reload button — applies all settings changes by unloading and reloading
+                if engine.state == .ready, let model = selectedModel {
+                    Button {
+                        Task {
+                            engine.unloadModel()
+                            try? await Task.sleep(for: .milliseconds(200))
+                            loadModel(model)
+                        }
+                    } label: {
+                        Label("Reload Model with Current Settings", systemImage: "arrow.clockwise")
+                    }
+                    .tint(.orange)
+                }
             }
 
             if let error = downloadManager.error,
