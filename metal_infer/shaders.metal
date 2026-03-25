@@ -2330,7 +2330,7 @@ kernel void prefill_q_rope_norm_bf16(
     constant float&        rope_theta  [[buffer(6)]],
     constant float&        eps        [[buffer(7)]],
     constant uint&         rotary_dim [[buffer(8)]],
-    uint2 tgid  [[threadgroup_position_in_grid]],  // (head, token)
+    uint3 tgid  [[threadgroup_position_in_grid]],  // (head, token, 1)
     uint lid    [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]]
 ) {
@@ -2416,7 +2416,7 @@ kernel void prefill_kv_cache_bf16(
     constant float&        rope_theta  [[buffer(10)]],
     constant float&        eps        [[buffer(11)]],
     constant uint&         rotary_dim [[buffer(12)]],
-    uint2 tgid  [[threadgroup_position_in_grid]],  // (kv_head, token)
+    uint3 tgid  [[threadgroup_position_in_grid]],  // (kv_head, token, 1)
     uint lid    [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]]
 ) {
@@ -2684,7 +2684,7 @@ kernel void rms_norm_qk_batched(
     constant float &inv_scale,
     constant uint &num_k_heads,
     constant uint &batch_n,
-    uint2 tgid [[threadgroup_position_in_grid]],  // (head, token)
+    uint3 tgid [[threadgroup_position_in_grid]],  // (head, token, 1)
     uint tid   [[thread_position_in_threadgroup]]
 ) {
     uint head = tgid.x;
@@ -2828,7 +2828,7 @@ kernel void gated_rms_norm_batched(
     constant float &eps,
     constant uint &num_v_heads,
     constant uint &batch_n,
-    uint2 tgid [[threadgroup_position_in_grid]],  // (head, token)
+    uint3 tgid [[threadgroup_position_in_grid]],  // (head, token, 1)
     uint tid   [[thread_position_in_threadgroup]]
 ) {
     uint head = tgid.x;
