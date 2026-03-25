@@ -192,6 +192,22 @@ static int batched_prefill(
         if (can_gemm) {
             gemm_layers++;
 
+            // Check if we can run GPU post-projection for full attention layers.
+            // Requires: Q/K norm weights, RoPE kernels, causal attn kernel, residual norm kernel,
+            //           O projection weights, post-attn norm weights, GPU KV cache buffers.
+            int can_gpu_full_post = 0;
+            if (is_full && g_metal->pfb_q_rope_norm && g_metal->pfb_kv_cache &&
+                g_metal->pfb_causal_attn && g_metal->pfb_residual_norm &&
+                lc->q_norm_w && lc->k_norm_w &&
+                lc->o_w && lc->o_s && lc->o_b && lc->post_attn_norm_w) {
+                int fa_idx = cfg.full_attn_index[layer];
+                if (fa_idx >= 0 && fa_idx < cfg.num_full_attn_layers &&
+                    g_metal->buf_kv_k && g_metal->buf_kv_v &&
+                    g_metal->buf_kv_k[fa_idx] && g_metal->buf_kv_v[fa_idx]) {
+                    can_gpu_full_post = 1;
+                }
+            }
+
             // Process tokens in GPU-batch-sized chunks
             for (int chunk_start = 0; chunk_start < num_tokens; chunk_start += gpu_batch) {
                 int chunk_n = num_tokens - chunk_start;
@@ -209,6 +225,16 @@ static int batched_prefill(
                 // ---- Step 2: Batched RMS norm + GEMM projections ----
                 id<MTLCommandBuffer> cmd_pfb = [g_metal->queue commandBuffer];
                 metal_staging_reset(g_metal);
+
+                // Save residual: blit buf_pfb_input -> buf_pfb_out[6] (needed for residual add later)
+                if (can_gpu_full_post) {
+                    id<MTLBlitCommandEncoder> blit = [cmd_pfb blitCommandEncoder];
+                    size_t copy_size = (size_t)batch_n * cfg.hidden_dim * sizeof(float);
+                    [blit copyFromBuffer:g_metal->buf_pfb_input sourceOffset:0
+                                toBuffer:g_metal->buf_pfb_out[6] destinationOffset:0
+                                    size:copy_size];
+                    [blit endEncoding];
+                }
 
                 // RMS norm: buf_pfb_input -> buf_pfb_out[7] (use slot 7 as normed scratch)
                 pfb_encode_rms_norm(g_metal, cmd_pfb,
@@ -271,7 +297,266 @@ static int batched_prefill(
                 [cmd_pfb commit];
                 [cmd_pfb waitUntilCompleted];
 
+                // ================================================================
+                // GPU POST-PROJECTION: Full attention layers
+                // ================================================================
+                // After batched GEMM, dispatch GPU kernels for:
+                //   Q deinterleave + RMS norm + RoPE -> KV cache write -> causal attention
+                //   -> O projection GEMM -> residual + RMS norm
+                // Then read back h_post (normed) and h_mid for per-token routing + experts.
+                if (is_full && can_gpu_full_post) {
+                    int q_proj_dim = cfg.num_attn_heads * cfg.head_dim * 2;
+                    int q_dim = cfg.num_attn_heads * cfg.head_dim;
+                    int kv_dim = cfg.num_kv_heads * cfg.head_dim;
+                    int fa_idx = cfg.full_attn_index[layer];
+
+                    // ---- CPU deinterleave Q+gate from slot 0 into slots 3 (Q) and 4 (gate) ----
+                    // GEMM output: [N, num_heads * (2 * head_dim)] = [Q_h0, gate_h0, Q_h1, gate_h1, ...]
+                    // Deinterleave to: Q [N, num_heads * head_dim], gate [N, num_heads * head_dim]
+                    {
+                        float *qg_buf = (float *)[g_metal->buf_pfb_out[0] contents];
+                        float *q_deint = (float *)[g_metal->buf_pfb_out[3] contents];
+                        float *gate_deint = (float *)[g_metal->buf_pfb_out[4] contents];
+                        for (int t = 0; t < chunk_n; t++) {
+                            float *src = qg_buf + (size_t)t * q_proj_dim;
+                            float *dq = q_deint + (size_t)t * q_dim;
+                            float *dg = gate_deint + (size_t)t * q_dim;
+                            for (int h = 0; h < cfg.num_attn_heads; h++) {
+                                memcpy(dq + h * cfg.head_dim, src + h * 2 * cfg.head_dim,
+                                       cfg.head_dim * sizeof(float));
+                                memcpy(dg + h * cfg.head_dim, src + h * 2 * cfg.head_dim + cfg.head_dim,
+                                       cfg.head_dim * sizeof(float));
+                            }
+                        }
+                    }
+
+                    // ---- GPU command buffer for post-projection ----
+                    id<MTLCommandBuffer> cmd_post = [g_metal->queue commandBuffer];
+                    metal_staging_reset(g_metal);
+
+                    // ---- Dispatch: prefill_q_rope_norm_bf16 (in-place on slot 3) ----
+                    {
+                        id<MTLBuffer> qnw_buf; NSUInteger qnw_off;
+                        metal_find_chunk_sized(g_metal, lc->q_norm_w,
+                            (size_t)cfg.head_dim * 2, &qnw_buf, &qnw_off);
+                        uint32_t hd = (uint32_t)cfg.head_dim;
+                        uint32_t nh = (uint32_t)cfg.num_attn_heads;
+                        uint32_t cs = (uint32_t)(start_pos + chunk_start);
+                        float rope_theta = cfg.rope_theta;
+                        float eps = cfg.rms_norm_eps;
+                        uint32_t rd = (uint32_t)cfg.rotary_dim;
+
+                        id<MTLComputeCommandEncoder> enc = [cmd_post computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_q_rope_norm];
+                        [enc setBuffer:g_metal->buf_pfb_out[3] offset:0      atIndex:0];
+                        [enc setBuffer:qnw_buf                 offset:qnw_off atIndex:1];
+                        [enc setBytes:&hd          length:4 atIndex:2];
+                        [enc setBytes:&nh          length:4 atIndex:3];
+                        [enc setBytes:&batch_n     length:4 atIndex:4];
+                        [enc setBytes:&cs          length:4 atIndex:5];
+                        [enc setBytes:&rope_theta  length:4 atIndex:6];
+                        [enc setBytes:&eps         length:4 atIndex:7];
+                        [enc setBytes:&rd          length:4 atIndex:8];
+                        // Grid: [num_heads * batch_n, 1, 1], 256 threads
+                        uint32_t num_tgs = nh * batch_n;
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc endEncoding];
+                    }
+
+                    // ---- Dispatch: prefill_kv_cache_bf16 (slots 1,2 -> GPU KV cache) ----
+                    {
+                        id<MTLBuffer> knw_buf; NSUInteger knw_off;
+                        metal_find_chunk_sized(g_metal, lc->k_norm_w,
+                            (size_t)cfg.head_dim * 2, &knw_buf, &knw_off);
+                        uint32_t hd = (uint32_t)cfg.head_dim;
+                        uint32_t kvd = (uint32_t)kv_dim;
+                        uint32_t nkvh = (uint32_t)cfg.num_kv_heads;
+                        uint32_t cs = (uint32_t)(start_pos + chunk_start);
+                        float rope_theta = cfg.rope_theta;
+                        float eps = cfg.rms_norm_eps;
+                        uint32_t rd = (uint32_t)cfg.rotary_dim;
+
+                        id<MTLComputeCommandEncoder> enc = [cmd_post computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_kv_cache];
+                        [enc setBuffer:g_metal->buf_pfb_out[1]   offset:0      atIndex:0];  // K_in
+                        [enc setBuffer:g_metal->buf_pfb_out[2]   offset:0      atIndex:1];  // V_in
+                        [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:0      atIndex:2];  // K_cache
+                        [enc setBuffer:g_metal->buf_kv_v[fa_idx] offset:0      atIndex:3];  // V_cache
+                        [enc setBuffer:knw_buf                   offset:knw_off atIndex:4];  // k_norm_w
+                        [enc setBytes:&hd          length:4 atIndex:5];
+                        [enc setBytes:&kvd         length:4 atIndex:6];
+                        [enc setBytes:&nkvh        length:4 atIndex:7];
+                        [enc setBytes:&batch_n     length:4 atIndex:8];
+                        [enc setBytes:&cs          length:4 atIndex:9];
+                        [enc setBytes:&rope_theta  length:4 atIndex:10];
+                        [enc setBytes:&eps         length:4 atIndex:11];
+                        [enc setBytes:&rd          length:4 atIndex:12];
+                        // Grid: [num_kv_heads * batch_n, 1, 1], 256 threads
+                        uint32_t num_tgs = nkvh * batch_n;
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc endEncoding];
+                    }
+
+                    // ---- Dispatch: prefill_causal_attn (slot 3=Q, KV cache, slot 4=gate -> slot 5) ----
+                    {
+                        uint32_t hd = (uint32_t)cfg.head_dim;
+                        uint32_t kvd = (uint32_t)kv_dim;
+                        uint32_t nh = (uint32_t)cfg.num_attn_heads;
+                        uint32_t hpkv = (uint32_t)(cfg.num_attn_heads / cfg.num_kv_heads);
+                        uint32_t cs = (uint32_t)(start_pos + chunk_start);
+                        float scale = 1.0f / sqrtf((float)cfg.head_dim);
+                        scale *= rope_yarn_attn_factor(g_rope_scale_factor);
+
+                        id<MTLComputeCommandEncoder> enc = [cmd_post computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_causal_attn];
+                        [enc setBuffer:g_metal->buf_pfb_out[3]   offset:0 atIndex:0];  // Q
+                        [enc setBuffer:g_metal->buf_kv_k[fa_idx] offset:0 atIndex:1];  // K_cache
+                        [enc setBuffer:g_metal->buf_kv_v[fa_idx] offset:0 atIndex:2];  // V_cache
+                        [enc setBuffer:g_metal->buf_pfb_out[4]   offset:0 atIndex:3];  // gate
+                        [enc setBuffer:g_metal->buf_pfb_out[5]   offset:0 atIndex:4];  // output
+                        [enc setBytes:&hd      length:4 atIndex:5];
+                        [enc setBytes:&kvd     length:4 atIndex:6];
+                        [enc setBytes:&nh      length:4 atIndex:7];
+                        [enc setBytes:&hpkv    length:4 atIndex:8];
+                        [enc setBytes:&cs      length:4 atIndex:9];
+                        [enc setBytes:&batch_n length:4 atIndex:10];
+                        [enc setBytes:&scale   length:4 atIndex:11];
+                        // Grid: [batch_n * num_heads, 1, 1], head_dim threads
+                        uint32_t num_tgs = batch_n * nh;
+                        uint32_t tg_sz = (cfg.head_dim <= 256) ? 256 : (uint32_t)cfg.head_dim;
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(tg_sz, 1, 1)];
+                        [enc endEncoding];
+                    }
+
+                    // ---- Blit: attn output (slot 5) -> buf_pfb_input for O proj GEMM ----
+                    {
+                        id<MTLBlitCommandEncoder> blit = [cmd_post blitCommandEncoder];
+                        size_t copy_size = (size_t)batch_n * q_dim * sizeof(float);
+                        [blit copyFromBuffer:g_metal->buf_pfb_out[5] sourceOffset:0
+                                    toBuffer:g_metal->buf_pfb_input destinationOffset:0
+                                        size:copy_size];
+                        [blit endEncoding];
+                    }
+
+                    // ---- O projection batched GEMM: buf_pfb_input -> slot 0 ----
+                    pfb_encode_gemm(g_metal, cmd_post,
+                                    lc->o_w, lc->o_s, lc->o_b,
+                                    (uint32_t)cfg.hidden_dim, (uint32_t)q_dim,
+                                    (uint32_t)cfg.group_size, 0, batch_n);
+
+                    // ---- Dispatch: prefill_residual_norm_bf16 ----
+                    // residual=slot 6, x=slot 0 (O proj), weight=post_attn_norm_w
+                    // -> out=slot 7 (normed/h_post), hidden=buf_pfb_input (h_mid)
+                    {
+                        id<MTLBuffer> panw_buf; NSUInteger panw_off;
+                        metal_find_chunk_sized(g_metal, lc->post_attn_norm_w,
+                            (size_t)cfg.hidden_dim * 2, &panw_buf, &panw_off);
+                        uint32_t dim = (uint32_t)cfg.hidden_dim;
+                        float eps = cfg.rms_norm_eps;
+
+                        id<MTLComputeCommandEncoder> enc = [cmd_post computeCommandEncoder];
+                        [enc setComputePipelineState:g_metal->pfb_residual_norm];
+                        [enc setBuffer:g_metal->buf_pfb_out[6]  offset:0       atIndex:0];  // residual
+                        [enc setBuffer:g_metal->buf_pfb_out[0]  offset:0       atIndex:1];  // x (O proj out)
+                        [enc setBuffer:panw_buf                 offset:panw_off atIndex:2];  // weight
+                        [enc setBuffer:g_metal->buf_pfb_out[7]  offset:0       atIndex:3];  // out (normed)
+                        [enc setBuffer:g_metal->buf_pfb_input   offset:0       atIndex:4];  // hidden (h_mid)
+                        [enc setBytes:&dim     length:4 atIndex:5];
+                        [enc setBytes:&eps     length:4 atIndex:6];
+                        [enc setBytes:&batch_n length:4 atIndex:7];
+                        // One threadgroup per token, 256 threads
+                        [enc dispatchThreadgroups:MTLSizeMake(batch_n, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc endEncoding];
+                    }
+
+                    [cmd_post commit];
+                    [cmd_post waitUntilCompleted];
+
+                    // ---- Read back h_post and h_mid, sync KV cache to CPU ----
+                    float *h_post_gpu = (float *)[g_metal->buf_pfb_out[7] contents];  // normed
+                    float *h_mid_gpu = (float *)[g_metal->buf_pfb_input contents];     // residual+oproj
+
+                    // Sync GPU KV cache back to CPU KV cache for the newly written positions
+                    KVCache *kv = kv_caches[layer];
+                    if (kv) {
+                        float *gpu_k = (float *)[g_metal->buf_kv_k[fa_idx] contents];
+                        float *gpu_v = (float *)[g_metal->buf_kv_v[fa_idx] contents];
+                        int cache_start = start_pos + chunk_start;
+                        for (int t = 0; t < chunk_n; t++) {
+                            int cache_pos = cache_start + t;
+                            if (cache_pos < kv->capacity) {
+                                if (!kv->use_fp8) {
+                                    memcpy(kv->k_cache + (size_t)cache_pos * kv_dim,
+                                           gpu_k + (size_t)cache_pos * kv_dim,
+                                           kv_dim * sizeof(float));
+                                    memcpy(kv->v_cache + (size_t)cache_pos * kv_dim,
+                                           gpu_v + (size_t)cache_pos * kv_dim,
+                                           kv_dim * sizeof(float));
+                                }
+                                // Note: FP8 KV cache not supported in GPU prefill path
+                            }
+                        }
+                        kv->len = cache_start + chunk_n;
+                    }
+
+                    // ---- Per-token: routing + expert I/O + combine via fused_layer_forward ----
+                    for (int t = 0; t < chunk_n; t++) {
+                        int global_t = chunk_start + t;
+                        int pos = start_pos + global_t;
+                        float *h = hidden_states + (size_t)global_t * cfg.hidden_dim;
+
+                        // h_post for this token (normed, for routing input)
+                        float *hp = h_post_gpu + (size_t)t * cfg.hidden_dim;
+                        // h_mid for this token (residual + O proj, for combine)
+                        float *hm = h_mid_gpu + (size_t)t * cfg.hidden_dim;
+
+                        // Set hidden = h_mid (fused_layer_forward reads/writes this)
+                        memcpy(token_hidden, hm, cfg.hidden_dim * sizeof(float));
+
+                        // Pre-fill scratch buffers for post-attn bypass
+                        memcpy(s_h_post, hp, cfg.hidden_dim * sizeof(float));
+                        memcpy(s_h_mid, hm, cfg.hidden_dim * sizeof(float));
+
+                        // Routing + shared expert projections (matvecs on h_post)
+                        memset(s_gate_scores, 0, cfg.num_experts * sizeof(float));
+                        memset(s_shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+                        memset(s_shared_up, 0, cfg.shared_intermediate * sizeof(float));
+                        g_pfb_shared_gate_score = 0.0f;
+
+                        BatchMatvecSpec moe_specs[4] = {
+                            { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,          (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                            { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,          (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                            { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,            (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                            { lc->seg_w,  lc->seg_s,  lc->seg_b,  &g_pfb_shared_gate_score, 1,                             cfg.hidden_dim, cfg.group_size, 3 },
+                        };
+                        fast_batch_matvec(hp, cfg.hidden_dim, moe_specs, 4);
+
+                        // Call fused_layer_forward in post-attn bypass mode
+                        // (skips norm, projections, attention, O proj, residual+norm;
+                        //  runs routing softmax + topK + expert I/O + combine)
+                        g_pfb_precomputed_post_attn = 1;
+                        fused_layer_forward(wf, layer, token_hidden,
+                                            kv_caches[layer], NULL,
+                                            pos, mmap_base,
+                                            K, layer_fds[layer]);
+                        g_pfb_precomputed_post_attn = 0;
+
+                        // Complete deferred expert work (synchronous for prefill)
+                        complete_deferred_experts();
+
+                        // Copy result back to hidden_states
+                        memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
+                    }
+
+                    continue;  // skip the per-token fallback below
+                }
+
                 // ---- Step 3: Read back normed input and projections, then per-token forward ----
+                // (Fallback for linear attention layers or when GPU post-projection unavailable)
                 float *normed_buf = (float *)[g_metal->buf_pfb_input contents];  // normed is now in pfb_input (after blit)
 
                 for (int t = 0; t < chunk_n; t++) {

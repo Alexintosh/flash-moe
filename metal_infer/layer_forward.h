@@ -1759,6 +1759,15 @@ static int    s_scratch_initialized = 0;
 // from the batched GEMM output before each per-token call.
 static int g_pfb_precomputed_qkv = 0;
 
+// ---- Batched prefill: pre-computed post-attention bypass ----
+// When g_pfb_precomputed_post_attn is non-zero, fused_layer_forward skips
+// norm, projections, attention, O proj, residual, norm, and routing projections.
+// The caller must pre-fill: hidden (=h_mid), s_h_post, s_h_mid,
+// s_gate_scores, s_shared_gate, s_shared_up, and g_pfb_shared_gate_score.
+// Execution starts at softmax + topK + expert I/O.
+static int g_pfb_precomputed_post_attn = 0;
+static float g_pfb_shared_gate_score = 0.0f;
+
 static int init_layer_scratch(void) {
     if (s_scratch_initialized) return 0;  // already initialized
 
@@ -1859,6 +1868,167 @@ static void fused_layer_forward(
     if (!layer_cache_built) build_layer_cache(wf);
     LayerWeightCache *lc = &layer_cache[layer_idx];
     int is_full = (kv != NULL);
+
+    // ---- Batched prefill: post-attention bypass ----
+    // GPU post-projection has already computed attention, O proj, residual + norm.
+    // The caller pre-filled s_h_post, s_h_mid, s_gate_scores, s_shared_gate,
+    // s_shared_up, g_pfb_shared_gate_score, and hidden (=h_mid).
+    // Jump directly to routing softmax + topK + expert I/O + combine.
+    if (g_pfb_precomputed_post_attn) {
+        // Complete any deferred experts from previous layer
+        complete_deferred_experts();
+
+        // Set up variables expected by the routing + expert phase
+        float *h_post = s_h_post;
+        float *h_mid = s_h_mid;
+        float *gate_scores = s_gate_scores;
+        float *shared_gate = s_shared_gate;
+        float *shared_up = s_shared_up;
+        float shared_gate_score = g_pfb_shared_gate_score;
+        uint32_t *sdw = lc->sd_w; uint16_t *sds = lc->sd_s, *sdb = lc->sd_b;
+
+        // Softmax + top-K routing
+        cpu_softmax(gate_scores, cfg.num_experts);
+        int expert_indices[64];
+        float expert_weights[64];
+        cpu_topk(gate_scores, cfg.num_experts, K, expert_indices, expert_weights);
+        cpu_normalize_weights(expert_weights, K);
+
+        // Expert I/O + compute + combine (synchronous path for prefill)
+        float *moe_out = s_moe_out;
+        memset(moe_out, 0, cfg.hidden_dim * sizeof(float));
+        float *shared_out = s_shared_out;
+        memset(shared_out, 0, cfg.hidden_dim * sizeof(float));
+        int actual_K = (K > MAX_K) ? MAX_K : K;
+
+        if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
+            // GPU multi-expert path: parallel pread + batched GPU dispatch
+            int valid[MAX_K];
+            id<MTLBuffer> expert_bufs[MAX_K];
+
+            // Parallel pread into multi-expert buffers
+            InferPreadTask tasks[MAX_K];
+            for (int k = 0; k < actual_K; k++) {
+                off_t eoff; size_t esz;
+                expert_offset_size(layer_idx, expert_indices[k], &eoff, &esz);
+                tasks[k].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
+                tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
+                tasks[k].offset = eoff;
+                tasks[k].size = esz;
+                tasks[k].result = 0;
+                tasks[k].mmap_base = mmap_base;
+                tasks[k].lz4_comp_buf = NULL;
+                tasks[k].lz4_comp_size = 0;
+                expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+            }
+            io_pool_dispatch(tasks, actual_K);
+            for (int k = 0; k < actual_K; k++) {
+                valid[k] = (tasks[k].result == (ssize_t)tasks[k].size);
+            }
+
+            // GPU dispatch: experts + shared SwiGLU + down_proj + combine
+            memcpy([g_metal->buf_multi_expert_input contents], h_post, cfg.hidden_dim * sizeof(float));
+            memcpy([g_metal->buf_shared_gate contents], shared_gate,
+                   cfg.shared_intermediate * sizeof(float));
+            memcpy([g_metal->buf_shared_up contents], shared_up,
+                   cfg.shared_intermediate * sizeof(float));
+
+            id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
+            gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs,
+                                       layer_idx, expert_indices);
+
+            // Shared SwiGLU
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->swiglu];
+                [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
+                uint32_t dim = cfg.shared_intermediate;
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t swiglu_tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // Shared down_proj
+            if (sdw && sds && sdb) {
+                gpu_encode_dequant_matvec_with_io_bufs(
+                    g_metal, cmd_experts, sdw, sds, sdb,
+                    g_metal->buf_shared_act, g_metal->buf_shared_out,
+                    cfg.hidden_dim, cfg.shared_intermediate, cfg.group_size);
+            }
+
+            [cmd_experts commit];
+            [cmd_experts waitUntilCompleted];
+
+            // Read back expert results
+            for (int k = 0; k < actual_K; k++) {
+                if (!valid[k]) continue;
+                float *expert_result = (float *)[g_metal->buf_multi_expert_out[k] contents];
+                cpu_vec_madd(moe_out, expert_result, expert_weights[k], cfg.hidden_dim);
+            }
+            memcpy(shared_out, [g_metal->buf_shared_out contents], cfg.hidden_dim * sizeof(float));
+
+        } else if (packed_fd >= 0) {
+            // CPU fallback for experts
+            float *expert_out_cpu = s_expert_out_cpu;
+            for (int k = 0; k < K; k++) {
+                int eidx = expert_indices[k];
+                off_t expert_offset; size_t esz;
+                expert_offset_size(layer_idx, eidx, &expert_offset, &esz);
+                void *expert_data = malloc(esz);
+                if (!expert_data) continue;
+                ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
+                if (nread != (ssize_t)esz) { free(expert_data); continue; }
+
+                int use_2bit_k = g_use_2bit;
+                if (g_use_tiered && g_tiered_manifest)
+                    use_2bit_k = (TIERED(layer_idx, eidx).bits == 2);
+                uint32_t *gw = (uint32_t *)expert_data;
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.gate_s_off_2 : cfg.gate_s_off_4));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.gate_b_off_2 : cfg.gate_b_off_4));
+                uint32_t *uw = (uint32_t *)((char *)expert_data + (use_2bit_k ? cfg.up_w_off_2 : cfg.up_w_off_4));
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.up_s_off_2 : cfg.up_s_off_4));
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.up_b_off_2 : cfg.up_b_off_4));
+                uint32_t *dw_p = (uint32_t *)((char *)expert_data + (use_2bit_k ? cfg.down_w_off_2 : cfg.down_w_off_4));
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.down_s_off_2 : cfg.down_s_off_4));
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + (use_2bit_k ? cfg.down_b_off_2 : cfg.down_b_off_4));
+
+                cpu_dequant_matvec(gw, gs_p, gb_p, h_post, s_gate_proj_out,
+                                   cfg.moe_intermediate, cfg.hidden_dim, cfg.group_size);
+                cpu_dequant_matvec(uw, us_p, ub_p, h_post, s_up_proj_out,
+                                   cfg.moe_intermediate, cfg.hidden_dim, cfg.group_size);
+                cpu_swiglu(s_gate_proj_out, s_up_proj_out, s_act_out, cfg.moe_intermediate);
+                cpu_dequant_matvec(dw_p, ds_p, db_p, s_act_out, expert_out_cpu,
+                                   cfg.hidden_dim, cfg.moe_intermediate, cfg.group_size);
+                free(expert_data);
+                cpu_vec_madd(moe_out, expert_out_cpu, expert_weights[k], cfg.hidden_dim);
+            }
+
+            // CPU shared expert
+            memset(s_shared_act, 0, cfg.shared_intermediate * sizeof(float));
+            cpu_swiglu(shared_gate, shared_up, s_shared_act, cfg.shared_intermediate);
+            if (sdw && sds && sdb) {
+                cpu_dequant_matvec(sdw, sds, sdb, s_shared_act, shared_out,
+                                   cfg.hidden_dim, cfg.shared_intermediate, cfg.group_size);
+            }
+        }
+
+        // Shared expert gate
+        float shared_weight = cpu_sigmoid(shared_gate_score);
+        for (int i = 0; i < cfg.hidden_dim; i++) {
+            shared_out[i] *= shared_weight;
+        }
+
+        // Final combine: hidden = h_mid + moe_out + shared_out
+        for (int i = 0; i < cfg.hidden_dim; i++) {
+            hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
+        }
+
+        return;
+    }
 
     // =====================================================================
     // PHASE 1: Deferred completion + CMD1 (attention projections)
