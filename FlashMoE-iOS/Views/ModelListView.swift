@@ -362,16 +362,21 @@ struct ModelListView: View {
                 }
 
                 // Reload button — applies all settings changes by unloading and reloading
-                if engine.state == .ready, let model = selectedModel {
+                if engine.state == .ready {
+                    let modelName = engine.modelInfo?.name ?? ""
                     Button {
-                        Task {
-                            engine.unloadModel()
-                            try? await Task.sleep(for: .milliseconds(200))
-                            loadModel(model)
+                        if let model = selectedModel ?? localModels.first(where: { modelName.contains($0.name) || $0.name.contains(modelName) }) {
+                            Task {
+                                engine.unloadModel()
+                                try? await Task.sleep(for: .milliseconds(300))
+                                loadModel(model)
+                            }
                         }
                     } label: {
-                        Label("Reload Model with Current Settings", systemImage: "arrow.clockwise")
+                        Label("Reload Model", systemImage: "arrow.clockwise")
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(.borderedProminent)
                     .tint(.orange)
                 }
             }
