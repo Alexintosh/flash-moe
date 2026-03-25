@@ -99,6 +99,214 @@ static void pfb_encode_rms_norm(
 }
 
 // ============================================================================
+// Helper: batched shared expert — replaces per-token shared expert projections
+// ============================================================================
+// Given h_post in buf_pfb_out[7] and h_mid in buf_pfb_input, this function:
+//   1. Saves h_mid to buf_pfb_out[6]
+//   2. Runs batched GEMMs for shared gate/up/expert_gate/routing on h_post
+//   3. Runs prefill_swiglu on shared gate/up
+//   4. Runs batched GEMM for shared down projection
+//   5. Per-token: reads routing gate from GPU, runs softmax+topK, expert I/O,
+//      then combines via fused_layer_forward in post-attn bypass mode
+//
+// Buffer assignments during this function:
+//   slot 0: shared_gate [N, shared_intermediate], then reused
+//   slot 1: shared_up [N, shared_intermediate]
+//   slot 2: shared_expert_gate [N, 1]
+//   slot 3: routing_gate [N, num_experts]
+//   slot 4: swiglu output [N, shared_intermediate]
+//   slot 5: shared_down output [N, hidden_dim]
+//   slot 6: h_mid saved [N, hidden_dim]
+//   slot 7: h_post [N, hidden_dim] (input)
+
+static void pfb_batched_shared_expert(
+    WeightFile *wf,
+    int layer,
+    LayerWeightCache *lc,
+    float *hidden_states,   // [num_tokens, hidden_dim]
+    float *token_hidden,    // single-token buffer
+    int chunk_start,
+    int chunk_n,
+    uint32_t batch_n,
+    int start_pos,
+    const void *mmap_base,
+    int K,
+    int *layer_fds,
+    KVCache **kv_caches,
+    void **layer_states
+) {
+    int is_full = cfg.is_full_attn[layer];
+
+    // ---- Save h_mid (buf_pfb_input) -> slot 6, copy h_post (slot 7) -> buf_pfb_input ----
+    {
+        id<MTLCommandBuffer> cmd_blit = [g_metal->queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cmd_blit blitCommandEncoder];
+        size_t hidden_copy = (size_t)batch_n * cfg.hidden_dim * sizeof(float);
+        // Save h_mid
+        [blit copyFromBuffer:g_metal->buf_pfb_input sourceOffset:0
+                    toBuffer:g_metal->buf_pfb_out[6] destinationOffset:0
+                        size:hidden_copy];
+        // Copy h_post for GEMM input
+        [blit copyFromBuffer:g_metal->buf_pfb_out[7] sourceOffset:0
+                    toBuffer:g_metal->buf_pfb_input destinationOffset:0
+                        size:hidden_copy];
+        [blit endEncoding];
+        [cmd_blit commit];
+        [cmd_blit waitUntilCompleted];
+    }
+
+    // ---- Batched GEMM: shared gate/up/expert_gate/routing on h_post ----
+    {
+        id<MTLCommandBuffer> cmd_shared = [g_metal->queue commandBuffer];
+        metal_staging_reset(g_metal);
+
+        // Shared gate_proj -> slot 0
+        pfb_encode_gemm(g_metal, cmd_shared,
+                        lc->sg_w, lc->sg_s, lc->sg_b,
+                        (uint32_t)cfg.shared_intermediate, (uint32_t)cfg.hidden_dim,
+                        (uint32_t)cfg.group_size, 0, batch_n);
+        // Shared up_proj -> slot 1
+        pfb_encode_gemm(g_metal, cmd_shared,
+                        lc->su_w, lc->su_s, lc->su_b,
+                        (uint32_t)cfg.shared_intermediate, (uint32_t)cfg.hidden_dim,
+                        (uint32_t)cfg.group_size, 1, batch_n);
+        // Shared expert gate -> slot 2 (output dim = 1)
+        pfb_encode_gemm(g_metal, cmd_shared,
+                        lc->seg_w, lc->seg_s, lc->seg_b,
+                        1, (uint32_t)cfg.hidden_dim,
+                        (uint32_t)cfg.group_size, 2, batch_n);
+        // Routing gate -> slot 3
+        pfb_encode_gemm(g_metal, cmd_shared,
+                        lc->gate_w, lc->gate_s, lc->gate_b,
+                        (uint32_t)cfg.num_experts, (uint32_t)cfg.hidden_dim,
+                        (uint32_t)cfg.group_size, 3, batch_n);
+
+        // Dispatch prefill_swiglu: gate(slot 0) + up(slot 1) -> slot 4
+        {
+            uint32_t total_elems = batch_n * (uint32_t)cfg.shared_intermediate;
+            id<MTLComputeCommandEncoder> enc = [cmd_shared computeCommandEncoder];
+            [enc setComputePipelineState:g_metal->pfb_swiglu];
+            [enc setBuffer:g_metal->buf_pfb_out[0]  offset:0 atIndex:0];  // gate
+            [enc setBuffer:g_metal->buf_pfb_out[1]  offset:0 atIndex:1];  // up
+            [enc setBuffer:g_metal->buf_pfb_out[4]  offset:0 atIndex:2];  // swiglu out
+            [enc setBytes:&total_elems length:4 atIndex:3];
+            uint32_t tgs = (total_elems + 255) / 256;
+            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        [cmd_shared commit];
+        [cmd_shared waitUntilCompleted];
+    }
+
+    // ---- Batched GEMM: shared down_proj (swiglu output -> shared_out) ----
+    {
+        // Copy swiglu output (slot 4) -> buf_pfb_input for GEMM
+        id<MTLCommandBuffer> cmd_down = [g_metal->queue commandBuffer];
+        {
+            id<MTLBlitCommandEncoder> blit = [cmd_down blitCommandEncoder];
+            size_t copy_size = (size_t)batch_n * cfg.shared_intermediate * sizeof(float);
+            [blit copyFromBuffer:g_metal->buf_pfb_out[4] sourceOffset:0
+                        toBuffer:g_metal->buf_pfb_input destinationOffset:0
+                            size:copy_size];
+            [blit endEncoding];
+        }
+
+        metal_staging_reset(g_metal);
+
+        // Shared down_proj -> slot 5
+        pfb_encode_gemm(g_metal, cmd_down,
+                        lc->sd_w, lc->sd_s, lc->sd_b,
+                        (uint32_t)cfg.hidden_dim, (uint32_t)cfg.shared_intermediate,
+                        (uint32_t)cfg.group_size, 5, batch_n);
+
+        [cmd_down commit];
+        [cmd_down waitUntilCompleted];
+    }
+
+    // ---- Per-token: routing softmax + topK + expert I/O + combine ----
+    // h_mid: slot 6 [N, hidden_dim]
+    // shared_out: slot 5 [N, hidden_dim]
+    // routing_gate: slot 3 [N, num_experts]
+    // expert_gate_score: slot 2 [N, 1]
+    float *h_mid_buf = (float *)[g_metal->buf_pfb_out[6] contents];
+    float *shared_out_buf = (float *)[g_metal->buf_pfb_out[5] contents];
+    float *routing_buf = (float *)[g_metal->buf_pfb_out[3] contents];
+    float *expert_gate_buf = (float *)[g_metal->buf_pfb_out[2] contents];
+    float *h_post_buf = (float *)[g_metal->buf_pfb_out[7] contents];
+
+    int packed_fd = layer_fds[layer];
+
+    for (int t = 0; t < chunk_n; t++) {
+        int global_t = chunk_start + t;
+        int pos = start_pos + global_t;
+        float *h = hidden_states + (size_t)global_t * cfg.hidden_dim;
+
+        float *hp = h_post_buf + (size_t)t * cfg.hidden_dim;
+        float *hm = h_mid_buf + (size_t)t * cfg.hidden_dim;
+        float *so = shared_out_buf + (size_t)t * cfg.hidden_dim;
+
+        // Routing: softmax + topK on pre-computed gate scores
+        float *gate_scores_t = routing_buf + (size_t)t * cfg.num_experts;
+        cpu_softmax(gate_scores_t, cfg.num_experts);
+        int expert_indices[64];
+        float expert_weights[64];
+        cpu_topk(gate_scores_t, cfg.num_experts, K, expert_indices, expert_weights);
+        cpu_normalize_weights(expert_weights, K);
+
+        // Routed expert I/O + compute
+        float *moe_out = s_moe_out;
+        memset(moe_out, 0, cfg.hidden_dim * sizeof(float));
+        int actual_K = (K > MAX_K) ? MAX_K : K;
+
+        if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
+            int valid[MAX_K];
+            id<MTLBuffer> expert_bufs[MAX_K];
+
+            InferPreadTask tasks[MAX_K];
+            for (int k = 0; k < actual_K; k++) {
+                off_t eoff; size_t esz;
+                expert_offset_size(layer, expert_indices[k], &eoff, &esz);
+                tasks[k].fd = expert_pick_fd(layer, expert_indices[k], packed_fd);
+                tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
+                tasks[k].offset = eoff;
+                tasks[k].size = esz;
+                tasks[k].result = 0;
+                tasks[k].mmap_base = mmap_base;
+                tasks[k].lz4_comp_buf = NULL;
+                tasks[k].lz4_comp_size = 0;
+                expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+            }
+            io_pool_dispatch(tasks, actual_K);
+            for (int k = 0; k < actual_K; k++) {
+                valid[k] = (tasks[k].result == (ssize_t)tasks[k].size);
+            }
+
+            // GPU expert dispatch
+            memcpy([g_metal->buf_multi_expert_input contents], hp, cfg.hidden_dim * sizeof(float));
+            id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
+            gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs,
+                                       layer, expert_indices);
+            [cmd_experts commit];
+            [cmd_experts waitUntilCompleted];
+
+            for (int k = 0; k < actual_K; k++) {
+                if (!valid[k]) continue;
+                float *expert_result = (float *)[g_metal->buf_multi_expert_out[k] contents];
+                cpu_vec_madd(moe_out, expert_result, expert_weights[k], cfg.hidden_dim);
+            }
+        }
+
+        // Final combine: hidden = h_mid + moe_out + sigmoid(expert_gate) * shared_out
+        float shared_weight = cpu_sigmoid(expert_gate_buf[t]);
+        for (int i = 0; i < cfg.hidden_dim; i++) {
+            h[i] = hm[i] + moe_out[i] + shared_weight * so[i];
+        }
+    }
+}
+
+// ============================================================================
 // Batched prefill entry point (v2 — layer-first with batched GEMM)
 // ============================================================================
 // Processes tokens [0, num_tokens-1] through all layers in layer-first order.
@@ -520,53 +728,49 @@ static int batched_prefill(
                         kv->len = cache_start + chunk_n;
                     }
 
-                    // ---- Per-token: routing + expert I/O + combine via fused_layer_forward ----
-                    for (int t = 0; t < chunk_n; t++) {
-                        int global_t = chunk_start + t;
-                        int pos = start_pos + global_t;
-                        float *h = hidden_states + (size_t)global_t * cfg.hidden_dim;
+                    // ---- Batched shared expert + per-token routed experts ----
+                    // h_post is in slot 7, h_mid is in buf_pfb_input after residual_norm
+                    if (lc->sg_w && lc->su_w && lc->seg_w && lc->gate_w && lc->sd_w &&
+                        g_metal->pfb_swiglu) {
+                        pfb_batched_shared_expert(wf, layer, lc, hidden_states, token_hidden,
+                                                  chunk_start, chunk_n, batch_n, start_pos,
+                                                  mmap_base, K, layer_fds, kv_caches, layer_states);
+                    } else {
+                        // Fallback: per-token routing + shared expert via fused_layer_forward
+                        for (int t = 0; t < chunk_n; t++) {
+                            int global_t = chunk_start + t;
+                            int pos = start_pos + global_t;
+                            float *h = hidden_states + (size_t)global_t * cfg.hidden_dim;
+                            float *hp = h_post_gpu + (size_t)t * cfg.hidden_dim;
+                            float *hm = h_mid_gpu + (size_t)t * cfg.hidden_dim;
 
-                        // h_post for this token (normed, for routing input)
-                        float *hp = h_post_gpu + (size_t)t * cfg.hidden_dim;
-                        // h_mid for this token (residual + O proj, for combine)
-                        float *hm = h_mid_gpu + (size_t)t * cfg.hidden_dim;
+                            memcpy(token_hidden, hm, cfg.hidden_dim * sizeof(float));
+                            memcpy(s_h_post, hp, cfg.hidden_dim * sizeof(float));
+                            memcpy(s_h_mid, hm, cfg.hidden_dim * sizeof(float));
 
-                        // Set hidden = h_mid (fused_layer_forward reads/writes this)
-                        memcpy(token_hidden, hm, cfg.hidden_dim * sizeof(float));
+                            memset(s_gate_scores, 0, cfg.num_experts * sizeof(float));
+                            memset(s_shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+                            memset(s_shared_up, 0, cfg.shared_intermediate * sizeof(float));
+                            g_pfb_shared_gate_score = 0.0f;
 
-                        // Pre-fill scratch buffers for post-attn bypass
-                        memcpy(s_h_post, hp, cfg.hidden_dim * sizeof(float));
-                        memcpy(s_h_mid, hm, cfg.hidden_dim * sizeof(float));
+                            BatchMatvecSpec moe_specs[4] = {
+                                { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,          (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                                { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,          (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                                { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,            (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                                { lc->seg_w,  lc->seg_s,  lc->seg_b,  &g_pfb_shared_gate_score, 1,                             cfg.hidden_dim, cfg.group_size, 3 },
+                            };
+                            fast_batch_matvec(hp, cfg.hidden_dim, moe_specs, 4);
 
-                        // Routing + shared expert projections (matvecs on h_post)
-                        memset(s_gate_scores, 0, cfg.num_experts * sizeof(float));
-                        memset(s_shared_gate, 0, cfg.shared_intermediate * sizeof(float));
-                        memset(s_shared_up, 0, cfg.shared_intermediate * sizeof(float));
-                        g_pfb_shared_gate_score = 0.0f;
+                            g_pfb_precomputed_post_attn = 1;
+                            fused_layer_forward(wf, layer, token_hidden,
+                                                kv_caches[layer], NULL,
+                                                pos, mmap_base,
+                                                K, layer_fds[layer]);
+                            g_pfb_precomputed_post_attn = 0;
 
-                        BatchMatvecSpec moe_specs[4] = {
-                            { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,          (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
-                            { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,          (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
-                            { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,            (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
-                            { lc->seg_w,  lc->seg_s,  lc->seg_b,  &g_pfb_shared_gate_score, 1,                             cfg.hidden_dim, cfg.group_size, 3 },
-                        };
-                        fast_batch_matvec(hp, cfg.hidden_dim, moe_specs, 4);
-
-                        // Call fused_layer_forward in post-attn bypass mode
-                        // (skips norm, projections, attention, O proj, residual+norm;
-                        //  runs routing softmax + topK + expert I/O + combine)
-                        g_pfb_precomputed_post_attn = 1;
-                        fused_layer_forward(wf, layer, token_hidden,
-                                            kv_caches[layer], NULL,
-                                            pos, mmap_base,
-                                            K, layer_fds[layer]);
-                        g_pfb_precomputed_post_attn = 0;
-
-                        // Complete deferred expert work (synchronous for prefill)
-                        complete_deferred_experts();
-
-                        // Copy result back to hidden_states
-                        memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
+                            complete_deferred_experts();
+                            memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
+                        }
                     }
 
                     continue;  // skip the per-token fallback below
@@ -821,42 +1025,48 @@ static int batched_prefill(
                         }
                     }
 
-                    // ---- Per-token: routing + expert I/O + combine ----
-                    for (int t = 0; t < chunk_n; t++) {
-                        int global_t = chunk_start + t;
-                        int pos = start_pos + global_t;
-                        float *h = hidden_states + (size_t)global_t * cfg.hidden_dim;
+                    // ---- Batched shared expert + per-token routed experts ----
+                    if (lc->sg_w && lc->su_w && lc->seg_w && lc->gate_w && lc->sd_w &&
+                        g_metal->pfb_swiglu) {
+                        pfb_batched_shared_expert(wf, layer, lc, hidden_states, token_hidden,
+                                                  chunk_start, chunk_n, batch_n, start_pos,
+                                                  mmap_base, K, layer_fds, kv_caches, layer_states);
+                    } else {
+                        // Fallback: per-token routing + shared expert via fused_layer_forward
+                        for (int t = 0; t < chunk_n; t++) {
+                            int global_t = chunk_start + t;
+                            int pos = start_pos + global_t;
+                            float *h = hidden_states + (size_t)global_t * cfg.hidden_dim;
+                            float *hp = h_post_gpu + (size_t)t * cfg.hidden_dim;
+                            float *hm = h_mid_gpu + (size_t)t * cfg.hidden_dim;
 
-                        float *hp = h_post_gpu + (size_t)t * cfg.hidden_dim;
-                        float *hm = h_mid_gpu + (size_t)t * cfg.hidden_dim;
+                            memcpy(token_hidden, hm, cfg.hidden_dim * sizeof(float));
+                            memcpy(s_h_post, hp, cfg.hidden_dim * sizeof(float));
+                            memcpy(s_h_mid, hm, cfg.hidden_dim * sizeof(float));
 
-                        memcpy(token_hidden, hm, cfg.hidden_dim * sizeof(float));
-                        memcpy(s_h_post, hp, cfg.hidden_dim * sizeof(float));
-                        memcpy(s_h_mid, hm, cfg.hidden_dim * sizeof(float));
+                            memset(s_gate_scores, 0, cfg.num_experts * sizeof(float));
+                            memset(s_shared_gate, 0, cfg.shared_intermediate * sizeof(float));
+                            memset(s_shared_up, 0, cfg.shared_intermediate * sizeof(float));
+                            g_pfb_shared_gate_score = 0.0f;
 
-                        // Routing + shared expert projections (matvecs on h_post)
-                        memset(s_gate_scores, 0, cfg.num_experts * sizeof(float));
-                        memset(s_shared_gate, 0, cfg.shared_intermediate * sizeof(float));
-                        memset(s_shared_up, 0, cfg.shared_intermediate * sizeof(float));
-                        g_pfb_shared_gate_score = 0.0f;
+                            BatchMatvecSpec moe_specs[4] = {
+                                { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,            (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
+                                { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,            (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
+                                { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,              (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
+                                { lc->seg_w,  lc->seg_s,  lc->seg_b,  &g_pfb_shared_gate_score, 1,                               cfg.hidden_dim, cfg.group_size, 3 },
+                            };
+                            fast_batch_matvec(hp, cfg.hidden_dim, moe_specs, 4);
 
-                        BatchMatvecSpec moe_specs[4] = {
-                            { lc->gate_w, lc->gate_s, lc->gate_b, s_gate_scores,            (uint32_t)cfg.num_experts,         cfg.hidden_dim, cfg.group_size, 0 },
-                            { lc->sg_w,   lc->sg_s,   lc->sg_b,   s_shared_gate,            (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 1 },
-                            { lc->su_w,   lc->su_s,   lc->su_b,   s_shared_up,              (uint32_t)cfg.shared_intermediate, cfg.hidden_dim, cfg.group_size, 2 },
-                            { lc->seg_w,  lc->seg_s,  lc->seg_b,  &g_pfb_shared_gate_score, 1,                               cfg.hidden_dim, cfg.group_size, 3 },
-                        };
-                        fast_batch_matvec(hp, cfg.hidden_dim, moe_specs, 4);
+                            g_pfb_precomputed_post_attn = 1;
+                            fused_layer_forward(wf, layer, token_hidden,
+                                                NULL, (LinearAttnState *)layer_states[layer],
+                                                pos, mmap_base,
+                                                K, layer_fds[layer]);
+                            g_pfb_precomputed_post_attn = 0;
 
-                        g_pfb_precomputed_post_attn = 1;
-                        fused_layer_forward(wf, layer, token_hidden,
-                                            NULL, (LinearAttnState *)layer_states[layer],
-                                            pos, mmap_base,
-                                            K, layer_fds[layer]);
-                        g_pfb_precomputed_post_attn = 0;
-
-                        complete_deferred_experts();
-                        memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
+                            complete_deferred_experts();
+                            memcpy(h, token_hidden, cfg.hidden_dim * sizeof(float));
+                        }
                     }
 
                     continue;  // skip the per-token fallback below
