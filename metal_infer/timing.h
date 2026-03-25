@@ -77,7 +77,7 @@ static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // >1: split each routed expert pread into N page-aligned chunks (fanout)
 static int g_cmd_merge_enabled = 1; // 1: merge CMD1+CMD2 for linear attention (saves ~2ms/token), 0: separate
 static int g_fused_attention_enabled = 0; // 1: fused online softmax attention (experimental), 0: 3-kernel fallback
-static int g_fused_expert_enabled = 1;   // 1: fused gate+up+SwiGLU kernel (default ON), 0: separate dispatches
+static int g_fused_expert_enabled = 0;   // 1: fused gate+up+SwiGLU kernel (experimental), 0: separate dispatches (default, proven correct)
 static int g_use_fp16_accum = 0;         // 1: use half-precision accumulation in dequant kernels (experimental)
 static int g_sliding_window = 0;         // >0: sliding window size for full attention KV cache (circular buffer)
 static int g_h2o_budget = 0;             // 0 = disabled, >0 = total H2O KV cache budget (sinks + recent + heavy hitters)
