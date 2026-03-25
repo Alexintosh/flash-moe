@@ -269,7 +269,11 @@ struct ChatView: View {
             }
         }
 
-        prompt += "<|im_start|>assistant\n"
+        // Qwen3.5 ALWAYS expects <think> after assistant start tag.
+        // Without it, the model emits EOS immediately. The /no_think
+        // instruction in the system prompt makes thinking brief, but
+        // the tag must be present for the model to generate anything.
+        prompt += "<|im_start|>assistant\n<think>\n"
         return prompt
     }
 }
