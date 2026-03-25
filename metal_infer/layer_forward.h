@@ -2242,7 +2242,25 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
 
         // normed and residual already set by caller — skip input norm and CMD1.
-        // cmd1 stays nil. Q/K/V results are already in s_q_proj_out etc.
+        // cmd1 stays nil, num_attn_specs stays set but we skip dispatch.
+        // The Q/K/V results are already in s_q_proj_out, s_k_proj_out, s_v_proj_out.
+        if (g_timing_enabled) { t0 = now_ms(); t1 = t0; }
+    } else if (g_pfb_precomputed_qkv && !is_full) {
+        // ---- BATCHED PREFILL PATH (LINEAR ATTENTION): projections already computed ----
+        // s_normed, s_residual are pre-filled by batched_prefill.h.
+        // s_qkv_proj_out, s_z_proj_out, s_beta_proj_out, s_alpha_proj_out contain
+        // the batched GEMM results for this token. Skip norm + CMD1 projection dispatch.
+        // The sequential part (conv1d, delta-net, gated_rms_norm) runs per-token below.
+        if (g_timing_enabled) { t0 = now_ms(); }
+        wait_deferred_experts_gpu();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_wait += t1 - t0; }
+
+        if (g_timing_enabled) { t0 = now_ms(); }
+        finalize_deferred_experts();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
+
+        // normed and residual already set by caller — skip input norm and CMD1.
+        // cmd1 stays nil. QKV/Z/beta/alpha results are in s_*_proj_out buffers.
         if (g_timing_enabled) { t0 = now_ms(); t1 = t0; }
     } else {
         // ---- ORIGINAL PATH: CPU deferred completion + input norm ----
