@@ -153,7 +153,7 @@ static int batched_prefill(
     int *layer_fds,
     void **layer_mmaps,
     KVCache **kv_caches,
-    void **layer_states __attribute__((unused))
+    void **layer_states
 ) {
     MetalCtx *ctx = g_metal;
     if (!ctx || !ctx->pfb_gemm_4bit || g_prefill_batch <= 1) {
@@ -807,6 +807,80 @@ static int batched_prefill(
         float *tmp = hidden_A;
         hidden_A = hidden_B;
         hidden_B = tmp;
+    }
+
+    // ================================================================
+    // Post-processing: sync GPU state back to CPU for fallback paths
+    // ================================================================
+    // The batched path writes KV cache, conv1d state, and delta-net state
+    // to GPU Metal buffers only. The per-token fused_layer_forward may
+    // use CPU fallback paths that read from CPU-side arrays (kv->k_cache,
+    // la_state->conv_state, la_state->ssm_state). Sync GPU -> CPU here
+    // so both paths see consistent state.
+
+    // 1. Sync GPU KV cache -> CPU KV cache for all full attention layers
+    {
+        uint32_t kv_dim_sync = num_kv_heads * head_dim;
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (!cfg.is_full_attn[layer]) continue;
+            KVCache *kv = kv_caches[layer];
+            if (!kv) continue;
+            int fa_idx = cfg.full_attn_index[layer];
+            if (fa_idx < 0 || fa_idx >= cfg.num_full_attn_layers) continue;
+            // Sync the positions written by batched_prefill: [start_pos, start_pos + num_tokens)
+            // Note: kv->len was already incremented per-chunk in the layer loop above.
+            int sync_start = start_pos;
+            int sync_end = start_pos + num_tokens;
+            if (sync_end > kv->capacity) sync_end = kv->capacity;
+            int sync_count = sync_end - sync_start;
+            if (sync_count <= 0) continue;
+
+            if (kv->use_fp8 && kv->k_cache_fp8 && kv->v_cache_fp8 && kv->k_scales && kv->v_scales) {
+                // GPU cache is float, CPU cache is FP8: quantize per-position
+                float *gpu_k = (float *)[ctx->buf_kv_k[fa_idx] contents];
+                float *gpu_v = (float *)[ctx->buf_kv_v[fa_idx] contents];
+                for (int p = sync_start; p < sync_end; p++) {
+                    kv->k_scales[p] = fp8_encode_vec(
+                        gpu_k + (size_t)p * kv_dim_sync,
+                        kv->k_cache_fp8 + (size_t)p * kv_dim_sync,
+                        kv_dim_sync);
+                    kv->v_scales[p] = fp8_encode_vec(
+                        gpu_v + (size_t)p * kv_dim_sync,
+                        kv->v_cache_fp8 + (size_t)p * kv_dim_sync,
+                        kv_dim_sync);
+                }
+            } else if (!kv->use_fp8 && kv->k_cache && kv->v_cache) {
+                // Both GPU and CPU are float: direct memcpy
+                size_t byte_len = (size_t)sync_count * kv_dim_sync * sizeof(float);
+                memcpy(kv->k_cache + (size_t)sync_start * kv_dim_sync,
+                       (float *)[ctx->buf_kv_k[fa_idx] contents] + (size_t)sync_start * kv_dim_sync,
+                       byte_len);
+                memcpy(kv->v_cache + (size_t)sync_start * kv_dim_sync,
+                       (float *)[ctx->buf_kv_v[fa_idx] contents] + (size_t)sync_start * kv_dim_sync,
+                       byte_len);
+            }
+        }
+    }
+
+    // 2. Sync GPU conv1d state + delta-net state -> CPU LinearAttnState
+    {
+        size_t conv_state_size = (cfg.conv_kernel_size - 1) * (size_t)cfg.linear_conv_dim * sizeof(float);
+        size_t delta_state_size = (size_t)cfg.linear_num_v_heads * cfg.linear_value_dim * cfg.linear_key_dim * sizeof(float);
+        for (int layer = 0; layer < cfg.num_layers; layer++) {
+            if (cfg.is_full_attn[layer]) continue;
+            int li = cfg.linear_index[layer];
+            if (li < 0 || li >= cfg.num_linear_layers) continue;
+            LinearAttnState *la = layer_states ? (LinearAttnState *)layer_states[layer] : NULL;
+            if (!la) continue;
+            // Sync conv1d state
+            if (la->conv_state && ctx->buf_conv_state[li]) {
+                memcpy(la->conv_state, [ctx->buf_conv_state[li] contents], conv_state_size);
+            }
+            // Sync delta-net (SSM) state
+            if (la->ssm_state && ctx->buf_delta_state[li]) {
+                memcpy(la->ssm_state, [ctx->buf_delta_state[li] contents], delta_state_size);
+            }
+        }
     }
 
     free(hidden_A);
