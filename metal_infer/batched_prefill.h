@@ -247,20 +247,22 @@ static void pfb_batched_shared_expert(
         float *hm = h_mid_buf + (size_t)t * cfg.hidden_dim;
         float *so = shared_out_buf + (size_t)t * cfg.hidden_dim;
 
-        // Routing: softmax + topK on pre-computed gate scores
-        float *gate_scores_t = routing_buf + (size_t)t * cfg.num_experts;
-        cpu_softmax(gate_scores_t, cfg.num_experts);
-        int expert_indices[64];
-        float expert_weights[64];
-        cpu_topk(gate_scores_t, cfg.num_experts, K, expert_indices, expert_weights);
-        cpu_normalize_weights(expert_weights, K);
-
-        // Routed expert I/O + compute
+        // Routed expert I/O + compute (K=0 skips all routed experts)
         float *moe_out = s_moe_out;
         memset(moe_out, 0, cfg.hidden_dim * sizeof(float));
-        int actual_K = (K > MAX_K) ? MAX_K : K;
 
-        if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
+        if (K > 0) {
+            // Routing: softmax + topK on pre-computed gate scores
+            float *gate_scores_t = routing_buf + (size_t)t * cfg.num_experts;
+            cpu_softmax(gate_scores_t, cfg.num_experts);
+            int expert_indices[64];
+            float expert_weights[64];
+            cpu_topk(gate_scores_t, cfg.num_experts, K, expert_indices, expert_weights);
+            cpu_normalize_weights(expert_weights, K);
+
+            int actual_K = (K > MAX_K) ? MAX_K : K;
+
+            if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
             int valid[MAX_K];
             id<MTLBuffer> expert_bufs[MAX_K];
 
@@ -297,6 +299,7 @@ static void pfb_batched_shared_expert(
                 cpu_vec_madd(moe_out, expert_result, expert_weights[k], cfg.hidden_dim);
             }
         }
+        }  // end if (K > 0)
 
         // Final combine: hidden = h_mid + moe_out + sigmoid(expert_gate) * shared_out
         float shared_weight = cpu_sigmoid(expert_gate_buf[t]);
@@ -378,6 +381,14 @@ static int batched_prefill(
         int is_full = cfg.is_full_attn[layer];
         const void *mmap_base = (layer_mmaps[layer] != MAP_FAILED) ? layer_mmaps[layer] : NULL;
         LayerWeightCache *lc = &layer_cache[layer];
+
+        // Expert skip modes: compute effective K for this layer
+        int effective_K = K;
+        if (g_prefill_skip_experts) {
+            effective_K = 0;
+        } else if (g_prefill_experts_full_only && !is_full) {
+            effective_K = 0;
+        }
 
         // Determine batch size for GPU dispatch (capped at MAX_PFB_GPU)
         int gpu_batch = (num_tokens > MAX_PFB_GPU) ? MAX_PFB_GPU : num_tokens;
@@ -734,7 +745,7 @@ static int batched_prefill(
                         g_metal->pfb_swiglu) {
                         pfb_batched_shared_expert(wf, layer, lc, hidden_states, token_hidden,
                                                   chunk_start, chunk_n, batch_n, start_pos,
-                                                  mmap_base, K, layer_fds, kv_caches, layer_states);
+                                                  mmap_base, effective_K, layer_fds, kv_caches, layer_states);
                     } else {
                         // Fallback: per-token routing + shared expert via fused_layer_forward
                         for (int t = 0; t < chunk_n; t++) {
@@ -765,7 +776,7 @@ static int batched_prefill(
                             fused_layer_forward(wf, layer, token_hidden,
                                                 kv_caches[layer], NULL,
                                                 pos, mmap_base,
-                                                K, layer_fds[layer]);
+                                                effective_K, layer_fds[layer]);
                             g_pfb_precomputed_post_attn = 0;
 
                             complete_deferred_experts();
@@ -1030,7 +1041,7 @@ static int batched_prefill(
                         g_metal->pfb_swiglu) {
                         pfb_batched_shared_expert(wf, layer, lc, hidden_states, token_hidden,
                                                   chunk_start, chunk_n, batch_n, start_pos,
-                                                  mmap_base, K, layer_fds, kv_caches, layer_states);
+                                                  mmap_base, effective_K, layer_fds, kv_caches, layer_states);
                     } else {
                         // Fallback: per-token routing + shared expert via fused_layer_forward
                         for (int t = 0; t < chunk_n; t++) {
@@ -1061,7 +1072,7 @@ static int batched_prefill(
                             fused_layer_forward(wf, layer, token_hidden,
                                                 NULL, (LinearAttnState *)layer_states[layer],
                                                 pos, mmap_base,
-                                                K, layer_fds[layer]);
+                                                effective_K, layer_fds[layer]);
                             g_pfb_precomputed_post_attn = 0;
 
                             complete_deferred_experts();
@@ -1128,7 +1139,7 @@ static int batched_prefill(
                                         is_full ? NULL : (LinearAttnState *)layer_states[layer],
                                         pos,
                                         mmap_base,
-                                        K, layer_fds[layer]);
+                                        effective_K, layer_fds[layer]);
                     g_pfb_precomputed_qkv = 0;
 
                     // Complete deferred expert work
@@ -1152,7 +1163,7 @@ static int batched_prefill(
                                     is_full ? NULL : (LinearAttnState *)layer_states[layer],
                                     pos,
                                     mmap_base,
-                                    K, layer_fds[layer]);
+                                    effective_K, layer_fds[layer]);
 
                 complete_deferred_experts();
 

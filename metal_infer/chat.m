@@ -500,6 +500,8 @@ int main(int argc, char **argv) {
         {"show-think",  no_argument,       0, 's'},
         {"resume",      required_argument, 0, 'r'},
         {"sessions",    no_argument,       0, 'l'},
+        {"prefill-skip-experts",       no_argument, 0, 0x104},
+        {"prefill-experts-full-only",  no_argument, 0, 0x105},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -514,6 +516,8 @@ int main(int argc, char **argv) {
             case 's': show_thinking = 1; break;
             case 'r': resume_id = optarg; break;
             case 'l': session_list(); return 0;
+            case 0x104: g_prefill_skip_experts = 1; break;
+            case 0x105: g_prefill_experts_full_only = 1; break;
             case 'h':
                 printf("Usage: %s [options]\n", argv[0]);
                 printf("  --port N         Server port (default: 8000)\n");
@@ -521,6 +525,8 @@ int main(int argc, char **argv) {
                 printf("  --show-think     Show <think> blocks (dimmed)\n");
                 printf("  --resume ID      Resume a previous session\n");
                 printf("  --sessions       List saved sessions\n");
+                printf("  --prefill-skip-experts    Skip routed experts during prefill (shared only)\n");
+                printf("  --prefill-experts-full-only  Experts only at full attention layers during prefill\n");
                 printf("  --help           This message\n");
                 return 0;
             default: return 1;
