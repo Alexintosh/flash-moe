@@ -74,6 +74,31 @@ static void gpu_encode_pfb_gemm(
 }
 
 // ============================================================================
+// Helper: CPU deinterleave conv1d output [N, conv_dim] into separate Q, K, V
+// ============================================================================
+// Conv1d outputs [N, conv_dim] where conv_dim = total_key*2 + total_value.
+// Within each token: [Q(total_key), K(total_key), V(total_value)].
+// Subsequent batched kernels (rms_norm_qk, delta_net_step) expect separate
+// contiguous [N, total_key] and [N, total_value] arrays — they use total_key
+// or total_value as the per-token stride, not conv_dim. Without this split,
+// tokens t>=1 read from wrong offsets (stride mismatch: total_key vs conv_dim).
+
+static void cpu_deinterleave_conv_batch(
+    const float *conv_out,   // [N, conv_dim]
+    float *q_out,            // [N, total_key]
+    float *k_out,            // [N, total_key]
+    float *v_out,            // [N, total_value]
+    int batch_n, int total_key, int total_value, int conv_dim
+) {
+    for (int t = 0; t < batch_n; t++) {
+        const float *src = conv_out + (size_t)t * conv_dim;
+        memcpy(q_out + (size_t)t * total_key, src, total_key * sizeof(float));
+        memcpy(k_out + (size_t)t * total_key, src + total_key, total_key * sizeof(float));
+        memcpy(v_out + (size_t)t * total_value, src + 2 * total_key, total_value * sizeof(float));
+    }
+}
+
+// ============================================================================
 // Helper: CPU deinterleave Q projection output
 // ============================================================================
 // Q projection outputs [N, num_heads * head_dim * 2] with interleaved layout:
@@ -415,39 +440,67 @@ static int batched_prefill(
                 // ---- Linear attention path ----
                 int linear_layer_idx = cfg.linear_index[layer];
 
-                // GPU: conv1d -> rms_norm_qk -> compute_decay_beta -> delta_net_step -> gated_rms_norm
+                // L1: conv1d_step_batched: buf_pfb_out[0] (qkv) -> buf_pfb_out[4] (conv output)
+                // Must complete before CPU deinterleave, so separate command buffer.
                 {
                     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
                     metal_staging_reset(ctx);
 
-                    // L1: conv1d_step_batched: buf_pfb_out[0] (qkv) -> buf_pfb_out[4] (conv output)
-                    {
-                        id<MTLBuffer> cw_buf; NSUInteger cw_off;
-                        metal_find_chunk_sized(ctx, lc->conv1d_w,
-                            (size_t)lin_conv_dim * 4 * 2, &cw_buf, &cw_off);  // conv_dim * kernel_size * bf16
+                    id<MTLBuffer> cw_buf; NSUInteger cw_off;
+                    metal_find_chunk_sized(ctx, lc->conv1d_w,
+                        (size_t)lin_conv_dim * 4 * 2, &cw_buf, &cw_off);  // conv_dim * kernel_size * bf16
 
-                        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-                        [enc setComputePipelineState:ctx->pfb_conv1d_step];
-                        [enc setBuffer:ctx->buf_conv_state[linear_layer_idx] offset:0 atIndex:0]; // conv state
-                        [enc setBuffer:ctx->buf_pfb_out[0]  offset:0       atIndex:1]; // input [N, conv_dim]
-                        [enc setBuffer:cw_buf               offset:cw_off  atIndex:2]; // weights bf16
-                        [enc setBuffer:ctx->buf_pfb_out[4]  offset:0       atIndex:3]; // output [N, conv_dim]
-                        [enc setBytes:&lin_conv_dim length:4 atIndex:4];
-                        [enc setBytes:&bn           length:4 atIndex:5];
-                        uint32_t tgs = (lin_conv_dim + 255) / 256;
-                        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                        [enc endEncoding];
-                    }
+                    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                    [enc setComputePipelineState:ctx->pfb_conv1d_step];
+                    [enc setBuffer:ctx->buf_conv_state[linear_layer_idx] offset:0 atIndex:0]; // conv state
+                    [enc setBuffer:ctx->buf_pfb_out[0]  offset:0       atIndex:1]; // input [N, conv_dim]
+                    [enc setBuffer:cw_buf               offset:cw_off  atIndex:2]; // weights bf16
+                    [enc setBuffer:ctx->buf_pfb_out[4]  offset:0       atIndex:3]; // output [N, conv_dim]
+                    [enc setBytes:&lin_conv_dim length:4 atIndex:4];
+                    [enc setBytes:&bn           length:4 atIndex:5];
+                    uint32_t tgs = (lin_conv_dim + 255) / 256;
+                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
 
-                    // L2: rms_norm_qk_batched: normalize Q and K in buf_pfb_out[4] in-place
+                    [cmd commit];
+                    [cmd waitUntilCompleted];
+                }
+
+                // CPU deinterleave: conv output [N, conv_dim] -> separate Q, K, V arrays.
+                // The conv output packs [Q(total_key), K(total_key), V(total_value)] per token.
+                // Batched kernels below expect contiguous [N, total_key] or [N, total_value]
+                // arrays with stride = total_key/total_value, NOT conv_dim.
+                // Without this split, token t>=1 reads from wrong offsets (stride mismatch).
+                //
+                // Buffer assignment after deinterleave:
+                //   buf_pfb_out[0] = Q [N, total_key]   (overwrite, was QKV proj input)
+                //   buf_pfb_out[5] = K [N, total_key]   (free slot)
+                //   buf_pfb_out[6] = V [N, total_value]  (overwrite, normed input no longer needed)
+                {
+                    float *conv_data = (float *)[ctx->buf_pfb_out[4] contents];
+                    float *q_data    = (float *)[ctx->buf_pfb_out[0] contents];
+                    float *k_data    = (float *)[ctx->buf_pfb_out[5] contents];
+                    float *v_data    = (float *)[ctx->buf_pfb_out[6] contents];
+                    cpu_deinterleave_conv_batch(conv_data, q_data, k_data, v_data,
+                        chunk_n, lin_total_key, lin_total_value, lin_conv_dim);
+                }
+
+                // GPU: rms_norm_qk -> compute_decay_beta -> delta_net_step -> gated_rms_norm
+                // Now using separate contiguous Q/K/V buffers.
+                {
+                    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+                    metal_staging_reset(ctx);
+
+                    // L2: rms_norm_qk_batched: normalize Q and K in-place
+                    //   Q in buf_pfb_out[0] [N, total_key], K in buf_pfb_out[5] [N, total_key]
                     {
                         float inv_scale = 1.0f / sqrtf((float)lin_key_dim);
 
                         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
                         [enc setComputePipelineState:ctx->pfb_rms_norm_qk];
-                        [enc setBuffer:ctx->buf_pfb_out[4] offset:0                                         atIndex:0]; // q
-                        [enc setBuffer:ctx->buf_pfb_out[4] offset:lin_total_key * sizeof(float)              atIndex:1]; // k
+                        [enc setBuffer:ctx->buf_pfb_out[0] offset:0 atIndex:0]; // q [N, total_key]
+                        [enc setBuffer:ctx->buf_pfb_out[5] offset:0 atIndex:1]; // k [N, total_key]
                         [enc setBytes:&lin_key_dim  length:4 atIndex:2];
                         [enc setBytes:&inv_scale    length:4 atIndex:3];
                         [enc setBytes:&lin_num_k_heads length:4 atIndex:4];
@@ -459,6 +512,9 @@ static int batched_prefill(
                     }
 
                     // L3: compute_decay_beta_batched
+                    // Output g_decay -> buf_pfb_out[3] (overwrite alpha, no longer needed)
+                    // Output beta_gate -> buf_pfb_out[2] (overwrite beta, no longer needed)
+                    // These buffers are [N, num_v_heads] sized from the GEMM output, large enough.
                     {
                         id<MTLBuffer> alog_buf, dtb_buf; NSUInteger alog_off, dtb_off;
                         metal_find_chunk_sized(ctx, lc->A_log,
@@ -472,8 +528,8 @@ static int batched_prefill(
                         [enc setBuffer:ctx->buf_pfb_out[2]    offset:0         atIndex:1]; // beta [N, num_v_heads]
                         [enc setBuffer:alog_buf               offset:alog_off  atIndex:2]; // A_log
                         [enc setBuffer:dtb_buf                offset:dtb_off   atIndex:3]; // dt_bias bf16
-                        [enc setBuffer:ctx->buf_delta_g_decay offset:0         atIndex:4]; // g_decay output
-                        [enc setBuffer:ctx->buf_delta_beta    offset:0         atIndex:5]; // beta_gate output
+                        [enc setBuffer:ctx->buf_pfb_out[3]    offset:0         atIndex:4]; // g_decay output (in-place on alpha)
+                        [enc setBuffer:ctx->buf_pfb_out[2]    offset:0         atIndex:5]; // beta_gate output (in-place on beta)
                         [enc setBytes:&lin_num_v_heads length:4 atIndex:6];
                         [enc setBytes:&bn              length:4 atIndex:7];
                         uint32_t total = bn * lin_num_v_heads;
@@ -484,18 +540,21 @@ static int batched_prefill(
                     }
 
                     // L4: gated_delta_net_step_batched (processes tokens sequentially through recurrence)
+                    // Q from buf_pfb_out[0], K from buf_pfb_out[5], V from buf_pfb_out[6]
+                    // g_decay from buf_pfb_out[3], beta_gate from buf_pfb_out[2]
+                    // output [N, total_value] -> buf_pfb_out[4] (conv output no longer needed)
                     {
                         uint32_t khpv = lin_num_v_heads / lin_num_k_heads;
 
                         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
                         [enc setComputePipelineState:ctx->pfb_delta_net_step];
                         [enc setBuffer:ctx->buf_delta_state[linear_layer_idx] offset:0 atIndex:0]; // state
-                        [enc setBuffer:ctx->buf_pfb_out[4] offset:0                                         atIndex:1]; // q
-                        [enc setBuffer:ctx->buf_pfb_out[4] offset:lin_total_key * sizeof(float)              atIndex:2]; // k
-                        [enc setBuffer:ctx->buf_pfb_out[4] offset:2 * lin_total_key * sizeof(float)          atIndex:3]; // v
-                        [enc setBuffer:ctx->buf_delta_g_decay offset:0 atIndex:4];
-                        [enc setBuffer:ctx->buf_delta_beta    offset:0 atIndex:5];
-                        [enc setBuffer:ctx->buf_delta_output  offset:0 atIndex:6]; // output [N, total_value]
+                        [enc setBuffer:ctx->buf_pfb_out[0] offset:0 atIndex:1]; // q [N, total_key]
+                        [enc setBuffer:ctx->buf_pfb_out[5] offset:0 atIndex:2]; // k [N, total_key]
+                        [enc setBuffer:ctx->buf_pfb_out[6] offset:0 atIndex:3]; // v [N, total_value]
+                        [enc setBuffer:ctx->buf_pfb_out[3] offset:0 atIndex:4]; // g_decay [N, num_v_heads]
+                        [enc setBuffer:ctx->buf_pfb_out[2] offset:0 atIndex:5]; // beta_gate [N, num_v_heads]
+                        [enc setBuffer:ctx->buf_pfb_out[4] offset:0 atIndex:6]; // output [N, total_value]
                         [enc setBytes:&khpv            length:4 atIndex:7];
                         [enc setBytes:&lin_key_dim     length:4 atIndex:8];
                         [enc setBytes:&lin_value_dim   length:4 atIndex:9];
@@ -509,6 +568,7 @@ static int batched_prefill(
                     }
 
                     // L5: gated_rms_norm_batched: delta output + z -> buf_pfb_out[0]
+                    // delta output in buf_pfb_out[4], z in buf_pfb_out[1]
                     {
                         id<MTLBuffer> gnw_buf; NSUInteger gnw_off;
                         metal_find_chunk_sized(ctx, lc->gated_norm_w,
@@ -516,7 +576,7 @@ static int batched_prefill(
 
                         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
                         [enc setComputePipelineState:ctx->pfb_gated_rms_norm];
-                        [enc setBuffer:ctx->buf_delta_output offset:0       atIndex:0]; // values [N, total_value]
+                        [enc setBuffer:ctx->buf_pfb_out[4]   offset:0       atIndex:0]; // values [N, total_value]
                         [enc setBuffer:ctx->buf_pfb_out[1]   offset:0       atIndex:1]; // z [N, total_value]
                         [enc setBuffer:gnw_buf               offset:gnw_off atIndex:2]; // weight bf16
                         [enc setBuffer:ctx->buf_pfb_out[0]   offset:0       atIndex:3]; // output [N, total_value]
