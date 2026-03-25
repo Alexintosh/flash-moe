@@ -130,6 +130,11 @@ struct ModelListView: View {
     @State private var isScanning = true
     @State private var loadError: String?
     @State private var selectedModel: LocalModel?
+
+    // Build info — set at compile time via COMMIT_HASH build setting or fallback
+    private var buildCommitShort: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "dev"
+    }
     @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 1
     @AppStorage("activeExpertsK") private var activeExpertsK: Int = 0
     @AppStorage("cmdMergeEnabled") private var cmdMergeEnabled: Bool = true
@@ -361,24 +366,33 @@ struct ModelListView: View {
                     .pickerStyle(.menu)
                 }
 
-                // Reload button — applies all settings changes by unloading and reloading
-                if engine.state == .ready {
-                    let modelName = engine.modelInfo?.name ?? ""
-                    Button {
-                        if let model = selectedModel ?? localModels.first(where: { modelName.contains($0.name) || $0.name.contains(modelName) }) {
-                            Task {
+                // Reload button — always visible, applies all settings changes
+                Button {
+                    if let model = selectedModel ?? localModels.first {
+                        Task {
+                            if engine.state == .ready {
                                 engine.unloadModel()
                                 try? await Task.sleep(for: .milliseconds(300))
-                                loadModel(model)
                             }
+                            loadModel(model)
                         }
-                    } label: {
-                        Label("Reload Model", systemImage: "arrow.clockwise")
-                            .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.orange)
+                } label: {
+                    Label("Reload Model", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .disabled(localModels.isEmpty)
+            }
+
+            // Build info
+            Section {
+                Text("Branch: develop • \(buildCommitShort)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
             }
 
             if let error = downloadManager.error,
