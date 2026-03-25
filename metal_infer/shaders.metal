@@ -2330,12 +2330,11 @@ kernel void prefill_q_rope_norm_bf16(
     constant float&        rope_theta  [[buffer(6)]],
     constant float&        eps        [[buffer(7)]],
     constant uint&         rotary_dim [[buffer(8)]],
-    uint3 tgid  [[threadgroup_position_in_grid]],  // (head, token, 1)
-    uint lid    [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint tgid_flat [[threadgroup_position_in_grid]],
+    uint lid       [[thread_position_in_threadgroup]]
 ) {
-    uint h = tgid.x;
-    uint t = tgid.y;
+    uint h = tgid_flat % num_heads;
+    uint t = tgid_flat / num_heads;
     if (h >= num_heads || t >= batch_n) return;
 
     uint base = t * (num_heads * head_dim) + h * head_dim;
@@ -2416,12 +2415,11 @@ kernel void prefill_kv_cache_bf16(
     constant float&        rope_theta  [[buffer(10)]],
     constant float&        eps        [[buffer(11)]],
     constant uint&         rotary_dim [[buffer(12)]],
-    uint3 tgid  [[threadgroup_position_in_grid]],  // (kv_head, token, 1)
-    uint lid    [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint tgid_flat [[threadgroup_position_in_grid]],
+    uint lid       [[thread_position_in_threadgroup]]
 ) {
-    uint kv_h = tgid.x;
-    uint t = tgid.y;
+    uint kv_h = tgid_flat % num_kv_heads;
+    uint t = tgid_flat / num_kv_heads;
     if (kv_h >= num_kv_heads || t >= batch_n) return;
 
     uint d = lid;
@@ -2684,11 +2682,11 @@ kernel void rms_norm_qk_batched(
     constant float &inv_scale,
     constant uint &num_k_heads,
     constant uint &batch_n,
-    uint3 tgid [[threadgroup_position_in_grid]],  // (head, token, 1)
-    uint tid   [[thread_position_in_threadgroup]]
+    uint tgid_flat [[threadgroup_position_in_grid]],
+    uint tid       [[thread_position_in_threadgroup]]
 ) {
-    uint head = tgid.x;
-    uint t = tgid.y;
+    uint head = tgid_flat % num_k_heads;
+    uint t = tgid_flat / num_k_heads;
     if (head >= num_k_heads || t >= batch_n) return;
 
     uint stride = num_k_heads * key_dim;
@@ -2828,11 +2826,11 @@ kernel void gated_rms_norm_batched(
     constant float &eps,
     constant uint &num_v_heads,
     constant uint &batch_n,
-    uint3 tgid [[threadgroup_position_in_grid]],  // (head, token, 1)
-    uint tid   [[thread_position_in_threadgroup]]
+    uint tgid_flat [[threadgroup_position_in_grid]],
+    uint tid       [[thread_position_in_threadgroup]]
 ) {
-    uint head = tgid.x;
-    uint t = tgid.y;
+    uint head = tgid_flat % num_v_heads;
+    uint t = tgid_flat / num_v_heads;
     if (head >= num_v_heads || t >= batch_n) return;
 
     uint stride = num_v_heads * value_dim;
