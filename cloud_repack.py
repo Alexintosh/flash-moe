@@ -60,6 +60,7 @@ tiered_image = image
 @app.function(
     image=image,
     volumes={"/data": vol},
+    secrets=[modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])],
     timeout=7200,  # 2 hours max
     memory=16384,  # 16 GB RAM
     cpu=4,
@@ -504,6 +505,7 @@ cd flash-moe/metal_infer && make
 @app.function(
     image=tiered_image,
     volumes={"/data": vol},
+    secrets=[modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKEN"])],
     timeout=14400,  # 4 hours max (tiered requant is slower)
     memory=32768,   # 32 GB RAM (needs 4-bit data + 2-bit requant buffers)
     cpu=8,          # parallel requantization
@@ -529,9 +531,14 @@ def repack_tiered(
     import time
     import re
     import shutil
+    import os
     import numpy as np
     from pathlib import Path
     from huggingface_hub import HfApi, snapshot_download
+
+    # Read HF token from Modal secret if not passed as parameter
+    if not hf_token:
+        hf_token = os.environ.get("HF_TOKEN", "")
 
     # ==================================================================
     # Inlined 2-bit requantization helpers (self-contained for Modal)
