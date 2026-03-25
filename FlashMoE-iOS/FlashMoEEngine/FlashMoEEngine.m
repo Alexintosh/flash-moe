@@ -814,9 +814,24 @@ int flashmoe_generate(
             }
         }
 
-        // ---- Prefill intermediate tokens (discard expert output) ----
+        // ---- Prefill intermediate tokens ----
         if (pt->count > 1) {
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) { @autoreleasepool {
+            int prefill_count = pt->count - 1;  // last token processed separately for full hidden state
+            int batched_done = 0;
+
+            // Try batched GEMM prefill (reads each weight row once for all tokens)
+            if (g_prefill_batch > 1 && embed_batch) {
+                batched_done = batched_prefill(ctx->wf, embed_batch, prefill_count, pos,
+                                               K, ctx->layer_fds, ctx->layer_mmaps,
+                                               ctx->kv_caches, ctx->layer_states);
+                if (batched_done > 0) {
+                    pos += batched_done;
+                    NSLog(@"[FlashMoE] Batched prefill: %d tokens processed", batched_done);
+                }
+            }
+
+            // Fall back to per-token for remaining tokens
+            for (int token_idx = batched_done; token_idx < prefill_count; token_idx++) { @autoreleasepool {
                 if (atomic_load(&ctx->cancelled)) {
                     free(embed_batch);
                     free(pt->ids); free(pt);
@@ -1052,7 +1067,20 @@ int flashmoe_generate_continuation(
         }
 
         if (pt->count > 1) {
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) { @autoreleasepool {
+            int prefill_count = pt->count - 1;
+            int batched_done = 0;
+
+            if (g_prefill_batch > 1 && embed_batch) {
+                batched_done = batched_prefill(ctx->wf, embed_batch, prefill_count, pos,
+                                               K, ctx->layer_fds, ctx->layer_mmaps,
+                                               ctx->kv_caches, ctx->layer_states);
+                if (batched_done > 0) {
+                    pos += batched_done;
+                    NSLog(@"[FlashMoE] Batched continuation prefill: %d tokens", batched_done);
+                }
+            }
+
+            for (int token_idx = batched_done; token_idx < prefill_count; token_idx++) { @autoreleasepool {
                 if (atomic_load(&ctx->cancelled)) {
                     free(embed_batch);
                     free(pt->ids); free(pt);
