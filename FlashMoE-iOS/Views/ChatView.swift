@@ -182,10 +182,15 @@ struct ChatView: View {
         .sheet(isPresented: $showModelInfo) {
             ModelInfoSheet(info: engine.modelInfo)
         }
-        .sheet(isPresented: $showBenchmark) {
+        .fullScreenCover(isPresented: $showBenchmark) {
             NavigationStack {
                 BenchmarkView(modelPath: UserDefaults.standard.string(forKey: "lastLoadedModelPath") ?? "")
                     .environment(engine)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close") { showBenchmark = false }
+                        }
+                    }
             }
         }
     }
