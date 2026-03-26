@@ -30,6 +30,7 @@ struct ChatView: View {
     @State private var showStats = false
     @State private var showModelInfo = false
     @State private var showProfiler = false
+    @State private var showBenchmark = false
     @State private var scrollAnchor = UUID()  // updates on each token to trigger scroll
     @FocusState private var inputFocused: Bool
     @AppStorage("thinkingEnabled") private var thinkingEnabled: Bool = true
@@ -130,6 +131,9 @@ struct ChatView: View {
                     Button("Show Stats", systemImage: "chart.bar") {
                         showStats.toggle()
                     }
+                    Button("Benchmark", systemImage: "gauge.with.dots.needle.50percent") {
+                        showBenchmark = true
+                    }
                     Divider()
                     Button("Models & Settings", systemImage: "gearshape") {
                         messages.removeAll()
@@ -160,6 +164,9 @@ struct ChatView: View {
                     Button("Show Stats", systemImage: "chart.bar") {
                         showStats.toggle()
                     }
+                    Button("Benchmark", systemImage: "gauge.with.dots.needle.50percent") {
+                        showBenchmark = true
+                    }
                     Divider()
                     Button("Models & Settings", systemImage: "gearshape") {
                         messages.removeAll()
@@ -174,6 +181,12 @@ struct ChatView: View {
 #endif
         .sheet(isPresented: $showModelInfo) {
             ModelInfoSheet(info: engine.modelInfo)
+        }
+        .sheet(isPresented: $showBenchmark) {
+            NavigationStack {
+                BenchmarkView(modelPath: UserDefaults.standard.string(forKey: "lastLoadedModelPath") ?? "")
+                    .environment(engine)
+            }
         }
     }
 

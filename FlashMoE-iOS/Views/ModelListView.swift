@@ -623,6 +623,8 @@ struct ModelListView: View {
     private func loadModel(_ model: LocalModel) {
         guard engine.state != .loading && engine.state != .generating else { return }
         selectedModel = model
+        // Store path for benchmark access
+        UserDefaults.standard.set(model.path, forKey: "lastLoadedModelPath")
 
         // Use picker value, or auto-detect for 397B if user hasn't set a preference
         let activeK: Int
