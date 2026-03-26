@@ -112,18 +112,24 @@ final class BenchmarkRunner {
         }
     }
 
-    func run(engine: FlashMoEEngine, modelPath: String) async {
+    func run(engine: FlashMoEEngine, modelPath: String,
+             configIds: Set<String>? = nil, promptIds: Set<String>? = nil) async {
         isRunning = true
         isCancelled = false
         results = []
         currentConfigIndex = 0
         currentPromptIndex = 0
-        totalConfigs = BenchmarkConfig.builtIn.count
-        totalPrompts = BenchmarkPrompt.builtIn.count
-        statusMessage = "Starting benchmark..."
 
-        let configs = BenchmarkConfig.builtIn
-        let prompts = BenchmarkPrompt.builtIn
+        let configs = configIds != nil
+            ? BenchmarkConfig.builtIn.filter { configIds!.contains($0.id) }
+            : BenchmarkConfig.builtIn
+        let prompts = promptIds != nil
+            ? BenchmarkPrompt.builtIn.filter { promptIds!.contains($0.id) }
+            : BenchmarkPrompt.builtIn
+
+        totalConfigs = configs.count
+        totalPrompts = prompts.count
+        statusMessage = "Starting benchmark (\(configs.count)×\(prompts.count))..."
 
         for (ci, config) in configs.enumerated() {
             if isCancelled { break }
@@ -293,6 +299,9 @@ struct BenchmarkView: View {
     let modelPath: String
 
     @State private var runner = BenchmarkRunner()
+    @State private var selectedConfigs: Set<String> = Set(BenchmarkConfig.builtIn.map(\.id))
+    @State private var selectedPrompts: Set<String> = Set(BenchmarkPrompt.builtIn.map(\.id))
+    @State private var showSetup = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -356,13 +365,53 @@ struct BenchmarkView: View {
                     Text(runner.statusMessage)
                         .font(.headline)
 
-                    Text("\(BenchmarkConfig.builtIn.count) configs x \(BenchmarkPrompt.builtIn.count) prompts = \(BenchmarkConfig.builtIn.count * BenchmarkPrompt.builtIn.count) runs, \(runner.maxTokensPerRun) tokens each")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    // Toggle setup panel
+                    Button {
+                        withAnimation { showSetup.toggle() }
+                    } label: {
+                        HStack {
+                            Text("\(selectedConfigs.count) configs × \(selectedPrompts.count) prompts = \(selectedConfigs.count * selectedPrompts.count) runs")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Image(systemName: showSetup ? "chevron.up" : "chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    if showSetup {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Configs").font(.caption).fontWeight(.bold)
+                            ForEach(BenchmarkConfig.builtIn) { cfg in
+                                Toggle(cfg.name, isOn: Binding(
+                                    get: { selectedConfigs.contains(cfg.id) },
+                                    set: { if $0 { selectedConfigs.insert(cfg.id) } else { selectedConfigs.remove(cfg.id) } }
+                                ))
+                                .font(.caption)
+                                .toggleStyle(.switch)
+                            }
+
+                            Divider()
+
+                            Text("Prompts").font(.caption).fontWeight(.bold)
+                            ForEach(BenchmarkPrompt.builtIn) { p in
+                                Toggle(p.label, isOn: Binding(
+                                    get: { selectedPrompts.contains(p.id) },
+                                    set: { if $0 { selectedPrompts.insert(p.id) } else { selectedPrompts.remove(p.id) } }
+                                ))
+                                .font(.caption)
+                                .toggleStyle(.switch)
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
 
                     Button {
+                        showSetup = false
                         Task {
-                            await runner.run(engine: engine, modelPath: modelPath)
+                            await runner.run(engine: engine, modelPath: modelPath,
+                                           configIds: selectedConfigs, promptIds: selectedPrompts)
                         }
                     } label: {
                         Label("Run Benchmark", systemImage: "play.fill")
@@ -370,7 +419,7 @@ struct BenchmarkView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
-                    .disabled(engine.state != .ready && !runner.isRunning)
+                    .disabled((engine.state != .ready && !runner.isRunning) || selectedConfigs.isEmpty || selectedPrompts.isEmpty)
                 }
                 .padding()
             }
