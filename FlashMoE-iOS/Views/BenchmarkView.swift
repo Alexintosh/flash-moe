@@ -50,10 +50,12 @@ struct BenchmarkResult: Identifiable {
     let prefillTokens: Int
     let ttftMs: Double
     let tokensGenerated: Int
-    let tokensPerSecond: Double
+    let decodeTokPerSec: Double   // actual decode speed (tokens after first / decode time)
+    let engineTokPerSec: Double   // engine-reported tok/s
     let totalMs: Double
     let outputSnippet: String
     let quality: String
+    let thermalState: String
 
     var tsvLine: String {
         let truncatedPrompt = promptText.count > 50
@@ -62,7 +64,7 @@ struct BenchmarkResult: Identifiable {
         let cleanSnippet = outputSnippet
             .replacingOccurrences(of: "\t", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
-        return "\(configName)\t\(truncatedPrompt)\t\(prefillTokens)\t\(String(format: "%.0f", ttftMs))\t\(tokensGenerated)\t\(String(format: "%.1f", tokensPerSecond))\t\(String(format: "%.0f", totalMs))\t\(quality)\t\(cleanSnippet)"
+        return "\(configName)\t\(truncatedPrompt)\t\(prefillTokens)\t\(String(format: "%.0f", ttftMs))\t\(tokensGenerated)\t\(String(format: "%.1f", decodeTokPerSec))\t\(String(format: "%.1f", engineTokPerSec))\t\(String(format: "%.0f", totalMs))\t\(thermalState)\t\(quality)\t\(cleanSnippet)"
     }
 }
 
@@ -81,10 +83,33 @@ final class BenchmarkRunner {
     var progressDetail = ""
 
     let maxTokensPerRun = 50
+    let cooldownBetweenPrompts: UInt64 = 5_000_000_000  // 5 seconds
+    let cooldownBetweenConfigs: UInt64 = 10_000_000_000 // 10 seconds
 
     func cancel() {
         isCancelled = true
         statusMessage = "Cancelling..."
+    }
+
+    private func thermalStateString() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
+    }
+
+    private func waitForCooldown(duration: UInt64, label: String) async {
+        let thermal = thermalStateString()
+        if thermal == "serious" || thermal == "critical" {
+            progressDetail = "Thermal \(thermal) — cooling down (30s)..."
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+        } else {
+            progressDetail = "\(label) cooldown (\(duration / 1_000_000_000)s)..."
+            try? await Task.sleep(nanoseconds: duration)
+        }
     }
 
     func run(engine: FlashMoEEngine, modelPath: String) async {
@@ -158,6 +183,16 @@ final class BenchmarkRunner {
                 )
 
                 results.append(result)
+
+                // Cooldown between prompts
+                if pi < prompts.count - 1 && !isCancelled {
+                    await waitForCooldown(duration: cooldownBetweenPrompts, label: "Prompt")
+                }
+            }
+
+            // Cooldown between configs
+            if ci < configs.count - 1 && !isCancelled {
+                await waitForCooldown(duration: cooldownBetweenConfigs, label: "Config")
             }
         }
 
@@ -174,12 +209,15 @@ final class BenchmarkRunner {
         // Build Qwen chat template (no thinking)
         let formatted = "<|im_start|>system\nYou are a helpful assistant. /no_think<|im_end|>\n<|im_start|>user\n\(prompt.text)<|im_end|>\n<|im_start|>assistant\n<think>\n"
 
+        let thermal = thermalStateString()
         let startTime = CFAbsoluteTimeGetCurrent()
         var firstTokenTime: Double = 0
+        var secondTokenTime: Double = 0
         var output = ""
         var tokenCount = 0
-        var lastTokPerSec: Double = 0
+        var lastEngTokPerSec: Double = 0
         var gotFirstToken = false
+        var inThink = false
 
         let stream = engine.generate(prompt: formatted, maxTokens: maxTokensPerRun)
 
@@ -187,31 +225,39 @@ final class BenchmarkRunner {
             if !gotFirstToken {
                 firstTokenTime = CFAbsoluteTimeGetCurrent()
                 gotFirstToken = true
+            } else if tokenCount == 1 {
+                secondTokenTime = CFAbsoluteTimeGetCurrent()
             }
             tokenCount += 1
-            lastTokPerSec = token.tokensPerSecond
+            lastEngTokPerSec = token.tokensPerSecond
 
-            // Clean special tokens
+            // Clean special tokens + strip thinking
             var clean = token.text
                 .replacingOccurrences(of: "<|im_end|>", with: "")
                 .replacingOccurrences(of: "<|im_start|>", with: "")
                 .replacingOccurrences(of: "<|endoftext|>", with: "")
-                .replacingOccurrences(of: "<think>", with: "")
-                .replacingOccurrences(of: "</think>", with: "")
-            output += clean
+            if clean.contains("<think>") { inThink = true; clean = clean.replacingOccurrences(of: "<think>", with: "") }
+            if clean.contains("</think>") { inThink = false; clean = clean.replacingOccurrences(of: "</think>", with: "") }
+            if !inThink { output += clean }
         }
 
         let endTime = CFAbsoluteTimeGetCurrent()
         let totalMs = (endTime - startTime) * 1000
         let ttftMs = gotFirstToken ? (firstTokenTime - startTime) * 1000 : 0
 
+        // Calculate actual decode tok/s (exclude first token = prefill)
+        let decodeTokens = max(tokenCount - 1, 0)
+        let decodeTimeMs = gotFirstToken ? (endTime - firstTokenTime) * 1000 : 0
+        let decodeTokPerSec = decodeTimeMs > 0 ? Double(decodeTokens) / (decodeTimeMs / 1000.0) : 0
+
         // Quality check
         let hasGibberish = output.contains("!!!!") || output.contains("????")
-        let quality = hasGibberish ? "GIBBERISH" : "OK"
+        let isEmpty = output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let quality = hasGibberish ? "GIBBERISH" : isEmpty ? "EMPTY" : "OK"
 
-        // Estimate prefill tokens (rough: ~1.3 tokens per word + special tokens overhead)
+        // Estimate prefill tokens from TTFT log (rough)
         let wordCount = prompt.text.split(separator: " ").count
-        let estimatedPrefillTokens = wordCount + 10  // +10 for chat template tokens
+        let estimatedPrefillTokens = wordCount + 15  // +15 for chat template + system prompt tokens
 
         let snippet = String(output.prefix(100))
 
@@ -222,15 +268,17 @@ final class BenchmarkRunner {
             prefillTokens: estimatedPrefillTokens,
             ttftMs: ttftMs,
             tokensGenerated: tokenCount,
-            tokensPerSecond: lastTokPerSec,
+            decodeTokPerSec: decodeTokPerSec,
+            engineTokPerSec: lastEngTokPerSec,
             totalMs: totalMs,
             outputSnippet: snippet,
-            quality: quality
+            quality: quality,
+            thermalState: thermal
         )
     }
 
     var fullTSV: String {
-        var lines = "Config\tPrompt\tPrefillToks\tTTFT_ms\tGenToks\tTokPerSec\tTotalMs\tQuality\tOutput\n"
+        var lines = "Config\tPrompt\tPrefillToks\tTTFT_ms\tGenToks\tDecodeTok/s\tEngTok/s\tTotalMs\tThermal\tQuality\tOutput\n"
         for r in results {
             lines += r.tsvLine + "\n"
         }
