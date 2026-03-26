@@ -425,75 +425,112 @@ struct BenchmarkView: View {
 
     private var resultsList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2) {
-                // Header row
-                Text("Config\tPrompt\tPrefill\tTTFT\tToks\ttok/s\tTotal\tQual\tOutput")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.top, 8)
-
+            LazyVStack(spacing: 10) {
                 ForEach(runner.results) { result in
-                    resultRow(result)
+                    resultCard(result)
                 }
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
         }
     }
 
-    private func resultRow(_ result: BenchmarkResult) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 8) {
-                Text(result.configName)
-                    .font(.system(.caption, design: .monospaced))
-                    .fontWeight(.semibold)
-                    .lineLimit(1)
-
-                Text(result.promptLabel)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+    private func resultCard(_ result: BenchmarkResult) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Header: config + prompt + quality badge
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(result.configName)
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Text(result.promptLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 Spacer()
 
+                // Quality badge
                 Text(result.quality)
-                    .font(.system(.caption2, design: .monospaced))
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
-                    .background(result.quality == "OK" ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
-                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .font(.caption2)
+                    .fontWeight(.bold)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(qualityColor(result.quality))
+                    .foregroundStyle(.white)
+                    .clipShape(Capsule())
+
+                // Thermal indicator
+                if result.thermalState != "nominal" {
+                    Image(systemName: thermalIcon(result.thermalState))
+                        .font(.caption)
+                        .foregroundStyle(thermalColor(result.thermalState))
+                }
             }
 
-            HStack(spacing: 12) {
-                metricLabel("TTFT", String(format: "%.0fms", result.ttftMs))
-                metricLabel("Toks", "\(result.tokensGenerated)")
-                metricLabel("dec tok/s", String(format: "%.1f", result.decodeTokPerSec))
-                metricLabel("eng tok/s", String(format: "%.1f", result.engineTokPerSec))
-                metricLabel("Total", String(format: "%.0fms", result.totalMs))
+            // Metrics grid — 2 rows of 3
+            HStack(spacing: 0) {
+                metricTile("TTFT", String(format: "%.0f ms", result.ttftMs))
+                metricTile("Decode", String(format: "%.1f tok/s", result.decodeTokPerSec))
+                metricTile("Engine", String(format: "%.1f tok/s", result.engineTokPerSec))
             }
 
+            HStack(spacing: 0) {
+                metricTile("Tokens", "\(result.tokensGenerated)")
+                metricTile("Prefill", "~\(result.prefillTokens) tok")
+                metricTile("Total", String(format: "%.1f s", result.totalMs / 1000))
+            }
+
+            // Output preview
             if !result.outputSnippet.isEmpty {
                 Text(result.outputSnippet)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                     .lineLimit(2)
+                    .padding(.top, 2)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            runner.results.firstIndex(where: { $0.id == result.id }).map { $0 % 2 == 0 } == true
-            ? Color.clear : Color.secondary.opacity(0.05)
-        )
+        .padding(12)
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
-    private func metricLabel(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 2) {
-            Text(label)
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(.secondary)
+    private func metricTile(_ label: String, _ value: String) -> some View {
+        VStack(spacing: 2) {
             Text(value)
-                .font(.system(.caption2, design: .monospaced))
-                .fontWeight(.medium)
+                .font(.system(.callout, design: .rounded))
+                .fontWeight(.semibold)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func qualityColor(_ quality: String) -> Color {
+        switch quality {
+        case "OK": return .green
+        case "GIBBERISH": return .red
+        case "EMPTY": return .orange
+        default: return .gray
+        }
+    }
+
+    private func thermalIcon(_ state: String) -> String {
+        switch state {
+        case "fair": return "thermometer.medium"
+        case "serious": return "thermometer.high"
+        case "critical": return "flame.fill"
+        default: return "thermometer.low"
+        }
+    }
+
+    private func thermalColor(_ state: String) -> Color {
+        switch state {
+        case "fair": return .yellow
+        case "serious": return .orange
+        case "critical": return .red
+        default: return .green
         }
     }
 
