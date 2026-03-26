@@ -58,6 +58,8 @@ struct FlashMoEContext {
     dispatch_source_t memory_pressure_source;
 #if TARGET_OS_IPHONE
     id memory_warning_observer;
+    id background_observer;     // UIApplication.didEnterBackgroundNotification
+    id foreground_observer;     // UIApplication.willEnterForegroundNotification
 #endif
 
     // Error state
@@ -484,6 +486,29 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                     atomic_store(&ctx_warn->cancelled, 1);
                 }
             }];
+
+            // Background/foreground observers — prevent IOGPUMetalError crash
+            // when iOS revokes GPU access from backgrounded apps.
+            ctx->background_observer = [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidEnterBackgroundNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                NSLog(@"[FlashMoE] App entered background — pausing GPU work");
+                g_app_backgrounded = 1;
+                if (ctx_warn && ctx_warn->loaded) {
+                    atomic_store(&ctx_warn->cancelled, 1);
+                }
+            }];
+
+            ctx->foreground_observer = [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationWillEnterForegroundNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                NSLog(@"[FlashMoE] App entering foreground — resuming GPU access");
+                g_app_backgrounded = 0;
+            }];
         }
 #endif
 
@@ -617,12 +642,21 @@ void flashmoe_unload(FlashMoEContext *ctx) {
         g_cache_telemetry_enabled = 0;
         g_kv_seq_len = 0;
 
-        // Remove iOS memory warning observer
+        // Remove iOS notification observers
 #if TARGET_OS_IPHONE
         if (ctx->memory_warning_observer) {
             [[NSNotificationCenter defaultCenter] removeObserver:ctx->memory_warning_observer];
             ctx->memory_warning_observer = nil;
         }
+        if (ctx->background_observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:ctx->background_observer];
+            ctx->background_observer = nil;
+        }
+        if (ctx->foreground_observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:ctx->foreground_observer];
+            ctx->foreground_observer = nil;
+        }
+        g_app_backgrounded = 0;
 #endif
 
         // Cancel memory pressure monitoring
