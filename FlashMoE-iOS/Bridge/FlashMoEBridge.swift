@@ -360,6 +360,22 @@ final class FlashMoEEngine: @unchecked Sendable {
         }
     }
 
+    // MARK: - Runtime Config (no reload)
+
+    /// Change inference settings without reloading the model.
+    /// Sets C globals directly. Much faster than unload+reload.
+    func applyBenchmarkConfig(activeExpertsK: Int, cmdMerge: Bool,
+                               fusedAttention: Bool, cacheIOSplit: Int,
+                               fp16Accumulation: Bool) {
+        guard let ctx = context else { return }
+        flashmoe_set_runtime_config(ctx,
+                                     Int32(activeExpertsK),
+                                     cmdMerge ? 1 : 0,
+                                     fusedAttention ? 1 : 0,
+                                     Int32(cacheIOSplit),
+                                     fp16Accumulation ? 1 : 0)
+    }
+
     // MARK: - Model Validation
 
     /// Check if a model directory contains a valid Flash-MoE model

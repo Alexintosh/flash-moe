@@ -1302,6 +1302,28 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats) {
     stats->ttft_ms = ctx->ttft_ms;
 }
 
+void flashmoe_set_runtime_config(FlashMoEContext *ctx,
+                                  int active_experts_k,
+                                  int cmd_merge,
+                                  int fused_attention,
+                                  int cache_io_split,
+                                  int fp16_accumulation) {
+    if (!ctx || !ctx->loaded) return;
+
+    // K: clamp to [1, model default]
+    int k = active_experts_k;
+    if (k <= 0) k = cfg.num_experts_per_tok;
+    if (k > cfg.num_experts_per_tok) k = cfg.num_experts_per_tok;
+    if (k > MAX_K) k = MAX_K;
+    ctx->K = k;
+
+    // Set C globals directly — no reload needed
+    g_cmd_merge_enabled = cmd_merge ? 1 : 0;
+    g_fused_attention_enabled = fused_attention ? 1 : 0;
+    g_cache_io_split = cache_io_split > 1 ? cache_io_split : 1;
+    g_use_fp16_accum = fp16_accumulation ? 1 : 0;
+}
+
 int flashmoe_validate_model(const char *model_path) {
     if (!model_path) return -1;
 

@@ -127,6 +127,17 @@ void flashmoe_reset(FlashMoEContext *ctx);
 // Get current engine stats. Fills the provided struct.
 void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats);
 
+// ---- Runtime Config (no model reload needed) ----
+
+// Change inference settings without reloading the model.
+// Sets C globals directly. K is clamped to [1, model_default].
+void flashmoe_set_runtime_config(FlashMoEContext *ctx,
+                                  int active_experts_k,
+                                  int cmd_merge,
+                                  int fused_attention,
+                                  int cache_io_split,
+                                  int fp16_accumulation);
+
 // ---- Utility ----
 
 // Check if a model directory is valid (has config.json, packed_experts/, etc.)

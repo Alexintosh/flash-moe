@@ -135,43 +135,18 @@ final class BenchmarkRunner {
             if isCancelled { break }
 
             currentConfigIndex = ci
-            statusMessage = "Loading config \(ci + 1)/\(configs.count): \(config.name)"
-            progressDetail = "Reloading model..."
+            statusMessage = "Config \(ci + 1)/\(configs.count): \(config.name)"
+            progressDetail = "Applying settings..."
 
-            // Unload and reload with new config
-            engine.unloadModel()
-            // Small delay to let resources release
-            try? await Task.sleep(for: .milliseconds(500))
-
-            do {
-                try await engine.loadModel(
-                    at: modelPath,
-                    thinkBudget: -1,  // disable thinking for benchmarks
-                    activeExpertsK: config.activeExpertsK,
-                    cacheIOSplit: config.cacheIOSplit,
-                    cmdMerge: config.cmdMerge,
-                    fusedAttention: config.fusedAttention,
-                    fp16Accumulation: config.fp16Accumulation,
-                    verbose: false
-                )
-            } catch {
-                let errorResult = BenchmarkResult(
-                    configName: config.name,
-                    promptLabel: "ALL",
-                    promptText: "LOAD FAILED",
-                    prefillTokens: 0,
-                    ttftMs: 0,
-                    tokensGenerated: 0,
-                    decodeTokPerSec: 0,
-                    engineTokPerSec: 0,
-                    totalMs: 0,
-                    outputSnippet: "Error: \(error.localizedDescription)",
-                    quality: "FAIL",
-                    thermalState: "unknown"
-                )
-                results.append(errorResult)
-                continue
-            }
+            // Apply config by setting C globals directly — NO model reload needed.
+            // This keeps the fullScreenCover alive and avoids 5-10s reload per config.
+            engine.applyBenchmarkConfig(
+                activeExpertsK: config.activeExpertsK,
+                cmdMerge: config.cmdMerge,
+                fusedAttention: config.fusedAttention,
+                cacheIOSplit: config.cacheIOSplit,
+                fp16Accumulation: config.fp16Accumulation
+            )
 
             // Run each prompt with this config
             for (pi, prompt) in prompts.enumerated() {
