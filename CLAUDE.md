@@ -38,6 +38,7 @@ The engine auto-detects architecture, dimensions, expert counts, quantization, a
 - Always add a **settings toggle** (default OFF for experimental features) so broken features can be disabled without reverting code
 - Before any `git rebase` or destructive git operation, **ask the user first**
 - The `develop` branch should always produce correct output
+- **Bundle ID is `com.alexintosh.flashmoe`** — NEVER change this in project.pbxproj. Changing it creates a new app container on the device, losing all downloaded models (potentially 300GB+).
 
 ## Results
 
