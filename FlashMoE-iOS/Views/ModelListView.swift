@@ -277,7 +277,8 @@ struct ModelListView: View {
                 }
             }
 
-            Section("Expert Settings") {
+            // ---- Speed Settings ----
+            Section("Speed") {
                 Picker(selection: $activeExpertsK) {
                     Text("Model default").tag(0)
                     Text("K=2 (fastest)").tag(2)
@@ -300,13 +301,6 @@ struct ModelListView: View {
                 } label: { settingLabel("I/O Fanout", key: "ioFanout") }
                 .pickerStyle(.menu)
 
-                Toggle(isOn: $cmdMergeEnabled) { settingLabel("CMD1+CMD2 Merge", key: "cmdMerge") }
-                Toggle(isOn: $fusedAttention) { settingLabel("Fused Attention", key: "fusedAttention") }
-                Toggle(isOn: $fusedExpert) { settingLabel("Fused Expert Kernel", key: "fusedExpert") }
-                Toggle(isOn: $expertPrefetch) { settingLabel("Expert Prefetch", key: "expertPrefetch") }
-                Toggle(isOn: $fp16Accumulation) { settingLabel("FP16 Accumulation", key: "fp16Accum") }
-                Toggle(isOn: $fp8KVCache) { settingLabel("FP8 KV Cache", key: "fp8KV") }
-
                 Picker(selection: $prefillBatch) {
                     Text("Off (1)").tag(1)
                     Text("8 tokens").tag(8)
@@ -314,6 +308,21 @@ struct ModelListView: View {
                     Text("32 tokens").tag(32)
                 } label: { settingLabel("Prefill Batch Size", key: "prefillBatch") }
                 .pickerStyle(.menu)
+
+                Toggle(isOn: $fp16Accumulation) { settingLabel("FP16 Accumulation", key: "fp16Accum") }
+            }
+
+            // ---- GPU Pipeline ----
+            Section("GPU Pipeline") {
+                Toggle(isOn: $cmdMergeEnabled) { settingLabel("CMD1+CMD2 Merge", key: "cmdMerge") }
+                Toggle(isOn: $fusedAttention) { settingLabel("Fused Attention", key: "fusedAttention") }
+                Toggle(isOn: $fusedExpert) { settingLabel("Fused Expert Kernel", key: "fusedExpert") }
+                Toggle(isOn: $expertPrefetch) { settingLabel("Expert Prefetch", key: "expertPrefetch") }
+            }
+
+            // ---- Context & Memory ----
+            Section("Context & Memory") {
+                Toggle(isOn: $fp8KVCache) { settingLabel("FP8 KV Cache", key: "fp8KV") }
 
                 Picker(selection: $maxContext) {
                     Text("Auto").tag(0)
@@ -351,7 +360,10 @@ struct ModelListView: View {
                     Text("YaRN 4x").tag(34)
                 } label: { settingLabel("RoPE Scaling", key: "ropeScaling") }
                 .pickerStyle(.menu)
+            }
 
+            // ---- Generation ----
+            Section("Generation") {
                 Toggle(isOn: $thinkingEnabled) { settingLabel("Thinking", key: "thinking") }
 
                 if thinkingEnabled {
@@ -365,8 +377,10 @@ struct ModelListView: View {
                     }
                     .pickerStyle(.menu)
                 }
+            }
 
-                // Reload button — always visible, applies all settings changes
+            // ---- Apply ----
+            Section {
                 Button {
                     if let model = selectedModel ?? localModels.first {
                         Task {
