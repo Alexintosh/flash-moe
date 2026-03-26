@@ -63,6 +63,28 @@ struct ChatView: View {
                 }
             }
 
+            // Background pause banner
+            if engine.generationPausedByBackground {
+                HStack(spacing: 8) {
+                    Image(systemName: "pause.circle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Generation paused (app was backgrounded)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Dismiss") {
+                        engine.generationPausedByBackground = false
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
             // Stats bar
             if isGenerating || engine.tokensGenerated > 0 {
                 StatsBar(
@@ -200,6 +222,7 @@ struct ChatView: View {
         guard !text.isEmpty else { return }
 
         inputText = ""
+        engine.generationPausedByBackground = false
         let userMessage = ChatMessage(role: .user, text: text, timestamp: Date())
         messages.append(userMessage)
 
