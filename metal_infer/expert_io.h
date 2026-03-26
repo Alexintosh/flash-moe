@@ -3,6 +3,39 @@
 // Included by infer.m — do NOT compile separately.
 
 // ============================================================================
+// Expert callback infrastructure (distributed inference / flashswarm)
+// ============================================================================
+
+// Forward-declare callback types for unity build (full definition in FlashMoEEngine.h)
+#ifndef FLASHMOE_ENGINE_H
+typedef ssize_t (*expert_read_fn)(int layer, int expert, void *dst, size_t size,
+                                  off_t offset, void *user_data);
+typedef int (*expert_compute_fn)(int layer, int expert, const float *input,
+                                 float *output, int hidden_dim, void *user_data);
+#endif
+
+// Global callback state -- wired from FlashMoEContext during load/set.
+// These are checked in the expert I/O path to route remote experts.
+static expert_read_fn g_expert_read_cb = NULL;
+static void *g_expert_read_user_data = NULL;
+static expert_compute_fn g_expert_compute_cb = NULL;
+static void *g_expert_compute_user_data = NULL;
+static const uint8_t *g_expert_remote_bitmap = NULL;
+static int g_expert_remote_bitmap_size = 0;
+
+// Check if an expert is marked as remote in the bitmap.
+// Returns 1 if remote (should use callback), 0 if local (native pread).
+// If bitmap is NULL and any callback is set, ALL experts are remote (legacy).
+static inline int expert_is_remote(int layer, int expert) {
+    if (!g_expert_read_cb && !g_expert_compute_cb) return 0;
+    if (!g_expert_remote_bitmap) return 1;
+    int bit_idx = layer * cfg.num_experts + expert;
+    int byte_idx = bit_idx / 8;
+    if (byte_idx >= g_expert_remote_bitmap_size) return 0;
+    return (g_expert_remote_bitmap[byte_idx] >> (bit_idx % 8)) & 1;
+}
+
+// ============================================================================
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
@@ -18,6 +51,9 @@ typedef struct {
     // LZ4 compression fields (set by caller when reading compressed experts)
     void *lz4_comp_buf;     // if non-NULL: pread into this, then LZ4 decompress into dst
     uint32_t lz4_comp_size; // compressed size to read from disk
+    // Expert identification (for callback routing in distributed inference)
+    int layer_idx;
+    int expert_idx;
 } InferPreadTask;
 
 typedef struct {
@@ -73,7 +109,11 @@ static void *io_pool_worker(void *arg) {
         // Process assigned tasks (stride by thread count)
         for (int i = tid; i < num_tasks; i += NUM_IO_THREADS) {
             InferPreadTask *t = &tasks[i];
-            if (t->lz4_comp_buf && t->lz4_comp_size > 0) {
+            if (g_expert_read_cb && expert_is_remote(t->layer_idx, t->expert_idx)) {
+                t->result = g_expert_read_cb(t->layer_idx, t->expert_idx,
+                                             t->dst, t->size, t->offset,
+                                             g_expert_read_user_data);
+            } else if (t->lz4_comp_buf && t->lz4_comp_size > 0) {
                 // LZ4 path: read compressed from SSD, decompress into dst
                 ssize_t nr = pread(t->fd, t->lz4_comp_buf, t->lz4_comp_size, t->offset);
                 if (nr == (ssize_t)t->lz4_comp_size) {
@@ -230,19 +270,30 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
             g_async_pread.tasks[task_idx].mmap_base = NULL;
             g_async_pread.tasks[task_idx].lz4_comp_buf = NULL;
             g_async_pread.tasks[task_idx].lz4_comp_size = 0;
+            g_async_pread.tasks[task_idx].layer_idx = layer_idx;
+            g_async_pread.tasks[task_idx].expert_idx = expert_indices[k];
         }
     }
 
-    // Fire off parallel preads on GCD — dispatch_group guarantees all blocks
+    // Fire off parallel preads on GCD -- dispatch_group guarantees all blocks
     // complete before dispatch_group_wait returns (no generation counter race).
+    // Remote experts (per bitmap) use the read callback instead of pread.
     static dispatch_queue_t io_q = NULL;
     if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
     int total_tasks = g_async_pread.num_tasks;
     for (int i = 0; i < total_tasks; i++) {
         InferPreadTask *t = &g_async_pread.tasks[i];
-        dispatch_group_async(g_async_pread.group, io_q, ^{
-            t->result = pread(t->fd, t->dst, t->size, t->offset);
-        });
+        if (g_expert_read_cb && expert_is_remote(t->layer_idx, t->expert_idx)) {
+            expert_read_fn cb = g_expert_read_cb;
+            void *ud = g_expert_read_user_data;
+            dispatch_group_async(g_async_pread.group, io_q, ^{
+                t->result = cb(t->layer_idx, t->expert_idx, t->dst, t->size, t->offset, ud);
+            });
+        } else {
+            dispatch_group_async(g_async_pread.group, io_q, ^{
+                t->result = pread(t->fd, t->dst, t->size, t->offset);
+            });
+        }
     }
 }
 
@@ -308,6 +359,8 @@ static int parallel_pread_experts(
         tasks[k].size = this_esz;
         tasks[k].result = 0;
         tasks[k].mmap_base = mmap_base;
+        tasks[k].layer_idx = layer_idx;
+        tasks[k].expert_idx = expert_indices[k];
     }
 
     io_pool_dispatch(tasks, K);
@@ -354,6 +407,8 @@ static int parallel_pread_experts_into(
         tasks[k].offset = this_offset;
         tasks[k].size = this_esz;
         tasks[k].result = 0;
+        tasks[k].layer_idx = layer_idx;
+        tasks[k].expert_idx = expert_indices[k];
     }
 
     io_pool_dispatch(tasks, K);

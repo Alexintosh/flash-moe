@@ -1940,6 +1940,8 @@ static void fused_layer_forward(
                 tasks[k].mmap_base = mmap_base;
                 tasks[k].lz4_comp_buf = NULL;
                 tasks[k].lz4_comp_size = 0;
+                tasks[k].layer_idx = layer_idx;
+                tasks[k].expert_idx = expert_indices[k];
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
             io_pool_dispatch(tasks, actual_K);
@@ -2004,9 +2006,27 @@ static void fused_layer_forward(
                 int eidx = expert_indices[k];
                 off_t expert_offset; size_t esz;
                 expert_offset_size(layer_idx, eidx, &expert_offset, &esz);
+
+                // Compute callback: skip pread+CPU compute for remote experts
+                if (g_expert_compute_cb && expert_is_remote(layer_idx, eidx)) {
+                    memset(expert_out_cpu, 0, cfg.hidden_dim * sizeof(float));
+                    int rc = g_expert_compute_cb(layer_idx, eidx, h_post, expert_out_cpu,
+                                                 cfg.hidden_dim, g_expert_compute_user_data);
+                    if (rc == 0) {
+                        cpu_vec_madd(moe_out, expert_out_cpu, expert_weights[k], cfg.hidden_dim);
+                    }
+                    continue;
+                }
+
                 void *expert_data = malloc(esz);
                 if (!expert_data) continue;
-                ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
+                ssize_t nread;
+                if (g_expert_read_cb && expert_is_remote(layer_idx, eidx)) {
+                    nread = g_expert_read_cb(layer_idx, eidx, expert_data, esz,
+                                             expert_offset, g_expert_read_user_data);
+                } else {
+                    nread = pread(packed_fd, expert_data, esz, expert_offset);
+                }
                 if (nread != (ssize_t)esz) { free(expert_data); continue; }
 
                 int use_2bit_k = g_use_2bit;
@@ -3671,6 +3691,8 @@ static void fused_layer_forward(
                         tasks[m].mmap_base = mmap_base;
                         tasks[m].lz4_comp_buf = NULL;
                         tasks[m].lz4_comp_size = 0;
+                        tasks[m].layer_idx = layer_idx;
+                        tasks[m].expert_idx = miss_ei[m];
                     }
                     io_pool_dispatch(tasks, miss_count);
                     for (int m = 0; m < miss_count; m++) {
@@ -3730,6 +3752,8 @@ static void fused_layer_forward(
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = NULL;  // always pread for cache population
+                    tasks[m].layer_idx = layer_idx;
+                    tasks[m].expert_idx = expert_indices[k];
                 }
 
                 io_pool_dispatch(tasks, num_misses);
@@ -3786,6 +3810,8 @@ static void fused_layer_forward(
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = mmap_base;
+                    tasks[m].layer_idx = layer_idx;
+                    tasks[m].expert_idx = expert_indices[k];
                 }
 
                 io_pool_dispatch(tasks, num_misses);
@@ -3847,6 +3873,8 @@ static void fused_layer_forward(
                     tasks[m].offset = eoff;
                     tasks[m].size = esz;
                     tasks[m].result = 0;
+                    tasks[m].layer_idx = layer_idx;
+                    tasks[m].expert_idx = miss_ei[m];
                 }
                 io_pool_dispatch(tasks, miss_count);
                 for (int m = 0; m < miss_count; m++) {
@@ -3869,6 +3897,8 @@ static void fused_layer_forward(
                 tasks[k].mmap_base = NULL;
                 tasks[k].lz4_comp_buf = g_lz4_comp_bufs[k];
                 tasks[k].lz4_comp_size = ie->comp_size;
+                tasks[k].layer_idx = layer_idx;
+                tasks[k].expert_idx = expert_indices[k];
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
             io_pool_dispatch(tasks, actual_K);
@@ -4114,13 +4144,33 @@ static void fused_layer_forward(
             int eidx = expert_indices[k];
             off_t expert_offset; size_t esz;
             expert_offset_size(layer_idx, eidx, &expert_offset, &esz);
+
+            // Compute callback: skip pread+CPU compute for remote experts
+            if (g_expert_compute_cb && expert_is_remote(layer_idx, eidx)) {
+                memset(expert_out_cpu, 0, cfg.hidden_dim * sizeof(float));
+                int rc = g_expert_compute_cb(layer_idx, eidx, h_post, expert_out_cpu,
+                                             cfg.hidden_dim, g_expert_compute_user_data);
+                if (rc == 0) {
+                    for (int d = 0; d < cfg.hidden_dim; d++) {
+                        moe_out[d] += expert_weights[k] * expert_out_cpu[d];
+                    }
+                }
+                continue;
+            }
+
             void *expert_data = malloc(esz);
             if (!expert_data) {
                 fprintf(stderr, "WARNING: layer %d expert %d malloc(%zu) failed, skipping\n",
                         layer_idx, eidx, esz);
                 continue;
             }
-            ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
+            ssize_t nread;
+            if (g_expert_read_cb && expert_is_remote(layer_idx, eidx)) {
+                nread = g_expert_read_cb(layer_idx, eidx, expert_data, esz,
+                                         expert_offset, g_expert_read_user_data);
+            } else {
+                nread = pread(packed_fd, expert_data, esz, expert_offset);
+            }
             if (nread != (ssize_t)esz) {
                 fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
                         layer_idx, eidx, nread, esz);
