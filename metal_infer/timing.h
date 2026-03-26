@@ -104,6 +104,8 @@ static int g_prefetch_layer = -1;                 // which layer the in-flight p
 static int g_expert_prefetch_enabled = 0;         // default OFF until validated; toggled via config/CLI
 static int g_prefetch_hits_total = 0;             // cross-layer prefetch hit counter
 static int g_prefetch_misses_total = 0;           // cross-layer prefetch miss counter
+static int g_prefetch_skipped_total = 0;          // skipped because CMD3 was reading from buf_B
+static int g_prefetch_launched_total = 0;         // cross-layer prefetch launches
 
 // Runtime KV sequence limit — set before model load.
 // On iOS: capped to adaptive context (e.g. 8192). On macOS: cfg.max_seq_len.
@@ -287,10 +289,11 @@ static void timing_print(void) {
         fprintf(stderr, "  [predict] hits=%llu misses=%llu rate=%.1f%% layers=%llu\n",
                 g_pred_hits, g_pred_misses, hit_rate, g_pred_layers);
     }
-    if (g_expert_prefetch_enabled && (g_prefetch_hits_total + g_prefetch_misses_total) > 0) {
+    if (g_expert_prefetch_enabled && (g_prefetch_hits_total + g_prefetch_misses_total + g_prefetch_launched_total + g_prefetch_skipped_total) > 0) {
         int total = g_prefetch_hits_total + g_prefetch_misses_total;
         double hit_rate = total > 0 ? (double)g_prefetch_hits_total / total * 100.0 : 0;
-        fprintf(stderr, "  [prefetch] hits=%d misses=%d rate=%.1f%%\n",
-                g_prefetch_hits_total, g_prefetch_misses_total, hit_rate);
+        fprintf(stderr, "  [prefetch] hits=%d misses=%d rate=%.1f%% launched=%d skipped_buf_b=%d\n",
+                g_prefetch_hits_total, g_prefetch_misses_total, hit_rate,
+                g_prefetch_launched_total, g_prefetch_skipped_total);
     }
 }

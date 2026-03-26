@@ -1597,6 +1597,9 @@ typedef struct {
     float shared_gate_score;            // saved shared expert gate score
     float *hidden;                      // pointer to hidden state (for writing final result)
     int layer_idx;                      // which layer produced this deferred state
+    int cmd3_uses_buf_b;                // 1 if any expert_bufs[k] points to buf_B (prefetch data)
+                                        // When set, cross-layer prefetch must NOT write into buf_B
+                                        // until CMD3 completes (GPU is still reading buf_B).
 } DeferredExpertState;
 
 static DeferredExpertState g_deferred = { .active = 0, .h_mid = NULL };
@@ -1650,6 +1653,7 @@ static void finalize_deferred_experts(void) {
 
     g_deferred.active = 0;
     g_deferred.gpu_combined = 0;
+    g_deferred.cmd3_uses_buf_b = 0;
     g_deferred.cmd_experts = nil;
 }
 
@@ -1670,6 +1674,7 @@ static void discard_deferred_experts(void) {
     if (g_deferred.active) {
         g_deferred.active = 0;
         g_deferred.gpu_combined = 0;
+        g_deferred.cmd3_uses_buf_b = 0;
         g_deferred.cmd_experts = nil;
     }
 }
@@ -2365,6 +2370,7 @@ static void fused_layer_forward(
             // Merged path: hidden already set from buf_h_mid above.
             // Clear deferred state so CMD3(N) can proceed.
             g_deferred.active = 0;
+            g_deferred.cmd3_uses_buf_b = 0;
             g_deferred.cmd_experts = nil;
         }
 
@@ -4038,6 +4044,22 @@ static void fused_layer_forward(
             g_timing.total += t1 - t_layer_start;
         }
 
+        // Check if CMD3 reads from any buf_B buffer. If so, cross-layer prefetch
+        // must NOT write into buf_B until CMD3 completes — the GPU would read
+        // partially-overwritten expert weights, producing gibberish output.
+        int cmd3_uses_buf_b = 0;
+        if (g_expert_prefetch_enabled) {
+            for (int k = 0; k < actual_K; k++) {
+                for (int b = 0; b < MAX_K; b++) {
+                    if (expert_bufs[k] == g_metal->buf_multi_expert_data_B[b]) {
+                        cmd3_uses_buf_b = 1;
+                        break;
+                    }
+                }
+                if (cmd3_uses_buf_b) break;
+            }
+        }
+
         // Save state for deferred completion
         g_deferred.active = 1;
         g_deferred.gpu_combined = gpu_combine;
@@ -4046,6 +4068,7 @@ static void fused_layer_forward(
         g_deferred.shared_gate_score = shared_gate_score;
         g_deferred.hidden = hidden;
         g_deferred.layer_idx = layer_idx;
+        g_deferred.cmd3_uses_buf_b = cmd3_uses_buf_b;
         if (!gpu_combine) {
             // Only need to save h_mid for CPU-side combine path
             memcpy(g_deferred.h_mid, h_mid, cfg.hidden_dim * sizeof(float));
@@ -4058,21 +4081,29 @@ static void fused_layer_forward(
         // Cross-layer prefetch: start pread'ing next layer's predicted experts into Set B.
         // CMD3 GPU execution overlaps with this I/O (~2.4ms of GPU time to hide behind).
         // Uses temporal prediction: last token's expert choices for layer N+1.
+        // SAFETY: skip if CMD3 is reading from buf_B — writing into buf_B would
+        // corrupt the GPU's in-flight expert data and produce gibberish.
         if (g_expert_prefetch_enabled && g_layer_fds_global &&
             layer_idx + 1 < cfg.num_layers &&
             g_pred_count && PRED_COUNT(layer_idx + 1) > 0 &&
             !g_prefetch_active && g_pred_generating && g_pred_valid) {
-            int next = layer_idx + 1;
-            int next_fd = g_layer_fds_global[next];
-            void *next_mmap = (g_layer_mmaps_global && g_layer_mmaps_global[next] != MAP_FAILED)
-                               ? g_layer_mmaps_global[next] : NULL;
-            if (next_fd >= 0 && g_metal->buf_multi_expert_data_B[0]) {
-                async_pread_start(next_fd, &PRED_EXPERT(next, 0),
-                                  PRED_COUNT(next),
-                                  g_metal->buf_multi_expert_data_B,
-                                  next_mmap, next);
-                g_prefetch_active = 1;
-                g_prefetch_layer = next;
+            if (cmd3_uses_buf_b) {
+                // CMD3 is reading from buf_B — cannot overwrite. Skip this prefetch.
+                g_prefetch_skipped_total++;
+            } else {
+                int next = layer_idx + 1;
+                int next_fd = g_layer_fds_global[next];
+                void *next_mmap = (g_layer_mmaps_global && g_layer_mmaps_global[next] != MAP_FAILED)
+                                   ? g_layer_mmaps_global[next] : NULL;
+                if (next_fd >= 0 && g_metal->buf_multi_expert_data_B[0]) {
+                    async_pread_start(next_fd, &PRED_EXPERT(next, 0),
+                                      PRED_COUNT(next),
+                                      g_metal->buf_multi_expert_data_B,
+                                      next_mmap, next);
+                    g_prefetch_active = 1;
+                    g_prefetch_layer = next;
+                    g_prefetch_launched_total++;
+                }
             }
         }
 
