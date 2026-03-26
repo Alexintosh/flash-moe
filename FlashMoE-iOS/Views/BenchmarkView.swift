@@ -162,10 +162,12 @@ final class BenchmarkRunner {
                     prefillTokens: 0,
                     ttftMs: 0,
                     tokensGenerated: 0,
-                    tokensPerSecond: 0,
+                    decodeTokPerSec: 0,
+                    engineTokPerSec: 0,
                     totalMs: 0,
                     outputSnippet: "Error: \(error.localizedDescription)",
-                    quality: "FAIL"
+                    quality: "FAIL",
+                    thermalState: "unknown"
                 )
                 results.append(errorResult)
                 continue
@@ -218,7 +220,6 @@ final class BenchmarkRunner {
         let thermal = thermalStateString()
         let startTime = CFAbsoluteTimeGetCurrent()
         var firstTokenTime: Double = 0
-        var secondTokenTime: Double = 0
         var output = ""
         var tokenCount = 0
         var lastEngTokPerSec: Double = 0
@@ -231,8 +232,6 @@ final class BenchmarkRunner {
             if !gotFirstToken {
                 firstTokenTime = CFAbsoluteTimeGetCurrent()
                 gotFirstToken = true
-            } else if tokenCount == 1 {
-                secondTokenTime = CFAbsoluteTimeGetCurrent()
             }
             tokenCount += 1
             lastEngTokPerSec = token.tokensPerSecond
@@ -492,7 +491,8 @@ struct BenchmarkView: View {
             HStack(spacing: 12) {
                 metricLabel("TTFT", String(format: "%.0fms", result.ttftMs))
                 metricLabel("Toks", "\(result.tokensGenerated)")
-                metricLabel("tok/s", String(format: "%.1f", result.tokensPerSecond))
+                metricLabel("dec tok/s", String(format: "%.1f", result.decodeTokPerSec))
+                metricLabel("eng tok/s", String(format: "%.1f", result.engineTokPerSec))
                 metricLabel("Total", String(format: "%.0fms", result.totalMs))
             }
 
