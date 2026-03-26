@@ -1517,6 +1517,7 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        int validate_prefill = 0;  // 1 = run batched prefill validation and exit
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -1550,6 +1551,7 @@ int main(int argc, char **argv) {
             {"pfb",           required_argument, 0, 0x103},
             {"prefill-skip-experts",       no_argument, 0, 0x104},
             {"prefill-experts-full-only",  no_argument, 0, 0x105},
+            {"validate-prefill",           no_argument, 0, 0x106},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -1628,6 +1630,7 @@ int main(int argc, char **argv) {
                 case 0x103: g_prefill_batch = atoi(optarg); break;
                 case 0x104: g_prefill_skip_experts = 1; break;
                 case 0x105: g_prefill_experts_full_only = 1; break;
+                case 0x106: validate_prefill = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -1754,6 +1757,14 @@ int main(int argc, char **argv) {
         // Wrap weight file for Metal GPU access
         if (g_metal) {
             metal_set_weights(g_metal, wf->data, wf->size);
+        }
+
+        // ---- Batched prefill validation (if requested) ----
+        if (validate_prefill) {
+            fprintf(stderr, "\n=== Batched Prefill GEMM Validation ===\n");
+            pfb_validate_all(wf);
+            fprintf(stderr, "=== Validation complete ===\n\n");
+            return 0;
         }
 
         // ---- Load vocabulary ----

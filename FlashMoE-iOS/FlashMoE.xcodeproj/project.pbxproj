@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		FF1111111111111111111111 /* BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF2222222222222222222222 /* BenchmarkView.swift */; };
 		0BA5B28A95E8C0616CCA6A3D /* FlashMoEApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EAF41B16BD4314D3642DC53 /* FlashMoEApp.swift */; };
 		15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AEBDCE15020A40A8451CB5A /* ContentView.swift */; };
 		23E305445AFD3D5FB1A5E5FC /* ModelListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */; };
@@ -27,6 +28,7 @@
 
 /* Begin PBXFileReference section */
 		03B08EB0D0CE594165AB1C14 /* FlashMoE-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "FlashMoE-Bridging-Header.h"; sourceTree = "<group>"; };
+		FF2222222222222222222222 /* BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkView.swift; sourceTree = "<group>"; };
 		2AEBDCE15020A40A8451CB5A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		3321AD5929C6B6D4FAD446C8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		3404570FACF1297B40EF6369 /* FlashMoEEngine.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FlashMoEEngine.h; sourceTree = "<group>"; };
@@ -145,6 +147,7 @@
 		993DF219F89AA4229E9A43D2 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				FF2222222222222222222222 /* BenchmarkView.swift */,
 				BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */,
 				2AEBDCE15020A40A8451CB5A /* ContentView.swift */,
 				DD2222222222222222222222 /* ModelDownloadRow.swift */,
@@ -247,6 +250,7 @@
 			files = (
 				D8242F5999552BC228A650CE /* shaders.metal in Sources */,
 				CC1111111111111111111111 /* AppDelegate.swift in Sources */,
+				FF1111111111111111111111 /* BenchmarkView.swift in Sources */,
 				86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */,
 				15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */,
 				BB1111111111111111111111 /* DownloadManager.swift in Sources */,

@@ -564,11 +564,18 @@ static MetalCtx *metal_setup(void) {
     // ---- Batched prefill buffers ----
     // Only allocate if the GEMM kernel compiled successfully
     if (ctx->pfb_gemm_4bit) {
-        size_t pfb_hidden = (size_t)MAX_PFB_GPU * cfg.hidden_dim * sizeof(float);
+        // buf_pfb_input is used for both hidden states AND attention output copies.
+        // Attention output is q_dim = num_heads * head_dim, which can exceed hidden_dim
+        // (e.g., 35B: hidden_dim=2048, q_dim=4096). Size for the maximum.
+        size_t pfb_input_dim = (size_t)cfg.hidden_dim;
+        size_t q_dim = (size_t)cfg.num_attn_heads * cfg.head_dim;
+        if (q_dim > pfb_input_dim) pfb_input_dim = q_dim;
+        size_t pfb_hidden = (size_t)MAX_PFB_GPU * pfb_input_dim * sizeof(float);
         ctx->buf_pfb_input = [ctx->device newBufferWithLength:pfb_hidden
                                                       options:MTLResourceStorageModeShared];
         // Scratch output buffers — each large enough for biggest batched projection
-        size_t max_proj_dim = cfg.num_attn_heads * cfg.head_dim;  // q_proj
+        // q_proj outputs num_attn_heads * head_dim * 2 (includes gate), so use that
+        size_t max_proj_dim = (size_t)cfg.num_attn_heads * cfg.head_dim * 2;  // q_proj_dim (16384)
         if ((size_t)cfg.linear_conv_dim > max_proj_dim) max_proj_dim = cfg.linear_conv_dim;
         if ((size_t)cfg.shared_intermediate > max_proj_dim) max_proj_dim = cfg.shared_intermediate;
         if ((size_t)cfg.moe_intermediate > max_proj_dim) max_proj_dim = cfg.moe_intermediate;

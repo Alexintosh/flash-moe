@@ -30,6 +30,7 @@ struct ChatView: View {
     @State private var showStats = false
     @State private var showModelInfo = false
     @State private var showProfiler = false
+    @State private var showBenchmark = false
     @State private var scrollAnchor = UUID()  // updates on each token to trigger scroll
     @FocusState private var inputFocused: Bool
     @AppStorage("thinkingEnabled") private var thinkingEnabled: Bool = true
@@ -130,6 +131,9 @@ struct ChatView: View {
                     Button("Show Stats", systemImage: "chart.bar") {
                         showStats.toggle()
                     }
+                    Button("Benchmark", systemImage: "gauge.with.dots.needle.50percent") {
+                        showBenchmark = true
+                    }
                     Divider()
                     Button("Models & Settings", systemImage: "gearshape") {
                         messages.removeAll()
@@ -160,6 +164,9 @@ struct ChatView: View {
                     Button("Show Stats", systemImage: "chart.bar") {
                         showStats.toggle()
                     }
+                    Button("Benchmark", systemImage: "gauge.with.dots.needle.50percent") {
+                        showBenchmark = true
+                    }
                     Divider()
                     Button("Models & Settings", systemImage: "gearshape") {
                         messages.removeAll()
@@ -174,6 +181,12 @@ struct ChatView: View {
 #endif
         .sheet(isPresented: $showModelInfo) {
             ModelInfoSheet(info: engine.modelInfo)
+        }
+        .sheet(isPresented: $showBenchmark) {
+            NavigationStack {
+                BenchmarkView(modelPath: UserDefaults.standard.string(forKey: "lastLoadedModelPath") ?? "")
+                    .environment(engine)
+            }
         }
     }
 
@@ -205,14 +218,29 @@ struct ChatView: View {
 
             var gotTokens = false
             var tokenCount = 0
+            var inThinkBlock = false
             for await token in stream {
                 gotTokens = true
                 tokenCount += 1
                 // Strip special tokens that leak through
-                let clean = token.text
+                var clean = token.text
                     .replacingOccurrences(of: "<|im_end|>", with: "")
                     .replacingOccurrences(of: "<|im_start|>", with: "")
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
+
+                // When thinking is OFF, suppress <think>...</think> content
+                if !thinkingEnabled {
+                    if clean.contains("<think>") {
+                        inThinkBlock = true
+                        clean = clean.replacingOccurrences(of: "<think>", with: "")
+                    }
+                    if clean.contains("</think>") {
+                        inThinkBlock = false
+                        clean = clean.replacingOccurrences(of: "</think>", with: "")
+                    }
+                    if inThinkBlock { clean = "" }
+                }
+
                 if !clean.isEmpty {
                     messages[assistantIndex].text += clean
                     // Auto-scroll every few tokens (not every token to avoid scroll jank)
@@ -230,12 +258,18 @@ struct ChatView: View {
                 let formattedPrompt = buildChatPrompt(userMessage: text)
                 let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 2048)
                 tokenCount = 0
+                inThinkBlock = false
                 for await token in fallbackStream {
                     tokenCount += 1
-                    let clean = token.text
+                    var clean = token.text
                         .replacingOccurrences(of: "<|im_end|>", with: "")
                         .replacingOccurrences(of: "<|im_start|>", with: "")
                         .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    if !thinkingEnabled {
+                        if clean.contains("<think>") { inThinkBlock = true; clean = clean.replacingOccurrences(of: "<think>", with: "") }
+                        if clean.contains("</think>") { inThinkBlock = false; clean = clean.replacingOccurrences(of: "</think>", with: "") }
+                        if inThinkBlock { clean = "" }
+                    }
                     if !clean.isEmpty {
                         messages[assistantIndex].text += clean
                         if tokenCount % 3 == 0 {
@@ -269,7 +303,11 @@ struct ChatView: View {
             }
         }
 
-        prompt += "<|im_start|>assistant\n"
+        // Qwen3.5 ALWAYS expects <think> after assistant start tag.
+        // Without it, the model emits EOS immediately. The /no_think
+        // instruction in the system prompt makes thinking brief, but
+        // the tag must be present for the model to generate anything.
+        prompt += "<|im_start|>assistant\n<think>\n"
         return prompt
     }
 }

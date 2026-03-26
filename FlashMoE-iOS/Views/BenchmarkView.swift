@@ -1,0 +1,438 @@
+/*
+ * BenchmarkView.swift -- Built-in benchmark mode for Flash-MoE iOS
+ *
+ * Runs a test matrix of prompts x settings configurations,
+ * logs structured results (tab-separated), and provides
+ * copy-to-clipboard for analysis.
+ */
+
+import SwiftUI
+
+// MARK: - Benchmark Data Types
+
+struct BenchmarkPrompt: Identifiable {
+    let id: String
+    let label: String
+    let text: String
+
+    static let builtIn: [BenchmarkPrompt] = [
+        BenchmarkPrompt(id: "short", label: "Short", text: "Hi"),
+        BenchmarkPrompt(id: "medium", label: "Medium", text: "What is an SSD and how does it work?"),
+        BenchmarkPrompt(id: "long", label: "Long", text: "Explain the differences between CPU, GPU, and TPU architectures. Compare their memory hierarchies, parallelism models, and ideal workloads. Include specific examples."),
+        BenchmarkPrompt(id: "json", label: "JSON", text: "Respond with a JSON object containing: name, age, hobbies (array of 3), and address (nested object with street, city, country)"),
+        BenchmarkPrompt(id: "code", label: "Code", text: "Write a Python function that implements binary search on a sorted array. Include docstring and type hints."),
+    ]
+}
+
+struct BenchmarkConfig: Identifiable {
+    let id: String
+    let name: String
+    let activeExpertsK: Int
+    let cmdMerge: Bool
+    let fusedAttention: Bool
+    let cacheIOSplit: Int
+    let fp16Accumulation: Bool
+
+    static let builtIn: [BenchmarkConfig] = [
+        BenchmarkConfig(id: "baseline", name: "Baseline K=8", activeExpertsK: 8, cmdMerge: false, fusedAttention: false, cacheIOSplit: 1, fp16Accumulation: false),
+        BenchmarkConfig(id: "k4_merge", name: "K=4+Merge", activeExpertsK: 4, cmdMerge: true, fusedAttention: false, cacheIOSplit: 1, fp16Accumulation: false),
+        BenchmarkConfig(id: "k4_merge_fused", name: "K=4+Merge+Fused F2", activeExpertsK: 4, cmdMerge: true, fusedAttention: true, cacheIOSplit: 2, fp16Accumulation: false),
+        BenchmarkConfig(id: "k4_merge_fused_fp16", name: "K=4+Merge+Fused+FP16", activeExpertsK: 4, cmdMerge: true, fusedAttention: true, cacheIOSplit: 2, fp16Accumulation: true),
+        BenchmarkConfig(id: "k3_merge_fused_fp16", name: "K=3+Merge+Fused+FP16", activeExpertsK: 3, cmdMerge: true, fusedAttention: true, cacheIOSplit: 2, fp16Accumulation: true),
+    ]
+}
+
+struct BenchmarkResult: Identifiable {
+    let id = UUID()
+    let configName: String
+    let promptLabel: String
+    let promptText: String
+    let prefillTokens: Int
+    let ttftMs: Double
+    let tokensGenerated: Int
+    let tokensPerSecond: Double
+    let totalMs: Double
+    let outputSnippet: String
+    let quality: String
+
+    var tsvLine: String {
+        let truncatedPrompt = promptText.count > 50
+            ? String(promptText.prefix(50)) + "..."
+            : promptText
+        let cleanSnippet = outputSnippet
+            .replacingOccurrences(of: "\t", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        return "\(configName)\t\(truncatedPrompt)\t\(prefillTokens)\t\(String(format: "%.0f", ttftMs))\t\(tokensGenerated)\t\(String(format: "%.1f", tokensPerSecond))\t\(String(format: "%.0f", totalMs))\t\(quality)\t\(cleanSnippet)"
+    }
+}
+
+// MARK: - Benchmark Runner (Observable)
+
+@Observable @MainActor
+final class BenchmarkRunner {
+    var isRunning = false
+    var isCancelled = false
+    var currentConfigIndex = 0
+    var currentPromptIndex = 0
+    var totalConfigs: Int = BenchmarkConfig.builtIn.count
+    var totalPrompts: Int = BenchmarkPrompt.builtIn.count
+    var results: [BenchmarkResult] = []
+    var statusMessage = "Ready"
+    var progressDetail = ""
+
+    let maxTokensPerRun = 50
+
+    func cancel() {
+        isCancelled = true
+        statusMessage = "Cancelling..."
+    }
+
+    func run(engine: FlashMoEEngine, modelPath: String) async {
+        isRunning = true
+        isCancelled = false
+        results = []
+        currentConfigIndex = 0
+        currentPromptIndex = 0
+        totalConfigs = BenchmarkConfig.builtIn.count
+        totalPrompts = BenchmarkPrompt.builtIn.count
+        statusMessage = "Starting benchmark..."
+
+        let configs = BenchmarkConfig.builtIn
+        let prompts = BenchmarkPrompt.builtIn
+
+        for (ci, config) in configs.enumerated() {
+            if isCancelled { break }
+
+            currentConfigIndex = ci
+            statusMessage = "Loading config \(ci + 1)/\(configs.count): \(config.name)"
+            progressDetail = "Reloading model..."
+
+            // Unload and reload with new config
+            engine.unloadModel()
+            // Small delay to let resources release
+            try? await Task.sleep(for: .milliseconds(500))
+
+            do {
+                try await engine.loadModel(
+                    at: modelPath,
+                    thinkBudget: -1,  // disable thinking for benchmarks
+                    activeExpertsK: config.activeExpertsK,
+                    cacheIOSplit: config.cacheIOSplit,
+                    cmdMerge: config.cmdMerge,
+                    fusedAttention: config.fusedAttention,
+                    fp16Accumulation: config.fp16Accumulation,
+                    verbose: false
+                )
+            } catch {
+                let errorResult = BenchmarkResult(
+                    configName: config.name,
+                    promptLabel: "ALL",
+                    promptText: "LOAD FAILED",
+                    prefillTokens: 0,
+                    ttftMs: 0,
+                    tokensGenerated: 0,
+                    tokensPerSecond: 0,
+                    totalMs: 0,
+                    outputSnippet: "Error: \(error.localizedDescription)",
+                    quality: "FAIL"
+                )
+                results.append(errorResult)
+                continue
+            }
+
+            // Run each prompt with this config
+            for (pi, prompt) in prompts.enumerated() {
+                if isCancelled { break }
+
+                currentPromptIndex = pi
+                statusMessage = "Config \(ci + 1)/\(configs.count), Prompt \(pi + 1)/\(prompts.count)"
+                progressDetail = "\(config.name) | \(prompt.label)"
+
+                // Reset conversation state between prompts
+                engine.reset()
+
+                let result = await runSingleBenchmark(
+                    engine: engine,
+                    config: config,
+                    prompt: prompt
+                )
+
+                results.append(result)
+            }
+        }
+
+        isRunning = false
+        statusMessage = isCancelled ? "Cancelled" : "Complete (\(results.count) runs)"
+        progressDetail = ""
+    }
+
+    private func runSingleBenchmark(
+        engine: FlashMoEEngine,
+        config: BenchmarkConfig,
+        prompt: BenchmarkPrompt
+    ) async -> BenchmarkResult {
+        // Build Qwen chat template (no thinking)
+        let formatted = "<|im_start|>system\nYou are a helpful assistant. /no_think<|im_end|>\n<|im_start|>user\n\(prompt.text)<|im_end|>\n<|im_start|>assistant\n<think>\n"
+
+        let startTime = CFAbsoluteTimeGetCurrent()
+        var firstTokenTime: Double = 0
+        var output = ""
+        var tokenCount = 0
+        var lastTokPerSec: Double = 0
+        var gotFirstToken = false
+
+        let stream = engine.generate(prompt: formatted, maxTokens: maxTokensPerRun)
+
+        for await token in stream {
+            if !gotFirstToken {
+                firstTokenTime = CFAbsoluteTimeGetCurrent()
+                gotFirstToken = true
+            }
+            tokenCount += 1
+            lastTokPerSec = token.tokensPerSecond
+
+            // Clean special tokens
+            var clean = token.text
+                .replacingOccurrences(of: "<|im_end|>", with: "")
+                .replacingOccurrences(of: "<|im_start|>", with: "")
+                .replacingOccurrences(of: "<|endoftext|>", with: "")
+                .replacingOccurrences(of: "<think>", with: "")
+                .replacingOccurrences(of: "</think>", with: "")
+            output += clean
+        }
+
+        let endTime = CFAbsoluteTimeGetCurrent()
+        let totalMs = (endTime - startTime) * 1000
+        let ttftMs = gotFirstToken ? (firstTokenTime - startTime) * 1000 : 0
+
+        // Quality check
+        let hasGibberish = output.contains("!!!!") || output.contains("????")
+        let quality = hasGibberish ? "GIBBERISH" : "OK"
+
+        // Estimate prefill tokens (rough: ~1.3 tokens per word + special tokens overhead)
+        let wordCount = prompt.text.split(separator: " ").count
+        let estimatedPrefillTokens = wordCount + 10  // +10 for chat template tokens
+
+        let snippet = String(output.prefix(100))
+
+        return BenchmarkResult(
+            configName: config.name,
+            promptLabel: prompt.label,
+            promptText: prompt.text,
+            prefillTokens: estimatedPrefillTokens,
+            ttftMs: ttftMs,
+            tokensGenerated: tokenCount,
+            tokensPerSecond: lastTokPerSec,
+            totalMs: totalMs,
+            outputSnippet: snippet,
+            quality: quality
+        )
+    }
+
+    var fullTSV: String {
+        var lines = "Config\tPrompt\tPrefillToks\tTTFT_ms\tGenToks\tTokPerSec\tTotalMs\tQuality\tOutput\n"
+        for r in results {
+            lines += r.tsvLine + "\n"
+        }
+        return lines
+    }
+}
+
+// MARK: - Benchmark View
+
+struct BenchmarkView: View {
+    @Environment(FlashMoEEngine.self) private var engine
+    let modelPath: String
+
+    @State private var runner = BenchmarkRunner()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Status header
+            statusHeader
+
+            Divider()
+
+            // Results
+            if runner.results.isEmpty && !runner.isRunning {
+                emptyState
+            } else {
+                resultsList
+            }
+        }
+        .navigationTitle("Benchmark")
+#if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+#endif
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                if runner.isRunning {
+                    Button("Stop") {
+                        engine.cancel()
+                        runner.cancel()
+                    }
+                    .foregroundStyle(.red)
+                } else {
+                    Button("Copy Results") {
+                        copyResults()
+                    }
+                    .disabled(runner.results.isEmpty)
+                }
+            }
+        }
+    }
+
+    // MARK: - Status Header
+
+    private var statusHeader: some View {
+        VStack(spacing: 12) {
+            if runner.isRunning {
+                VStack(spacing: 6) {
+                    ProgressView(
+                        value: Double(runner.currentConfigIndex * runner.totalPrompts + runner.currentPromptIndex),
+                        total: Double(runner.totalConfigs * runner.totalPrompts)
+                    )
+
+                    Text(runner.statusMessage)
+                        .font(.headline)
+
+                    if !runner.progressDetail.isEmpty {
+                        Text(runner.progressDetail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding()
+            } else {
+                VStack(spacing: 8) {
+                    Text(runner.statusMessage)
+                        .font(.headline)
+
+                    Text("\(BenchmarkConfig.builtIn.count) configs x \(BenchmarkPrompt.builtIn.count) prompts = \(BenchmarkConfig.builtIn.count * BenchmarkPrompt.builtIn.count) runs, \(runner.maxTokensPerRun) tokens each")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        Task {
+                            await runner.run(engine: engine, modelPath: modelPath)
+                        }
+                    } label: {
+                        Label("Run Benchmark", systemImage: "play.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .disabled(engine.state != .ready && !runner.isRunning)
+                }
+                .padding()
+            }
+        }
+        .background(.ultraThinMaterial)
+    }
+
+    // MARK: - Empty State
+
+    private var emptyState: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            Image(systemName: "gauge.with.dots.needle.50percent")
+                .font(.system(size: 48))
+                .foregroundStyle(.secondary)
+            Text("Tap Run Benchmark to start")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            Text("Tests 5 prompts across 5 configurations.\nModel reloads between config changes.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+            Spacer()
+        }
+        .padding()
+    }
+
+    // MARK: - Results List
+
+    private var resultsList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                // Header row
+                Text("Config\tPrompt\tPrefill\tTTFT\tToks\ttok/s\tTotal\tQual\tOutput")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 8)
+
+                ForEach(runner.results) { result in
+                    resultRow(result)
+                }
+            }
+        }
+    }
+
+    private func resultRow(_ result: BenchmarkResult) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Text(result.configName)
+                    .font(.system(.caption, design: .monospaced))
+                    .fontWeight(.semibold)
+                    .lineLimit(1)
+
+                Text(result.promptLabel)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Spacer()
+
+                Text(result.quality)
+                    .font(.system(.caption2, design: .monospaced))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(result.quality == "OK" ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            }
+
+            HStack(spacing: 12) {
+                metricLabel("TTFT", String(format: "%.0fms", result.ttftMs))
+                metricLabel("Toks", "\(result.tokensGenerated)")
+                metricLabel("tok/s", String(format: "%.1f", result.tokensPerSecond))
+                metricLabel("Total", String(format: "%.0fms", result.totalMs))
+            }
+
+            if !result.outputSnippet.isEmpty {
+                Text(result.outputSnippet)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            runner.results.firstIndex(where: { $0.id == result.id }).map { $0 % 2 == 0 } == true
+            ? Color.clear : Color.secondary.opacity(0.05)
+        )
+    }
+
+    private func metricLabel(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 2) {
+            Text(label)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(.caption2, design: .monospaced))
+                .fontWeight(.medium)
+        }
+    }
+
+    // MARK: - Actions
+
+    private func copyResults() {
+#if os(iOS)
+        UIPasteboard.general.string = runner.fullTSV
+#elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(runner.fullTSV, forType: .string)
+#endif
+    }
+}
