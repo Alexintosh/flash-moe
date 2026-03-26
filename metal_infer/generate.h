@@ -1501,6 +1501,8 @@ static void print_usage(const char *prog) {
     printf("  --pfb N              Prefill batch size (default: 1 = token-by-token)\n");
     printf("  --prefill-skip-experts    Skip routed experts during prefill (shared only)\n");
     printf("  --prefill-experts-full-only  Experts only at full attention layers during prefill\n");
+    printf("  --fused-expert       Enable fused gate+up+SwiGLU expert kernel (experimental)\n");
+    printf("  --validate-fused     Run fused vs separate expert kernel comparison (enables --fused-expert)\n");
     printf("  --help               This message\n");
 }
 
@@ -1552,6 +1554,8 @@ int main(int argc, char **argv) {
             {"prefill-skip-experts",       no_argument, 0, 0x104},
             {"prefill-experts-full-only",  no_argument, 0, 0x105},
             {"validate-prefill",           no_argument, 0, 0x106},
+            {"fused-expert",               no_argument, 0, 0x107},
+            {"validate-fused",             no_argument, 0, 0x108},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -1631,6 +1635,8 @@ int main(int argc, char **argv) {
                 case 0x104: g_prefill_skip_experts = 1; break;
                 case 0x105: g_prefill_experts_full_only = 1; break;
                 case 0x106: validate_prefill = 1; break;
+                case 0x107: g_fused_expert_enabled = 1; break;
+                case 0x108: g_fused_expert_validate = 1; g_fused_expert_enabled = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }

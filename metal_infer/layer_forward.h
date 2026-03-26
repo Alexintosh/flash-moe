@@ -1188,10 +1188,25 @@ static void moe_forward(
             off_t expert_offset; size_t esz;
             expert_offset_size(layer_idx, eidx, &expert_offset, &esz);
 
-            if (g_metal && g_metal->buf_expert_data) {
+            // Compute callback: skip pread+GPU entirely for remote experts
+            if (g_expert_compute_cb && expert_is_remote(layer_idx, eidx)) {
+                int rc = g_expert_compute_cb(layer_idx, eidx, h_post, expert_out,
+                                             cfg.hidden_dim, g_expert_compute_user_data);
+                if (rc != 0) {
+                    fprintf(stderr, "WARNING: layer %d expert %d compute callback failed\n",
+                            layer_idx, eidx);
+                    continue;
+                }
+            } else if (g_metal && g_metal->buf_expert_data) {
                 // GPU path: pread directly into Metal buffer, run gate+up+swiglu+down on GPU
                 void *expert_buf_ptr = [g_metal->buf_expert_data contents];
-                ssize_t nread = pread(packed_fd, expert_buf_ptr, esz, expert_offset);
+                ssize_t nread;
+                if (g_expert_read_cb && expert_is_remote(layer_idx, eidx)) {
+                    nread = g_expert_read_cb(layer_idx, eidx, expert_buf_ptr, esz,
+                                             expert_offset, g_expert_read_user_data);
+                } else {
+                    nread = pread(packed_fd, expert_buf_ptr, esz, expert_offset);
+                }
                 if (nread != (ssize_t)esz) {
                     fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
                             layer_idx, eidx, nread, esz);
@@ -1207,7 +1222,13 @@ static void moe_forward(
                             layer_idx, eidx, esz);
                     continue;
                 }
-                ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
+                ssize_t nread;
+                if (g_expert_read_cb && expert_is_remote(layer_idx, eidx)) {
+                    nread = g_expert_read_cb(layer_idx, eidx, expert_data, esz,
+                                             expert_offset, g_expert_read_user_data);
+                } else {
+                    nread = pread(packed_fd, expert_data, esz, expert_offset);
+                }
                 if (nread != (ssize_t)esz) {
                     fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
                             layer_idx, eidx, nread, esz);
@@ -1932,6 +1953,11 @@ static void fused_layer_forward(
                    cfg.shared_intermediate * sizeof(float));
             memcpy([g_metal->buf_shared_up contents], shared_up,
                    cfg.shared_intermediate * sizeof(float));
+
+            // Validation: compare fused vs separate expert kernel (first valid expert, once)
+            if (g_fused_expert_validate && valid[0]) {
+                gpu_validate_fused_expert(g_metal, expert_bufs[0]);
+            }
 
             id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
             gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs,
