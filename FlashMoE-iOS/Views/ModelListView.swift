@@ -160,6 +160,10 @@ struct ModelListView: View {
     @State private var modelToDelete: LocalModel? = nil
     @State private var customRepoURL: String = ""
     @State private var showCustomURLError: String? = nil
+    @State private var showSpeed = false
+    @State private var showPipeline = false
+    @State private var showContext = false
+    @State private var showGeneration = false
     @State private var customEntries: [CatalogEntry] = []
     @State private var isResolvingURL = false
     private let downloadManager = DownloadManager.shared
@@ -278,7 +282,8 @@ struct ModelListView: View {
             }
 
             // ---- Speed Settings ----
-            Section("Speed") {
+            Section {
+                DisclosureGroup("Speed", isExpanded: $showSpeed) {
                 Picker(selection: $activeExpertsK) {
                     Text("Model default").tag(0)
                     Text("K=2 (fastest)").tag(2)
@@ -310,18 +315,22 @@ struct ModelListView: View {
                 .pickerStyle(.menu)
 
                 Toggle(isOn: $fp16Accumulation) { settingLabel("FP16 Accumulation", key: "fp16Accum") }
+                }
             }
 
             // ---- GPU Pipeline ----
-            Section("GPU Pipeline") {
+            Section {
+                DisclosureGroup("GPU Pipeline", isExpanded: $showPipeline) {
                 Toggle(isOn: $cmdMergeEnabled) { settingLabel("CMD1+CMD2 Merge", key: "cmdMerge") }
                 Toggle(isOn: $fusedAttention) { settingLabel("Fused Attention", key: "fusedAttention") }
                 Toggle(isOn: $fusedExpert) { settingLabel("Fused Expert Kernel", key: "fusedExpert") }
                 Toggle(isOn: $expertPrefetch) { settingLabel("Expert Prefetch", key: "expertPrefetch") }
+                }
             }
 
             // ---- Context & Memory ----
-            Section("Context & Memory") {
+            Section {
+                DisclosureGroup("Context & Memory", isExpanded: $showContext) {
                 Toggle(isOn: $fp8KVCache) { settingLabel("FP8 KV Cache", key: "fp8KV") }
 
                 Picker(selection: $maxContext) {
@@ -360,10 +369,12 @@ struct ModelListView: View {
                     Text("YaRN 4x").tag(34)
                 } label: { settingLabel("RoPE Scaling", key: "ropeScaling") }
                 .pickerStyle(.menu)
+                }
             }
 
             // ---- Generation ----
-            Section("Generation") {
+            Section {
+                DisclosureGroup("Generation", isExpanded: $showGeneration) {
                 Toggle(isOn: $thinkingEnabled) { settingLabel("Thinking", key: "thinking") }
 
                 if thinkingEnabled {
@@ -376,6 +387,7 @@ struct ModelListView: View {
                         Text("Unlimited").tag(0)
                     }
                     .pickerStyle(.menu)
+                }
                 }
             }
 
