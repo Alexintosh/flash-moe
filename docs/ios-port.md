@@ -12,12 +12,13 @@ A native SwiftUI iOS app that runs Qwen3.5 MoE models on iPhone, sharing 100% of
 
 | Device | Model | K | tok/s | Notes |
 |--------|-------|---|-------|-------|
+| iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B (tiered) | 4 | **11** | Fused Att + CMD Merge + Fanout 2. Best measured. |
+| iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B (tiered) | 4 | **17.3 prefill** | Batched prefill: 58 tokens in 3357ms |
 | iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B | 8 | **5.5** | Full quality, full GPU path |
 | iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B (tiered) | 8 | **5.5+** | 13.4GB download, same quality |
-| iPhone 17 (12GB, A19) | Qwen3.5-35B-A3B | 4 | **~11*** | *Projected with K=4 + all optimizations (CMD merge, fused expert, prefetch) |
 | iPhone 17 (12GB, A19) | Qwen3.5-397B-A17B | 4 | ~0.003 | CPU fallback only (Metal 4GB buffer limit) |
 
-iPhone achieves 57% of laptop speed on the 35B model with 17% of the memory. With K=4 and all Expert Settings optimizations enabled, projections reach ~11 tok/s on the 35B.
+iPhone achieves **11 tok/s** on the 35B model with K=4 and optimizations enabled (Fused Attention, CMD Merge, Fanout 2). Batched prefill achieves 17.3 tok/s throughput, dramatically reducing TTFT (time to first token).
 
 ## iOS App Features
 
@@ -55,7 +56,9 @@ All settings include info modals with plain-language analogies and technical exp
 - **Sliding Window** — Circular KV buffer for full attention layers (0/2048/4096/8192)
 - **Thinking Mode** — Enable/disable `<think>` chain-of-thought with configurable budget
 - **H2O Budget** — Heavy Hitter Oracle KV eviction (coming soon)
+- **RoPE Scaling** — Context extension method (None/Linear/NTK/YaRN) with scale factor
 - Max generation tokens bumped from 500 to 2048
+- Settings organized in collapsible sections: Speed, GPU Pipeline, Context, Generation
 
 ### Profiler
 - Resource monitoring overlay
@@ -234,6 +237,45 @@ The GPTQ quantization pipeline opens a realistic path to running the full 397B m
 - Validate GPTQ 2-bit JSON quality on real tool-calling workloads
 
 See [docs/quantization-guide.md](quantization-guide.md) for the full GPTQ pipeline documentation.
+
+## Batched Prefill
+
+GEMM-based prompt processing for all 40 layers. Instead of processing prompt tokens one-by-one, the prefill phase uses matrix-matrix multiplications to process the entire prompt in parallel.
+
+- 13 new Metal kernels: batched RoPE, batched RMS norm, batched attention (Q@K^T with causal mask), batched SwiGLU, batched MoE combine
+- Layer-first ordering: all tokens through layer 0, then layer 1, etc.
+- 17.3 tok/s prefill throughput on iPhone 17 (58 tokens in 3357ms)
+- Partial GPU post-projection for attention layers
+- Expert forward still uses per-token dispatch (experts are I/O-bound, batching doesn't help)
+- KV cache sync: GPU-to-CPU mirror after batched prefill completes
+
+## GPU Background Handling
+
+iOS app responds to app lifecycle notifications to prevent jetsam kills:
+
+- `UIApplicationDidEnterBackground`: cancels in-flight Metal command buffers, flushes GPU pipeline, releases non-essential Metal resources
+- `UIApplicationWillEnterForeground`: re-validates Metal device, re-creates command queue if needed
+- Prevents background GPU memory pressure from triggering iOS memory jetsam
+
+## Benchmark Mode
+
+In-app systematic performance testing via `BenchmarkView.swift`:
+
+- Configurable test matrix: prompt lengths (short/medium/long), generation token counts, Expert Settings combinations
+- Records tok/s, TTFT, total time, memory usage per configuration
+- Card-based UI with results sorting and export
+- Engine runs each config sequentially with model reload between incompatible settings
+- Useful for finding optimal Expert Settings combinations per device
+
+## RoPE Scaling
+
+Three context extension methods for full-attention layers:
+
+- **Linear scaling**: divide position by factor. Simple, degrades at high ratios.
+- **NTK-aware scaling**: rotate the frequency base. Better quality at 2-4x extension.
+- **YaRN**: per-dimension interpolation with attention scaling factor. Best quality at 4-8x.
+
+Configured via Expert Settings or CLI flags `--rope-scale-type` and `--rope-scale-factor`.
 
 ## Next Steps
 

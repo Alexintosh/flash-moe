@@ -175,11 +175,35 @@ python ../repack_experts_tiered.py --hot-experts hot_experts.json --gptq-dir pac
 
 The 20/80 tiered configuration with GPTQ is the target for production deployment on storage-constrained devices (256GB iPhones, smaller SSDs).
 
+## Implementation Status
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 0: MSE-Optimal Clipping | **Done** | Working, 15-30% RMSE reduction |
+| Phase 1: Calibration Collection | **Done** | Calibration data collected, Hessians built |
+| Phase 2: GPTQ Requantization | **Done** | Blocked GPTQ working; inline script also created |
+| Phase 3: Sensitivity Analysis | **In Progress** | Script exists, 64 vs 256 expert count mismatch needs fixing |
+
+### Inline GPTQ Script
+
+`gptq_tiered_inline.py` provides a single-script pipeline that combines Hessian accumulation, GPTQ requantization, and tiered repacking. Key features:
+
+- **Batch Hessian accumulation**: Processes calibration data in batches to fit in memory
+- **Estimated runtime**: ~2 hours for the 35B model on a single GPU
+- **bf16 overflow issue**: Identified with 256+ experts (397B model). The Hessian accumulation can overflow bf16 range when expert count is large. Not yet fixed -- workaround is to use float32 accumulation, but this increases memory.
+
+### Known Issues
+
+- **64 vs 256 expert count mismatch**: The tiered repacking script assumes 64 experts per layer (122B model) but the 35B model has 256 experts per layer. The `--hot-experts` manifest needs to handle variable expert counts.
+- **bf16 overflow with 256+ experts**: Hessian diagonal values can exceed bf16 range (~65K) when accumulating over many tokens. Affects the 35B model (256 experts) but not the 122B (64 experts).
+- **Modal cloud repacking**: Works for 4-bit models. Tiered repacking on Modal needs fixes for path handling.
+
 ## Files
 
 | File | Location | Purpose |
 |------|----------|---------|
 | `gptq_requantize.py` | `metal_infer/` | Blocked GPTQ requantization with automatic RTN fallback |
+| `gptq_tiered_inline.py` | `metal_infer/` | Single-script inline GPTQ pipeline with batch Hessian accumulation |
 | `build_hessian.py` | `metal_infer/` | Online Hessian accumulation (H = X^T @ X) per expert |
 | `sensitivity_analysis.py` | `metal_infer/` | Expert sensitivity scoring and bit-width assignment |
 | `calibrate.sh` | `metal_infer/` | Calibration runner (diverse prompts, 16K+ tokens) |

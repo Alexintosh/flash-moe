@@ -57,6 +57,8 @@ The engine auto-detects architecture, dimensions, expert counts, quantization, a
 
 | Model | K | tok/s | Notes |
 |-------|---|-------|-------|
+| Qwen3.5-35B-A3B (tiered) | 4 | **11** | Fused Att + CMD Merge + Fanout 2. Best config. |
+| Qwen3.5-35B-A3B (tiered) | 4 | **17.3 prefill** | Batched prefill throughput (58 tokens in 3357ms). |
 | Qwen3.5-35B-A3B (4-bit) | 8 | **5.5** | 19.5GB download. Full quality. Full GPU path. |
 | Qwen3.5-35B-A3B (tiered) | 8 | **5.5+** | 13.4GB download. Same quality. |
 | Qwen3.5-397B-A17B (4-bit) | 4 | ~0.003* | *CPU fallback only — Metal 4GB per-buffer limit blocks GPU path. |
@@ -137,6 +139,20 @@ Qwen3.5 MoE models use a hybrid attention architecture with GatedDeltaNet (linea
 
 21. **Paper-Guided Autoresearch v2** — Automated experiment loop that reads the research paper, identifies optimization opportunities, implements them, benchmarks with quality gates, and logs results. See `autoresearch/program_v2.md`.
 
+22. **Batched Prefill** — GEMM-based prompt processing for all 40 layers. Instead of processing prompt tokens one-by-one (autoregressive), the prefill phase processes the entire prompt in parallel using matrix-matrix multiplications. 13 new Metal kernels handle batched RoPE, batched RMS norm, batched attention (Q@K^T with causal mask), batched SwiGLU, and batched MoE combine. Layer-first ordering processes all tokens through layer 0, then layer 1, etc. Achieves 17.3 tok/s prefill throughput on iPhone 17 (58 tokens in 3357ms). Partial GPU post-projection for attention layers; expert forward still uses per-token dispatch.
+
+23. **Expert Callback APIs** — C function pointer callbacks for distributed inference via flashswarm. Four callbacks: `expert_read_cb` (custom weight loading from network/cache), `expert_compute_cb` (offload expert forward pass to remote GPU), `expert_bitmap_cb` (query which experts are available locally), and `expert_timing_cb` (report per-expert latency for load balancing). Callbacks are registered per-context and checked at runtime with fallback to local I/O + compute.
+
+24. **GPU Background Handling** — iOS app responds to `UIApplicationDidEnterBackground` / `UIApplicationWillEnterForeground` notifications. On background: cancels in-flight Metal command buffers, flushes GPU pipeline, releases non-essential Metal resources. On foreground: re-validates Metal device, re-creates command queue if needed. Prevents jetsam kills from background GPU memory pressure.
+
+25. **OpenAI-Compatible API Server** — `--openai-api` flag starts an HTTP server implementing the OpenAI `/v1/chat/completions` endpoint. Supports streaming (SSE) and non-streaming modes, chat message format with system/user/assistant roles, temperature and max_tokens parameters. Enables integration with any OpenAI-compatible client (Cursor, Continue, Open WebUI, etc.).
+
+26. **Benchmark Mode** — In-app systematic performance testing. Configurable test matrix: prompt lengths (short/medium/long), generation token counts, Expert Settings combinations. Records tok/s, TTFT, total time, memory usage per configuration. Results displayed in card-based UI with sorting and export. `BenchmarkView.swift` drives the UI; engine runs each config sequentially with model reload between incompatible settings.
+
+27. **RoPE Scaling** — Three context extension methods for full-attention layers: **Linear scaling** (divide position by factor, simple but degrades at high ratios), **NTK-aware scaling** (rotate the frequency base, better quality at 2-4x), and **YaRN** (Yet Another RoPE extensioN — per-dimension interpolation with attention scaling factor, best quality at 4-8x). Configured via `--rope-scale-type` and `--rope-scale-factor` flags. Default: no scaling (native context length).
+
+28. **Expert Double Buffering** — Two expert I/O buffers (buf_A, buf_B) allow overlapping I/O for the next layer's experts with GPU compute for the current layer's experts. The prefetch system reads next-layer experts into buf_B while CMD3 processes current-layer experts from buf_A, then swaps. Fixed a data race where CMD3 read buf_B while prefetch was still writing to it — now waits for I/O completion before GPU dispatch.
+
 ### GPTQ/JANG Quantization Pipeline
 
 A 4-phase pipeline for producing high-quality 2-bit experts using GPTQ (Data-aware Weight Quantization) with optional JANG (Jang Adaptive N-bit Grading) mixed-precision assignment. GPTQ uses calibration data to build a Hessian proxy (H = X^T @ X) per expert, then applies blocked column-wise error compensation during quantization. The result: same 2-bit format, but output reconstruction error is dramatically lower than RTN (Round To Nearest). This fixes the broken JSON problem at 2-bit.
@@ -151,7 +167,32 @@ See [docs/quantization-guide.md](docs/quantization-guide.md) for the full techni
 
 ### Expert Settings UI
 
-The iOS/Mac app includes a comprehensive Expert Settings panel with info modals for every toggle. Each setting has an analogy (plain-language explanation) and technical details. The UI uses a compact layout with an info icon to the left of each label. Settings include: Active Experts (K), I/O Fanout, CMD1+CMD2 Merge, Fused Attention, Fused Expert Kernel, Expert Prefetch, FP16 Accumulation, FP8 KV Cache, Max Context Length (4K-32K), Sliding Window, Thinking Mode, and H2O Budget (coming soon). Max generation tokens bumped to 2048. See [docs/expert-settings-guide.md](docs/expert-settings-guide.md).
+The iOS/Mac app includes a comprehensive Expert Settings panel with info modals for every toggle. Each setting has an analogy (plain-language explanation) and technical details. The UI uses collapsible sections (Speed, GPU Pipeline, Context, Generation) with compact layout and info icons. Settings organized by section:
+
+**Speed:**
+- **Active Experts (K)** — K value picker (2-10), default model K. Fewer = faster, lower quality.
+- **I/O Fanout** — Chunks picker (off/2/4/8), default OFF. Splits expert reads into parallel chunks.
+- **Expert Prefetch** — Toggle, default OFF. Overlaps next-layer I/O with current-layer GPU compute.
+
+**GPU Pipeline:**
+- **CMD1+CMD2 Merge** — Toggle, default OFF. Merges GPU command buffers for linear attention layers.
+- **Fused Attention** — Toggle, default OFF. Single-kernel FlashAttention for full-attention layers.
+- **Fused Expert Kernel** — Toggle, default OFF. Combined gate+up+SwiGLU per expert.
+- **FP16 Accumulation** — Toggle, default OFF. Experimental half-precision in dequant kernels.
+
+**Context:**
+- **FP8 KV Cache** — Toggle, default OFF. 4x KV memory reduction via FP8 E4M3.
+- **Max Context Length** — Selector (Auto/4K/8K/16K/32K), default Auto.
+- **Sliding Window** — Selector (Off/2048/4096/8192), default OFF.
+- **H2O Budget** — KV cache eviction budget (coming soon).
+- **RoPE Scaling** — Context extension method (None/Linear/NTK/YaRN) with scale factor.
+
+**Generation:**
+- **Thinking Mode** — Toggle, default ON. Enables `<think>` chain-of-thought.
+- **Thinking Budget** — Token count for thinking (1024-8192).
+- **Max Generation Tokens** — Up to 2048 (bumped from 500).
+
+See [docs/expert-settings-guide.md](docs/expert-settings-guide.md).
 
 ### Model Management
 
@@ -310,7 +351,11 @@ metal_infer/
   build_hessian.py     # Online Hessian accumulation (H = X^T @ X) per expert from calibration data
   sensitivity_analysis.py  # Expert sensitivity scoring (freq × quant_error × layer_weight) and bit-width assignment
   calibrate.sh         # Calibration runner — collects expert activations over diverse prompts
+  batched_prefill.h   # Batched GEMM prefill: 13 Metal kernels, layer-first ordering
   train_predictor.py   # Expert routing prediction analysis
+  gptq_tiered_inline.py  # Inline GPTQ script with batch Hessian accumulation
+  test_regression.py   # Regression test suite for output quality
+  test_regression.sh   # Regression test runner
   model_weights.bin    # Non-expert weights (model-specific, mmap'd)
   model_weights.json   # Tensor manifest
   vocab.bin            # Vocabulary for token decoding
@@ -327,6 +372,8 @@ FlashMoE-iOS/              # Native iOS app
     ModelListView.swift    # Model discovery + download catalog
     ModelDownloadRow.swift # Download progress with pause/resume
     ProfilerView.swift     # Resource monitoring overlay
+    BenchmarkView.swift    # In-app benchmark mode with configurable test matrix
+    ExpertSettingsView.swift  # Collapsible settings sections with info modals
   Services/
     DownloadManager.swift  # Background URLSession model downloads
   Models/
@@ -355,6 +402,7 @@ docs/
   oom-prevention.md        # OOM prevention architecture
   tiered-expert-quantization.md   # Tiered quantization experiment writeup
   quantization-guide.md  # DWQ/JANG comparison, GPTQ pipeline, quantization formats
+  session-journal.md     # Complete session record: optimizations, features, bugs, status
 ```
 
 ## What We Tried (and What Worked)
@@ -430,6 +478,15 @@ Full analysis: [docs/vulkan-learnings-plan.md](docs/vulkan-learnings-plan.md)
 | 2-bit auto-detection missing in iOS | iOS load path skipped 2-bit directory check | Added 2-bit auto-detection in `flashmoe_load()` |
 | String format mismatch warnings | `%d` for `size_t`, `%f` for `int` | Corrected format specifiers throughout |
 | MAX_K buffer overflow on 397B | Hardcoded `MAX_K=8`, 397B needs K=10 | Bumped to `MAX_K=16` with runtime cap |
+| Fused expert kernel SIMD reduction | Divergent `simd_sum` across threads = UB (undefined behavior). Threads in same SIMD group took different branches. | Ensure uniform control flow before SIMD reduction; all threads participate. |
+| Expert prefetch buf_B data race | CMD3 GPU dispatch read buf_B while prefetch I/O was still writing to it | Added I/O completion fence; wait for prefetch to finish before GPU dispatch |
+| Chat template missing `<think>` tag | No output generated when thinking mode OFF — model expected `<think>` in template | Added `<think>` tag to chat template when thinking enabled; strip when disabled |
+| CMD1+CMD2 merge fallback clobber | `else` branch for full-attention layers re-ran o_proj with sentinel pointer, producing NaN | Fixed fallback path to skip o_proj when CMD1+CMD2 merge is not applicable |
+| Batched prefill KV cache sync | GPU wrote K/V during prefill but CPU-side mirror not updated, causing stale reads | Added GPU-to-CPU KV cache sync after batched prefill completes |
+| Batched prefill conv output stride | Convolution output stride mismatch between expected and actual layout | Fixed stride calculation in batched conv1d kernel for GatedDeltaNet |
+| Fused attention unnormalized accumulator | Online softmax accumulator not properly rescaled when max changed | Fixed rescaling: multiply accumulator by exp(old_max - new_max) on max update |
+| Bundle ID revert in merges | Feature branch merges occasionally changed bundle ID | Added CLAUDE.md rule: bundle ID is `com.alexintosh.flashmoe`, NEVER change |
+| Model reloads twice on button press | Reload button triggered both unload+load and a second load from state change | Debounce reload: ignore load requests within 1s of a previous load |
 
 ## Safety
 
