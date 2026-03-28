@@ -25,6 +25,8 @@ targets:
         type: group
       - path: ViewModels
         type: group
+      - path: Models
+        type: group
       - path: Services
         type: group
       - path: Bridge

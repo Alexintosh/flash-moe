@@ -23,6 +23,7 @@
 		D2852565F398AF1232656EFE /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D2BF3279663E9D253E86EEC /* ProfilerView.swift */; };
 		D2F140EBFBCC62B37BDBCB7F /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3321AD5929C6B6D4FAD446C8 /* Foundation.framework */; };
 		D8242F5999552BC228A650CE /* shaders.metal in Resources */ = {isa = PBXBuildFile; fileRef = EEC822B6F9CE0BABA49E989B /* shaders.metal */; };
+		E57950E02BEA9F62EC60BA78 /* ModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4FC6AC42727D1C25FFE2A331 /* ModelCatalog.swift */; };
 		E73BB005AD9F878023B7F75E /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51FB34EBC20226BA8269877A /* Accelerate.framework */; };
 		F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */ = {isa = PBXBuildFile; fileRef = 50DF36AC37579556033D375F /* FlashMoEEngine.m */; };
 /* End PBXBuildFile section */
@@ -35,6 +36,7 @@
 		2AEBDCE15020A40A8451CB5A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		3321AD5929C6B6D4FAD446C8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		3404570FACF1297B40EF6369 /* FlashMoEEngine.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FlashMoEEngine.h; sourceTree = "<group>"; };
+		4FC6AC42727D1C25FFE2A331 /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
 		50DF36AC37579556033D375F /* FlashMoEEngine.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = FlashMoEEngine.m; sourceTree = "<group>"; };
 		51FB34EBC20226BA8269877A /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		575B85659731B0C7F170E59E /* tokenizer.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = tokenizer.h; sourceTree = "<group>"; };
@@ -73,6 +75,14 @@
 				2012EBE1EE4FE61E69A833A7 /* DownloadManager.swift */,
 			);
 			path = Services;
+			sourceTree = "<group>";
+		};
+		0E99DB0A7BE709AF6B31DF3E /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				4FC6AC42727D1C25FFE2A331 /* ModelCatalog.swift */,
+			);
+			path = Models;
 			sourceTree = "<group>";
 		};
 		18638B2F96B8C1EB7D55C874 /* Bridge */ = {
@@ -145,6 +155,7 @@
 				18638B2F96B8C1EB7D55C874 /* Bridge */,
 				EDA325EB4F586262787DC634 /* FlashMoEEngine */,
 				436D67F159A3C0FA4F05317F /* metal_infer */,
+				0E99DB0A7BE709AF6B31DF3E /* Models */,
 				5A512650C4615EA193374D2F /* Resources */,
 				058EF5D1C90FFF5DF2417436 /* Services */,
 				42B268D8ECA1DA8E59B4F599 /* ViewModels */,
@@ -277,6 +288,7 @@
 				0BA5B28A95E8C0616CCA6A3D /* FlashMoEApp.swift in Sources */,
 				5F7FD44C4FF2E97505EDAB58 /* FlashMoEBridge.swift in Sources */,
 				F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */,
+				E57950E02BEA9F62EC60BA78 /* ModelCatalog.swift in Sources */,
 				728E0AD15FEECD0BB62EFD11 /* ModelDownloadRow.swift in Sources */,
 				23E305445AFD3D5FB1A5E5FC /* ModelListView.swift in Sources */,
 				D2852565F398AF1232656EFE /* ProfilerView.swift in Sources */,
