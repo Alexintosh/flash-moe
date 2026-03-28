@@ -17,6 +17,7 @@
 		6705BB42E9958921B7F9605F /* BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 772FF294C96556429A969E17 /* BenchmarkView.swift */; };
 		728E0AD15FEECD0BB62EFD11 /* ModelDownloadRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F7C68D2EF677F964065BB20 /* ModelDownloadRow.swift */; };
 		86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */; };
+		8B19E5D91C1756004B77CA2C /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2012EBE1EE4FE61E69A833A7 /* DownloadManager.swift */; };
 		8BBA5172A0EFA6233A4BCFCE /* SwarmWorker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2806E6B753DB713EEC153F3D /* SwarmWorker.swift */; };
 		A40E8D436A3EEDB8B04CDC44 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DEE08D3053B24D1E206627F9 /* Assets.xcassets */; };
 		D2852565F398AF1232656EFE /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D2BF3279663E9D253E86EEC /* ProfilerView.swift */; };
@@ -29,6 +30,7 @@
 /* Begin PBXFileReference section */
 		03B08EB0D0CE594165AB1C14 /* FlashMoE-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "FlashMoE-Bridging-Header.h"; sourceTree = "<group>"; };
 		0F7C68D2EF677F964065BB20 /* ModelDownloadRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloadRow.swift; sourceTree = "<group>"; };
+		2012EBE1EE4FE61E69A833A7 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
 		2806E6B753DB713EEC153F3D /* SwarmWorker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwarmWorker.swift; sourceTree = "<group>"; };
 		2AEBDCE15020A40A8451CB5A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		3321AD5929C6B6D4FAD446C8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
@@ -65,6 +67,14 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		058EF5D1C90FFF5DF2417436 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				2012EBE1EE4FE61E69A833A7 /* DownloadManager.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
 		18638B2F96B8C1EB7D55C874 /* Bridge */ = {
 			isa = PBXGroup;
 			children = (
@@ -136,6 +146,7 @@
 				EDA325EB4F586262787DC634 /* FlashMoEEngine */,
 				436D67F159A3C0FA4F05317F /* metal_infer */,
 				5A512650C4615EA193374D2F /* Resources */,
+				058EF5D1C90FFF5DF2417436 /* Services */,
 				42B268D8ECA1DA8E59B4F599 /* ViewModels */,
 				993DF219F89AA4229E9A43D2 /* Views */,
 				7066FB671F127A31C9768B99 /* Frameworks */,
@@ -262,6 +273,7 @@
 				6705BB42E9958921B7F9605F /* BenchmarkView.swift in Sources */,
 				86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */,
 				15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */,
+				8B19E5D91C1756004B77CA2C /* DownloadManager.swift in Sources */,
 				0BA5B28A95E8C0616CCA6A3D /* FlashMoEApp.swift in Sources */,
 				5F7FD44C4FF2E97505EDAB58 /* FlashMoEBridge.swift in Sources */,
 				F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */,
