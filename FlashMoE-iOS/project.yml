@@ -1,6 +1,6 @@
 name: FlashMoE
 options:
-  bundleIdPrefix: com.flashmoe
+  bundleIdPrefix: com.alexintosh
   deploymentTarget:
     iOS: "18.0"
   xcodeVersion: "26.0"
@@ -33,80 +33,75 @@ targets:
         type: group
       - path: Resources
         type: group
-      # Metal shaders — copied as resource (compiled at runtime via newLibraryWithSource)
       - path: ../metal_infer/shaders.metal
         type: file
         buildPhase: resources
-      # Tokenizer header — needed by infer.m
       - path: ../metal_infer/tokenizer.h
         type: file
         buildPhase: headers
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.flashmoe.ios
+        PRODUCT_BUNDLE_IDENTIFIER: com.alexintosh.flashmoe
         PRODUCT_NAME: FlashMoE
+        GENERATE_INFOPLIST_FILE: YES
         SWIFT_OBJC_BRIDGING_HEADER: Bridge/FlashMoE-Bridging-Header.h
-        # Obj-C / C compilation flags for infer.m unity build
         OTHER_CFLAGS: "-DCHAT_MODE=1 -DACCELERATE_NEW_LAPACK"
-        # Header search paths — includes flashswarm_ios.h from built RustLibs/
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/FlashMoEEngine
           - $(SRCROOT)/../metal_infer
           - $(SRCROOT)/RustLibs/include
-        # Needed for the engine
         CLANG_ENABLE_OBJC_ARC: YES
         GCC_OPTIMIZATION_LEVEL: "2"
         GCC_WARN_INHIBIT_ALL_WARNINGS: NO
-        # Memory / entitlements
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # Info.plist keys
         INFOPLIST_KEY_CFBundleDisplayName: "Flash-MoE"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-        # Local network usage — required for UDP discovery on iOS 14+
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Flash-Swarm needs local network access to discover and connect to Mac cluster nodes."
-        # Auto-generate Info.plist (required for code signing)
-        GENERATE_INFOPLIST_FILE: YES
-        # Linker: compression + flashswarm Rust static lib
         OTHER_LDFLAGS: "-lcompression -L$(SRCROOT)/RustLibs -lflashswarm_ios"
     dependencies:
       - sdk: Metal.framework
       - sdk: Foundation.framework
       - sdk: Accelerate.framework
-    # Pre-build: compile the Rust flashswarm-ios static library for the
-    # current Xcode target (device or simulator).
     preBuildScripts:
       - name: "Build Rust flashswarm-ios"
         basedOnDependencyAnalysis: false
         script: |
           #!/bin/bash
           set -euo pipefail
-
-          # Cargo lives in ~/.cargo/bin — not in Xcode's restricted PATH
           export PATH="$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-
           SWARM_DIR="$(cd "$SRCROOT/../../flash-swarm" && pwd)"
           LIB_OUT="$SRCROOT/RustLibs"
           mkdir -p "$LIB_OUT/include"
-
-          # Choose the right Rust target based on what Xcode is building for.
           if [[ "$PLATFORM_NAME" == "iphonesimulator" ]]; then
             RUST_TARGET="aarch64-apple-ios-sim"
           else
             RUST_TARGET="aarch64-apple-ios"
           fi
-
           echo "Building flashswarm-ios for $RUST_TARGET…"
           (cd "$SWARM_DIR" && cargo build --release --target "$RUST_TARGET" -p flashswarm-ios)
-
-          # Copy outputs to RustLibs/ so Xcode can find them at link time.
           cp "$SWARM_DIR/target/$RUST_TARGET/release/libflashswarm_ios.a" "$LIB_OUT/"
-          cp "$SWARM_DIR/crates/flashswarm-ios/include/flashswarm_ios.h"  "$LIB_OUT/include/"
-
-          echo "flashswarm-ios built → $LIB_OUT"
+          cp "$SWARM_DIR/crates/flashswarm-ios/include/flashswarm_ios.h" "$LIB_OUT/include/"
     postBuildScripts: []
     entitlements:
       path: Resources/FlashMoE.entitlements
       properties:
         com.apple.security.app-sandbox: true
+
+schemes:
+  FlashMoE:
+    shared: true
+    build:
+      targets:
+        FlashMoE: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

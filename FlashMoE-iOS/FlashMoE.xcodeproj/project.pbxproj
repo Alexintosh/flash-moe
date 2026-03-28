@@ -260,7 +260,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "#!/bin/bash\nset -euo pipefail\n\n# Cargo lives in ~/.cargo/bin — not in Xcode's restricted PATH\nexport PATH=\"$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\n\nSWARM_DIR=\"$(cd \"$SRCROOT/../../flash-swarm\" && pwd)\"\nLIB_OUT=\"$SRCROOT/RustLibs\"\nmkdir -p \"$LIB_OUT/include\"\n\n# Choose the right Rust target based on what Xcode is building for.\nif [[ \"$PLATFORM_NAME\" == \"iphonesimulator\" ]]; then\n  RUST_TARGET=\"aarch64-apple-ios-sim\"\nelse\n  RUST_TARGET=\"aarch64-apple-ios\"\nfi\n\necho \"Building flashswarm-ios for $RUST_TARGET…\"\n(cd \"$SWARM_DIR\" && cargo build --release --target \"$RUST_TARGET\" -p flashswarm-ios)\n\n# Copy outputs to RustLibs/ so Xcode can find them at link time.\ncp \"$SWARM_DIR/target/$RUST_TARGET/release/libflashswarm_ios.a\" \"$LIB_OUT/\"\ncp \"$SWARM_DIR/crates/flashswarm-ios/include/flashswarm_ios.h\"  \"$LIB_OUT/include/\"\n\necho \"flashswarm-ios built → $LIB_OUT\"\n";
+			shellScript = "#!/bin/bash\nset -euo pipefail\nexport PATH=\"$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\nSWARM_DIR=\"$(cd \"$SRCROOT/../../flash-swarm\" && pwd)\"\nLIB_OUT=\"$SRCROOT/RustLibs\"\nmkdir -p \"$LIB_OUT/include\"\nif [[ \"$PLATFORM_NAME\" == \"iphonesimulator\" ]]; then\n  RUST_TARGET=\"aarch64-apple-ios-sim\"\nelse\n  RUST_TARGET=\"aarch64-apple-ios\"\nfi\necho \"Building flashswarm-ios for $RUST_TARGET…\"\n(cd \"$SWARM_DIR\" && cargo build --release --target \"$RUST_TARGET\" -p flashswarm-ios)\ncp \"$SWARM_DIR/target/$RUST_TARGET/release/libflashswarm_ios.a\" \"$LIB_OUT/\"\ncp \"$SWARM_DIR/crates/flashswarm-ios/include/flashswarm_ios.h\" \"$LIB_OUT/include/\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -439,7 +439,7 @@
 				);
 				OTHER_CFLAGS = "-DCHAT_MODE=1 -DACCELERATE_NEW_LAPACK";
 				OTHER_LDFLAGS = "-lcompression -L$(SRCROOT)/RustLibs -lflashswarm_ios";
-				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alexintosh.flashmoe;
 				PRODUCT_NAME = FlashMoE;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Bridge/FlashMoE-Bridging-Header.h";
@@ -473,7 +473,7 @@
 				);
 				OTHER_CFLAGS = "-DCHAT_MODE=1 -DACCELERATE_NEW_LAPACK";
 				OTHER_LDFLAGS = "-lcompression -L$(SRCROOT)/RustLibs -lflashswarm_ios";
-				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alexintosh.flashmoe;
 				PRODUCT_NAME = FlashMoE;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Bridge/FlashMoE-Bridging-Header.h";
