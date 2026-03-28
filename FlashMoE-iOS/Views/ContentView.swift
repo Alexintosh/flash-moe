@@ -34,7 +34,7 @@ struct ContentView: View {
             Tab("Swarm", systemImage: "antenna.radiowaves.left.and.right") {
                 SwarmView()
             }
-            .badge(swarm.status == .processing ? "●" : nil)
+            .badge(swarm.status == .processing ? Text("●") : nil)
         }
     }
 }
