@@ -29,6 +29,7 @@ struct SwarmView: View {
     @State private var showAdvanced = false
     @State private var routerModelPath: String = ""
     @State private var showModelPicker = false
+    @State private var directPeers: String = ""
 
     private var isActive: Bool {
         mode == .worker ? swarm.status.isActive : router.isRunning
@@ -64,6 +65,15 @@ struct SwarmView: View {
                             .multilineTextAlignment(.trailing)
                             .disabled(isActive)
                             .foregroundStyle(isActive ? .secondary : .primary)
+                    }
+                    if mode == .router {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label("Direct Peers", systemImage: "cable.connector")
+                            TextField("ip:port, ip:port (USB, VPN)", text: $directPeers)
+                                .font(.system(.body, design: .monospaced))
+                                .disabled(isActive)
+                                .foregroundStyle(isActive ? .secondary : .primary)
+                        }
                     }
                 }
 
@@ -151,10 +161,12 @@ struct SwarmView: View {
             RouterStatusCard(
                 statusCode: router.statusCode,
                 statusText: router.statusText,
-                masterExperts: router.masterExperts,
                 totalExperts: router.totalExperts,
                 unassigned: router.unassignedExperts,
-                workerCount: router.workerCount
+                workerCount: router.workerCount,
+                workersAlive: router.workersAlive,
+                workersDeparted: router.workersDeparted,
+                uptimeSecs: router.uptimeSecs
             )
         }
 
@@ -213,12 +225,15 @@ struct SwarmView: View {
             }
         }
 
-        // Worker list
-        if !router.workers.isEmpty {
-            Section(header: Text("Connected Workers (\(router.workerCount))")) {
-                ForEach(router.workers) { worker in
-                    WorkerRow(worker: worker)
-                }
+        // Network topology
+        if router.isRunning {
+            Section(header: Text("Network Topology")) {
+                TopologyView(
+                    workers: router.workers,
+                    totalExperts: router.totalExperts,
+                    isRunning: router.isRunning
+                )
+                .frame(height: 250)
             }
         }
 
@@ -297,6 +312,7 @@ struct SwarmView: View {
 
     private func applyRouterSettings() {
         router.networkKey     = networkKey
+        router.directPeers    = directPeers
         router.discoveryPort  = UInt16(discoveryPort) ?? 10127
         router.expertPort     = UInt16(expertPort) ?? 10128
     }
@@ -307,10 +323,12 @@ struct SwarmView: View {
 private struct RouterStatusCard: View {
     let statusCode: Int32
     let statusText: String
-    let masterExperts: Int
     let totalExperts: Int
     let unassigned: Int
     let workerCount: Int
+    let workersAlive: Int
+    let workersDeparted: Int
+    let uptimeSecs: Int
 
     var body: some View {
         VStack(spacing: 12) {
@@ -322,22 +340,29 @@ private struct RouterStatusCard: View {
                     .font(.headline)
                 Spacer()
                 if workerCount > 0 {
-                    Label("\(workerCount) worker\(workerCount == 1 ? "" : "s")",
+                    Label("\(workersAlive) alive",
                           systemImage: "desktopcomputer")
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.green)
                 }
             }
 
             if statusCode == 2 {
-                HStack(spacing: 16) {
-                    StatBadge(label: "Master", value: "\(masterExperts)")
-                    StatBadge(label: "Total", value: "\(totalExperts)")
+                HStack(spacing: 12) {
+                    StatBadge(label: "Experts", value: "\(totalExperts)")
                     StatBadge(label: "Unassigned", value: "\(unassigned)")
+                    StatBadge(label: "Workers", value: "\(workersAlive)")
+                    StatBadge(label: "Uptime", value: uptimeFormatted)
                 }
             }
         }
         .padding(.vertical, 4)
+    }
+
+    private var uptimeFormatted: String {
+        if uptimeSecs < 60 { return "\(uptimeSecs)s" }
+        if uptimeSecs < 3600 { return "\(uptimeSecs / 60)m" }
+        return "\(uptimeSecs / 3600)h \((uptimeSecs % 3600) / 60)m"
     }
 
     private var statusColor: Color {
@@ -366,37 +391,6 @@ private struct StatBadge: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
-    }
-}
-
-// MARK: - WorkerRow
-
-private struct WorkerRow: View {
-    let worker: ClusterWorkerInfo
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Image(systemName: "desktopcomputer")
-                    .foregroundStyle(.tint)
-                Text(worker.hostname)
-                    .font(.headline)
-                Spacer()
-                Text("\(worker.experts_assigned) experts")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            HStack {
-                Text(worker.gpu)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(worker.memory_gb) GB")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.vertical, 2)
     }
 }
 

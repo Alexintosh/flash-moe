@@ -18,6 +18,7 @@
 		368893C82D55ADC634FBAD8B /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8A8F6936F5C735B8856277A2 /* Metal.framework */; };
 		3E6C62A6E329E47183BF8EE7 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51FB34EBC20226BA8269877A /* Accelerate.framework */; };
 		46A20E89D043378AFD642EF6 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2012EBE1EE4FE61E69A833A7 /* DownloadManager.swift */; };
+		55AD90AD8946BCCD0E3ADD85 /* TopologyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AA0B0C747299B35B1C1DC40 /* TopologyView.swift */; };
 		56979A57FD2F69B691BDDA0E /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3321AD5929C6B6D4FAD446C8 /* Foundation.framework */; };
 		5F7FD44C4FF2E97505EDAB58 /* FlashMoEBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 749C35B05B7C71B73796EEE6 /* FlashMoEBridge.swift */; };
 		6705BB42E9958921B7F9605F /* BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 772FF294C96556429A969E17 /* BenchmarkView.swift */; };
@@ -35,6 +36,7 @@
 		A5417D4047AEDF75C6CC88E0 /* ModelDownloadRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F7C68D2EF677F964065BB20 /* ModelDownloadRow.swift */; };
 		A9232852619D5163048156FF /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */; };
 		B866BB735C80E01AD0D5EBB3 /* SwarmView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA4422D5A57512CE46BBE97B /* SwarmView.swift */; };
+		BE14E2EE21BB506227512944 /* TopologyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AA0B0C747299B35B1C1DC40 /* TopologyView.swift */; };
 		C75E2B6BF80AB828BD9CCD2B /* shaders.metal in Resources */ = {isa = PBXBuildFile; fileRef = EEC822B6F9CE0BABA49E989B /* shaders.metal */; };
 		D2852565F398AF1232656EFE /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D2BF3279663E9D253E86EEC /* ProfilerView.swift */; };
 		D2F140EBFBCC62B37BDBCB7F /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3321AD5929C6B6D4FAD446C8 /* Foundation.framework */; };
@@ -57,6 +59,7 @@
 		2AEBDCE15020A40A8451CB5A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		3321AD5929C6B6D4FAD446C8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		3404570FACF1297B40EF6369 /* FlashMoEEngine.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FlashMoEEngine.h; sourceTree = "<group>"; };
+		4AA0B0C747299B35B1C1DC40 /* TopologyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopologyView.swift; sourceTree = "<group>"; };
 		4FC6AC42727D1C25FFE2A331 /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
 		50DF36AC37579556033D375F /* FlashMoEEngine.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = FlashMoEEngine.m; sourceTree = "<group>"; };
 		51FB34EBC20226BA8269877A /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
@@ -210,6 +213,7 @@
 				DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */,
 				9D2BF3279663E9D253E86EEC /* ProfilerView.swift */,
 				BA4422D5A57512CE46BBE97B /* SwarmView.swift */,
+				4AA0B0C747299B35B1C1DC40 /* TopologyView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -379,6 +383,7 @@
 				28CCC940DF927FB0D84FC7D7 /* RouterManager.swift in Sources */,
 				B866BB735C80E01AD0D5EBB3 /* SwarmView.swift in Sources */,
 				D6ED4149FF67F4E0A0BDD4B1 /* SwarmWorker.swift in Sources */,
+				55AD90AD8946BCCD0E3ADD85 /* TopologyView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -401,6 +406,7 @@
 				052485079CB64001915701A1 /* RouterManager.swift in Sources */,
 				02071AFBA6DDE07F6E070EB6 /* SwarmView.swift in Sources */,
 				8BBA5172A0EFA6233A4BCFCE /* SwarmWorker.swift in Sources */,
+				BE14E2EE21BB506227512944 /* TopologyView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

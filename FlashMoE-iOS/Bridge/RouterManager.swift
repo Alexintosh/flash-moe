@@ -10,25 +10,31 @@ import Observation
 
 // MARK: - Data types
 
-/// Info about a connected worker in the cluster.
+/// Info about a connected worker from the scheduler snapshot.
 struct ClusterWorkerInfo: Identifiable, Codable {
-    let node_id: UInt64
-    let hostname: String
-    let gpu: String
-    let memory_gb: UInt64
-    let experts_assigned: Int
-    let addr: String
+    let node_id: String      // hex, e.g. "0A1B2C3D4E5F6789"
+    let addr: String          // "192.168.1.67:10128"
+    let capabilities: [String]?
+    let active_tasks: Int?
 
-    var id: UInt64 { node_id }
+    var id: String { node_id }
+
+    /// Short display name derived from the address.
+    var displayName: String {
+        if addr.starts(with: "127.0.0.1") { return "This Mac (local)" }
+        return addr
+    }
 }
 
 /// Router status decoded from Rust JSON callback.
 struct RouterStatusInfo: Codable {
     let state: String
-    let master_experts: Int?
     let total_experts: Int?
     let unassigned: Int?
     let worker_count: Int?
+    let workers_alive: Int?
+    let workers_departed: Int?
+    let uptime_secs: Int?
     let workers: [ClusterWorkerInfo]?
     let error: String?
     let logs: [String]?
@@ -42,14 +48,15 @@ final class RouterManager: @unchecked Sendable {
     // Published state for SwiftUI
     private(set) var isRunning = false
     private(set) var statusCode: Int32 = 0
-    private(set) var masterExperts: Int = 0
     private(set) var totalExperts: Int = 0
     private(set) var unassignedExperts: Int = 0
+    private(set) var workerCount: Int = 0
+    private(set) var workersAlive: Int = 0
+    private(set) var workersDeparted: Int = 0
+    private(set) var uptimeSecs: Int = 0
     private(set) var workers: [ClusterWorkerInfo] = []
     private(set) var lastError: String?
     private(set) var logs: [String] = []
-
-    var workerCount: Int { workers.count }
 
     var statusText: String {
         switch statusCode {
@@ -63,6 +70,7 @@ final class RouterManager: @unchecked Sendable {
 
     // Settings
     var networkKey: String = "flashswarm"
+    var directPeers: String = ""  // Comma-separated, e.g. "172.20.10.1:10128"
     var discoveryPort: UInt16 = 10127
     var expertPort: UInt16 = 10128
 
@@ -91,10 +99,11 @@ final class RouterManager: @unchecked Sendable {
     func start(modelPath: String) {
         guard !isRunning else { return }
 
-        let pathPtr = (modelPath as NSString).utf8String
-        let keyPtr  = (networkKey as NSString).utf8String
+        let pathPtr  = (modelPath as NSString).utf8String
+        let keyPtr   = (networkKey as NSString).utf8String
+        let peersPtr = directPeers.isEmpty ? nil : (directPeers as NSString).utf8String
 
-        let rc = flashswarm_ios_router_init(pathPtr, keyPtr, discoveryPort, expertPort)
+        let rc = flashswarm_ios_router_init(pathPtr, keyPtr, peersPtr, discoveryPort, expertPort)
         if rc != 0 {
             DispatchQueue.main.async { self.lastError = "Router init failed" }
             return
@@ -118,6 +127,8 @@ final class RouterManager: @unchecked Sendable {
         flashswarm_ios_router_stop()
         DispatchQueue.main.async {
             self.isRunning = false
+            self.workerCount = 0
+            self.workersAlive = 0
             self.workers = []
             self.statusCode = 0
         }
@@ -135,9 +146,12 @@ final class RouterManager: @unchecked Sendable {
 
         DispatchQueue.main.async {
             self.statusCode = code
-            self.masterExperts = status.master_experts ?? self.masterExperts
             self.totalExperts = status.total_experts ?? self.totalExperts
             self.unassignedExperts = status.unassigned ?? self.unassignedExperts
+            self.workerCount = status.worker_count ?? self.workerCount
+            self.workersAlive = status.workers_alive ?? self.workersAlive
+            self.workersDeparted = status.workers_departed ?? self.workersDeparted
+            self.uptimeSecs = status.uptime_secs ?? self.uptimeSecs
             self.workers = status.workers ?? self.workers
             if let err = status.error {
                 self.lastError = err
