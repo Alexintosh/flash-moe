@@ -62,6 +62,8 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Flash-Swarm needs local network access to discover and connect to Mac cluster nodes."
         OTHER_LDFLAGS: "-lcompression -L$(SRCROOT)/RustLibs -lflashswarm_ios"
+        # Rust libs only support arm64 — exclude x86_64 simulator slice
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
     dependencies:
       - sdk: Metal.framework
       - sdk: Foundation.framework
