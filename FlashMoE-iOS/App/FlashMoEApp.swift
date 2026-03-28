@@ -33,6 +33,7 @@ struct FlashMoEApp: App {
 private struct RootView: View {
     let engine: FlashMoEEngine
     @State private var swarm: SwarmWorker
+    @State private var router = RouterManager()
 
     init(engine: FlashMoEEngine) {
         self.engine = engine
@@ -43,5 +44,6 @@ private struct RootView: View {
         ContentView()
             .environment(engine)
             .environment(swarm)
+            .environment(router)
     }
 }

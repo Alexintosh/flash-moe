@@ -491,7 +491,11 @@ struct BenchmarkView: View {
             }
         }
         .padding(12)
+        #if os(iOS)
         .background(Color(.secondarySystemGroupedBackground))
+        #else
+        .background(Color(.controlBackgroundColor))
+        #endif
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
