@@ -7,48 +7,48 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		02071AFBA6DDE07F6E070EB6 /* SwarmView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA4422D5A57512CE46BBE97B /* SwarmView.swift */; };
 		0BA5B28A95E8C0616CCA6A3D /* FlashMoEApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EAF41B16BD4314D3642DC53 /* FlashMoEApp.swift */; };
 		15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AEBDCE15020A40A8451CB5A /* ContentView.swift */; };
 		23E305445AFD3D5FB1A5E5FC /* ModelListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */; };
+		27AFF8FDB34F290DA5F8BD58 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5E3CF69D1C35835FFCA287F /* AppDelegate.swift */; };
 		368893C82D55ADC634FBAD8B /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8A8F6936F5C735B8856277A2 /* Metal.framework */; };
 		5F7FD44C4FF2E97505EDAB58 /* FlashMoEBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 749C35B05B7C71B73796EEE6 /* FlashMoEBridge.swift */; };
+		6705BB42E9958921B7F9605F /* BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 772FF294C96556429A969E17 /* BenchmarkView.swift */; };
+		728E0AD15FEECD0BB62EFD11 /* ModelDownloadRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F7C68D2EF677F964065BB20 /* ModelDownloadRow.swift */; };
 		86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */; };
+		8BBA5172A0EFA6233A4BCFCE /* SwarmWorker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2806E6B753DB713EEC153F3D /* SwarmWorker.swift */; };
 		A40E8D436A3EEDB8B04CDC44 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DEE08D3053B24D1E206627F9 /* Assets.xcassets */; };
-		AA1111111111111111111111 /* ModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA2222222222222222222222 /* ModelCatalog.swift */; };
-		BB1111111111111111111111 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB2222222222222222222222 /* DownloadManager.swift */; };
-		CC1111111111111111111111 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC2222222222222222222222 /* AppDelegate.swift */; };
+		D2852565F398AF1232656EFE /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D2BF3279663E9D253E86EEC /* ProfilerView.swift */; };
 		D2F140EBFBCC62B37BDBCB7F /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3321AD5929C6B6D4FAD446C8 /* Foundation.framework */; };
-		D8242F5999552BC228A650CE /* shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = EEC822B6F9CE0BABA49E989B /* shaders.metal */; };
-		DD1111111111111111111111 /* ModelDownloadRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2222222222222222222222 /* ModelDownloadRow.swift */; };
+		D8242F5999552BC228A650CE /* shaders.metal in Resources */ = {isa = PBXBuildFile; fileRef = EEC822B6F9CE0BABA49E989B /* shaders.metal */; };
 		E73BB005AD9F878023B7F75E /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51FB34EBC20226BA8269877A /* Accelerate.framework */; };
-		EE1111111111111111111111 /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2222222222222222222222 /* ProfilerView.swift */; };
 		F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */ = {isa = PBXBuildFile; fileRef = 50DF36AC37579556033D375F /* FlashMoEEngine.m */; };
-		FF1111111111111111111111 /* BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF2222222222222222222222 /* BenchmarkView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		03B08EB0D0CE594165AB1C14 /* FlashMoE-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "FlashMoE-Bridging-Header.h"; sourceTree = "<group>"; };
+		0F7C68D2EF677F964065BB20 /* ModelDownloadRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloadRow.swift; sourceTree = "<group>"; };
+		2806E6B753DB713EEC153F3D /* SwarmWorker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwarmWorker.swift; sourceTree = "<group>"; };
 		2AEBDCE15020A40A8451CB5A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		3321AD5929C6B6D4FAD446C8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		3404570FACF1297B40EF6369 /* FlashMoEEngine.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FlashMoEEngine.h; sourceTree = "<group>"; };
 		50DF36AC37579556033D375F /* FlashMoEEngine.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = FlashMoEEngine.m; sourceTree = "<group>"; };
 		51FB34EBC20226BA8269877A /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		575B85659731B0C7F170E59E /* tokenizer.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = tokenizer.h; sourceTree = "<group>"; };
-		64E904A15D9438F2D9B365F5 /* FlashMoE.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FlashMoE.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		64E904A15D9438F2D9B365F5 /* FlashMoE.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = FlashMoE.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		749C35B05B7C71B73796EEE6 /* FlashMoEBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlashMoEBridge.swift; sourceTree = "<group>"; };
+		772FF294C96556429A969E17 /* BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkView.swift; sourceTree = "<group>"; };
 		82BDA279F2267A8FD313D3C3 /* FlashMoE.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FlashMoE.entitlements; sourceTree = "<group>"; };
 		8A8F6936F5C735B8856277A2 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		8EAF41B16BD4314D3642DC53 /* FlashMoEApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlashMoEApp.swift; sourceTree = "<group>"; };
-		AA2222222222222222222222 /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
+		9D2BF3279663E9D253E86EEC /* ProfilerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilerView.swift; sourceTree = "<group>"; };
+		A5E3CF69D1C35835FFCA287F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		BA4422D5A57512CE46BBE97B /* SwarmView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwarmView.swift; sourceTree = "<group>"; };
 		BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
-		BB2222222222222222222222 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
-		CC2222222222222222222222 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
-		DD2222222222222222222222 /* ModelDownloadRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelDownloadRow.swift; sourceTree = "<group>"; };
 		DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelListView.swift; sourceTree = "<group>"; };
 		DEE08D3053B24D1E206627F9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		EE2222222222222222222222 /* ProfilerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilerView.swift; sourceTree = "<group>"; };
 		EEC822B6F9CE0BABA49E989B /* shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = shaders.metal; sourceTree = "<group>"; };
-		FF2222222222222222222222 /* BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -70,6 +70,7 @@
 			children = (
 				03B08EB0D0CE594165AB1C14 /* FlashMoE-Bridging-Header.h */,
 				749C35B05B7C71B73796EEE6 /* FlashMoEBridge.swift */,
+				2806E6B753DB713EEC153F3D /* SwarmWorker.swift */,
 			);
 			path = Bridge;
 			sourceTree = "<group>";
@@ -121,7 +122,7 @@
 		7DC3D96AAD773F68496A645B /* App */ = {
 			isa = PBXGroup;
 			children = (
-				CC2222222222222222222222 /* AppDelegate.swift */,
+				A5E3CF69D1C35835FFCA287F /* AppDelegate.swift */,
 				8EAF41B16BD4314D3642DC53 /* FlashMoEApp.swift */,
 			);
 			path = App;
@@ -134,9 +135,7 @@
 				18638B2F96B8C1EB7D55C874 /* Bridge */,
 				EDA325EB4F586262787DC634 /* FlashMoEEngine */,
 				436D67F159A3C0FA4F05317F /* metal_infer */,
-				AA3333333333333333333333 /* Models */,
 				5A512650C4615EA193374D2F /* Resources */,
-				BB3333333333333333333333 /* Services */,
 				42B268D8ECA1DA8E59B4F599 /* ViewModels */,
 				993DF219F89AA4229E9A43D2 /* Views */,
 				7066FB671F127A31C9768B99 /* Frameworks */,
@@ -147,30 +146,15 @@
 		993DF219F89AA4229E9A43D2 /* Views */ = {
 			isa = PBXGroup;
 			children = (
-				FF2222222222222222222222 /* BenchmarkView.swift */,
+				772FF294C96556429A969E17 /* BenchmarkView.swift */,
 				BAC1A43E0715A9CDE325FFC0 /* ChatView.swift */,
 				2AEBDCE15020A40A8451CB5A /* ContentView.swift */,
-				DD2222222222222222222222 /* ModelDownloadRow.swift */,
+				0F7C68D2EF677F964065BB20 /* ModelDownloadRow.swift */,
 				DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */,
-				EE2222222222222222222222 /* ProfilerView.swift */,
+				9D2BF3279663E9D253E86EEC /* ProfilerView.swift */,
+				BA4422D5A57512CE46BBE97B /* SwarmView.swift */,
 			);
 			path = Views;
-			sourceTree = "<group>";
-		};
-		AA3333333333333333333333 /* Models */ = {
-			isa = PBXGroup;
-			children = (
-				AA2222222222222222222222 /* ModelCatalog.swift */,
-			);
-			path = Models;
-			sourceTree = "<group>";
-		};
-		BB3333333333333333333333 /* Services */ = {
-			isa = PBXGroup;
-			children = (
-				BB2222222222222222222222 /* DownloadManager.swift */,
-			);
-			path = Services;
 			sourceTree = "<group>";
 		};
 		EDA325EB4F586262787DC634 /* FlashMoEEngine */ = {
@@ -189,6 +173,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = A992692CC1A07BC40EFA0D3E /* Build configuration list for PBXNativeTarget "FlashMoE" */;
 			buildPhases = (
+				A81F8256E9391573EDA12094 /* Build Rust flashswarm-ios */,
 				D57FD46C656820096AA63872 /* Sources */,
 				E55762DD03B859815792AC85 /* Resources */,
 				FD2BB59A0A54FF99587D143D /* Frameworks */,
@@ -211,7 +196,9 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 1600;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+				};
 			};
 			buildConfigurationList = 716F6ADA7E507FC5C74161A0 /* Build configuration list for PBXProject "FlashMoE" */;
 			developmentRegion = en;
@@ -238,29 +225,51 @@
 			buildActionMask = 2147483647;
 			files = (
 				A40E8D436A3EEDB8B04CDC44 /* Assets.xcassets in Resources */,
+				D8242F5999552BC228A650CE /* shaders.metal in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A81F8256E9391573EDA12094 /* Build Rust flashswarm-ios */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust flashswarm-ios";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "#!/bin/bash\nset -euo pipefail\n\n# Cargo lives in ~/.cargo/bin — not in Xcode's restricted PATH\nexport PATH=\"$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"\n\nSWARM_DIR=\"$(cd \"$SRCROOT/../../flash-swarm\" && pwd)\"\nLIB_OUT=\"$SRCROOT/RustLibs\"\nmkdir -p \"$LIB_OUT/include\"\n\n# Choose the right Rust target based on what Xcode is building for.\nif [[ \"$PLATFORM_NAME\" == \"iphonesimulator\" ]]; then\n  RUST_TARGET=\"aarch64-apple-ios-sim\"\nelse\n  RUST_TARGET=\"aarch64-apple-ios\"\nfi\n\necho \"Building flashswarm-ios for $RUST_TARGET…\"\n(cd \"$SWARM_DIR\" && cargo build --release --target \"$RUST_TARGET\" -p flashswarm-ios)\n\n# Copy outputs to RustLibs/ so Xcode can find them at link time.\ncp \"$SWARM_DIR/target/$RUST_TARGET/release/libflashswarm_ios.a\" \"$LIB_OUT/\"\ncp \"$SWARM_DIR/crates/flashswarm-ios/include/flashswarm_ios.h\"  \"$LIB_OUT/include/\"\n\necho \"flashswarm-ios built → $LIB_OUT\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		D57FD46C656820096AA63872 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D8242F5999552BC228A650CE /* shaders.metal in Sources */,
-				CC1111111111111111111111 /* AppDelegate.swift in Sources */,
-				FF1111111111111111111111 /* BenchmarkView.swift in Sources */,
+				27AFF8FDB34F290DA5F8BD58 /* AppDelegate.swift in Sources */,
+				6705BB42E9958921B7F9605F /* BenchmarkView.swift in Sources */,
 				86FB8D83EC8F2AA092081685 /* ChatView.swift in Sources */,
 				15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */,
-				BB1111111111111111111111 /* DownloadManager.swift in Sources */,
 				0BA5B28A95E8C0616CCA6A3D /* FlashMoEApp.swift in Sources */,
 				5F7FD44C4FF2E97505EDAB58 /* FlashMoEBridge.swift in Sources */,
 				F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */,
-				AA1111111111111111111111 /* ModelCatalog.swift in Sources */,
-				DD1111111111111111111111 /* ModelDownloadRow.swift in Sources */,
+				728E0AD15FEECD0BB62EFD11 /* ModelDownloadRow.swift in Sources */,
 				23E305445AFD3D5FB1A5E5FC /* ModelListView.swift in Sources */,
-				EE1111111111111111111111 /* ProfilerView.swift in Sources */,
+				D2852565F398AF1232656EFE /* ProfilerView.swift in Sources */,
+				02071AFBA6DDE07F6E070EB6 /* SwarmView.swift in Sources */,
+				8BBA5172A0EFA6233A4BCFCE /* SwarmWorker.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -315,16 +324,14 @@
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 6.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -382,17 +389,15 @@
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 6.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -402,41 +407,28 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
-				CODE_SIGN_IDENTITY = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 5297SX54T2;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
-				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/FlashMoEEngine",
 					"$(SRCROOT)/../metal_infer",
+					"$(SRCROOT)/RustLibs/include",
 				);
 				INFOPLIST_KEY_CFBundleDisplayName = "Flash-MoE";
-				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Flash-Swarm needs local network access to discover and connect to Mac cluster nodes.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
-					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				OTHER_CFLAGS = (
-					"-DCHAT_MODE=1",
-					"-DACCELERATE_NEW_LAPACK",
-				);
-				OTHER_LDFLAGS = "-lcompression";
-				PRODUCT_BUNDLE_IDENTIFIER = com.alexintosh.flashmoe;
+				OTHER_CFLAGS = "-DCHAT_MODE=1 -DACCELERATE_NEW_LAPACK";
+				OTHER_LDFLAGS = "-lcompression -L$(SRCROOT)/RustLibs -lflashswarm_ios";
+				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
 				PRODUCT_NAME = FlashMoE;
-				PROVISIONING_PROFILE_SPECIFIER = "";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
-				SUPPORTS_MACCATALYST = NO;
-				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Bridge/FlashMoE-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -448,44 +440,28 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
-				CODE_SIGN_IDENTITY = "Apple Development";
-				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 5297SX54T2;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
-				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/FlashMoEEngine",
 					"$(SRCROOT)/../metal_infer",
+					"$(SRCROOT)/RustLibs/include",
 				);
 				INFOPLIST_KEY_CFBundleDisplayName = "Flash-MoE";
-				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Flash-Swarm needs local network access to discover and connect to Mac cluster nodes.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
-					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 15.0;
-				OTHER_CFLAGS = (
-					"-DCHAT_MODE=1",
-					"-DACCELERATE_NEW_LAPACK",
-				);
-				OTHER_LDFLAGS = "-lcompression";
-				PRODUCT_BUNDLE_IDENTIFIER = com.alexintosh.flashmoe;
+				OTHER_CFLAGS = "-DCHAT_MODE=1 -DACCELERATE_NEW_LAPACK";
+				OTHER_LDFLAGS = "-lcompression -L$(SRCROOT)/RustLibs -lflashswarm_ios";
+				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.ios;
 				PRODUCT_NAME = FlashMoE;
-				PROVISIONING_PROFILE_SPECIFIER = "";
-				SDKROOT = auto;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
-				SUPPORTS_MACCATALYST = NO;
-				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Bridge/FlashMoE-Bridging-Header.h";
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
