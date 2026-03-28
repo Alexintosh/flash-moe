@@ -64,6 +64,8 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         # Local network usage — required for UDP discovery on iOS 14+
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Flash-Swarm needs local network access to discover and connect to Mac cluster nodes."
+        # Auto-generate Info.plist (required for code signing)
+        GENERATE_INFOPLIST_FILE: YES
         # Linker: compression + flashswarm Rust static lib
         OTHER_LDFLAGS: "-lcompression -L$(SRCROOT)/RustLibs -lflashswarm_ios"
     dependencies:
