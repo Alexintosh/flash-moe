@@ -56,6 +56,7 @@ final class FlashMoEEngine: @unchecked Sendable {
     // Observable state for SwiftUI
     private(set) var state: EngineState = .idle
     private(set) var modelInfo: ModelInfo?
+    private(set) var loadedModelPath: String? = nil
     private(set) var tokensPerSecond: Double = 0
     private(set) var tokensGenerated: Int = 0
     private(set) var timeToFirstToken: Double = 0
@@ -65,8 +66,8 @@ final class FlashMoEEngine: @unchecked Sendable {
     var generationPausedByBackground = false
 
     // Private engine state
-    private var context: OpaquePointer?  // FlashMoEContext*
-    private let engineQueue = DispatchQueue(label: "com.flashmoe.engine", qos: .userInitiated)
+    var context: OpaquePointer?  // FlashMoEContext*
+    let engineQueue = DispatchQueue(label: "com.flashmoe.engine", qos: .userInitiated)
     private var isGenerating = false
 
 #if os(iOS)
@@ -208,8 +209,10 @@ final class FlashMoEEngine: @unchecked Sendable {
                     metalBufferBytes: UInt64(stats.metal_buffer_bytes)
                 )
 
+                let loadedPath = path
                 DispatchQueue.main.async {
                     self.modelInfo = info
+                    self.loadedModelPath = loadedPath
                     self.state = .ready
                 }
                 continuation.resume()
