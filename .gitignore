@@ -35,3 +35,6 @@ logs/
 metal_infer/test_lzfse
 metal_infer/repack_experts_lz4
 metal_infer/routing_data.bin
+
+# Flash-Swarm Rust static library (built by Xcode pre-build script)
+FlashMoE-iOS/RustLibs/
