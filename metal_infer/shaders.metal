@@ -218,15 +218,22 @@ kernel void fused_gate_up_swiglu(
             }
         }
     }
-    // Reduction using dynamic SIMD width (future-proof for non-32 SIMD sizes)
+    // Reduction: first reduce within each SIMD group, then serial sum across groups.
+    // NOTE: Cannot use simd_sum for the second level because only num_simd_groups
+    // lanes (8 out of 32) would have valid data, and simd_sum with divergent
+    // execution (partial SIMD group participation) is undefined behavior in Metal.
     uint num_simd_groups = tg_size / simd_size;
     threadgroup float sg[32], su[32];  // max 256/simd_size groups
     float rg = simd_sum(ga), ru = simd_sum(ua);
     if (simd_lane == 0) { sg[simd_group] = rg; su[simd_group] = ru; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_group == 0 && simd_lane < num_simd_groups) {
-        float vg = simd_sum(sg[simd_lane]), vu = simd_sum(su[simd_lane]);
-        if (simd_lane == 0) out[tgid] = (vg / (1.0f + exp(-vg))) * vu;
+    if (lid == 0) {
+        float vg = 0.0f, vu = 0.0f;
+        for (uint i = 0; i < num_simd_groups; i++) {
+            vg += sg[i];
+            vu += su[i];
+        }
+        out[tgid] = (vg / (1.0f + exp(-vg))) * vu;
     }
 }
 
@@ -2106,17 +2113,24 @@ kernel void fused_gate_up_swiglu_fp16(
             }
         }
     }
-    // Reduction using dynamic SIMD width
+    // Reduction: first reduce within each SIMD group, then serial sum across groups.
+    // NOTE: Cannot use simd_sum for the second level because only num_simd_groups
+    // lanes (8 out of 32) would have valid data, and simd_sum with divergent
+    // execution (partial SIMD group participation) is undefined behavior in Metal.
     uint num_simd_groups = tg_size / simd_size;
     threadgroup float sg[32], su[32];
     // Promote to float for reduction — SiLU MUST be computed in float32
     float rg = float(simd_sum(ga)), ru = float(simd_sum(ua));
     if (simd_lane == 0) { sg[simd_group] = rg; su[simd_group] = ru; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_group == 0 && simd_lane < num_simd_groups) {
-        float vg = simd_sum(sg[simd_lane]), vu = simd_sum(su[simd_lane]);
+    if (lid == 0) {
+        float vg = 0.0f, vu = 0.0f;
+        for (uint i = 0; i < num_simd_groups; i++) {
+            vg += sg[i];
+            vu += su[i];
+        }
         // SiLU activation in float32 to avoid exp() overflow in half
-        if (simd_lane == 0) out[tgid] = (vg / (1.0f + exp(-vg))) * vu;
+        out[tgid] = (vg / (1.0f + exp(-vg))) * vu;
     }
 }
 

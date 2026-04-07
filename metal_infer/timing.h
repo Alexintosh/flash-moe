@@ -78,11 +78,17 @@ static int g_cache_io_split = 1;  // >1: split each routed expert pread into N p
 static int g_cmd_merge_enabled = 1; // 1: merge CMD1+CMD2 for linear attention (saves ~2ms/token), 0: separate
 static int g_fused_attention_enabled = 0; // 1: fused online softmax attention (experimental), 0: 3-kernel fallback
 static int g_fused_expert_enabled = 0;   // 1: fused gate+up+SwiGLU kernel (experimental), 0: separate dispatches (default, proven correct)
+static int g_fused_expert_validate = 0;  // 1: run BOTH fused and separate paths for first expert of first layer, compare outputs
 static int g_use_fp16_accum = 0;         // 1: use half-precision accumulation in dequant kernels (experimental)
 static int g_sliding_window = 0;         // >0: sliding window size for full attention KV cache (circular buffer)
 static int g_h2o_budget = 0;             // 0 = disabled, >0 = total H2O KV cache budget (sinks + recent + heavy hitters)
 static int g_h2o_num_sinks = 4;          // attention sink tokens to keep (first N, typically 4)
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+
+// iOS background state: when 1, GPU submissions are skipped to prevent
+// IOGPUMetalError (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted).
+// Set by UIApplication lifecycle observers in FlashMoEEngine.m.
+static volatile int g_app_backgrounded = 0;
 
 // Batched prefill configuration
 static int g_prefill_batch = 1;             // 1 = no batching (default), >1 = GEMM prefill
@@ -104,6 +110,8 @@ static int g_prefetch_layer = -1;                 // which layer the in-flight p
 static int g_expert_prefetch_enabled = 0;         // default OFF until validated; toggled via config/CLI
 static int g_prefetch_hits_total = 0;             // cross-layer prefetch hit counter
 static int g_prefetch_misses_total = 0;           // cross-layer prefetch miss counter
+static int g_prefetch_skipped_total = 0;          // skipped because CMD3 was reading from buf_B
+static int g_prefetch_launched_total = 0;         // cross-layer prefetch launches
 
 // Runtime KV sequence limit — set before model load.
 // On iOS: capped to adaptive context (e.g. 8192). On macOS: cfg.max_seq_len.
@@ -287,10 +295,11 @@ static void timing_print(void) {
         fprintf(stderr, "  [predict] hits=%llu misses=%llu rate=%.1f%% layers=%llu\n",
                 g_pred_hits, g_pred_misses, hit_rate, g_pred_layers);
     }
-    if (g_expert_prefetch_enabled && (g_prefetch_hits_total + g_prefetch_misses_total) > 0) {
+    if (g_expert_prefetch_enabled && (g_prefetch_hits_total + g_prefetch_misses_total + g_prefetch_launched_total + g_prefetch_skipped_total) > 0) {
         int total = g_prefetch_hits_total + g_prefetch_misses_total;
         double hit_rate = total > 0 ? (double)g_prefetch_hits_total / total * 100.0 : 0;
-        fprintf(stderr, "  [prefetch] hits=%d misses=%d rate=%.1f%%\n",
-                g_prefetch_hits_total, g_prefetch_misses_total, hit_rate);
+        fprintf(stderr, "  [prefetch] hits=%d misses=%d rate=%.1f%% launched=%d skipped_buf_b=%d\n",
+                g_prefetch_hits_total, g_prefetch_misses_total, hit_rate,
+                g_prefetch_launched_total, g_prefetch_skipped_total);
     }
 }

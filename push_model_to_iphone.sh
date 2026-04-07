@@ -35,24 +35,44 @@ fi
 
 echo "$(ts) iPhone detected."
 
+# Check for --force flag
+FORCE=0
+if [ "$3" = "--force" ] || [ "$2" = "--force" ]; then
+    FORCE=1
+    echo "$(ts) Force mode — will overwrite existing files"
+fi
+
 # Get list of files already on device (for resume)
 echo "$(ts) Checking existing files on device..."
 EXISTING=$(python3 -c "
+import os
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.services.house_arrest import HouseArrestService
 lockdown = create_using_usbmux()
 afc = HouseArrestService(lockdown=lockdown, bundle_id='$BUNDLE')
-try: afc.makedirs('Documents/$MODEL_NAME/packed_experts')
-except: pass
-try:
-    for f in afc.listdir('Documents/$MODEL_NAME'):
-        if not f.startswith('.'): print(f)
-except: pass
-try:
-    for f in afc.listdir('Documents/$MODEL_NAME/packed_experts'):
-        if not f.startswith('.'): print('packed_experts/' + f)
-except: pass
+# Create all needed subdirectories
+for subdir in ['packed_experts', 'packed_experts_tiered', 'packed_experts_2bit']:
+    try: afc.makedirs('Documents/$MODEL_NAME/' + subdir)
+    except: pass
+# List all files recursively
+def list_recursive(path, prefix=''):
+    try:
+        for f in afc.listdir(path):
+            if f.startswith('.'): continue
+            full = path + '/' + f
+            rel = prefix + f if not prefix else prefix + '/' + f
+            try:
+                afc.listdir(full)  # if this works, it's a directory
+                list_recursive(full, rel + '/')
+            except:
+                print(rel if prefix else f)
+    except: pass
+list_recursive('Documents/$MODEL_NAME')
 " 2>/dev/null)
+
+if [ "$FORCE" = "1" ]; then
+    EXISTING=""
+fi
 
 EXISTING_COUNT=$(echo "$EXISTING" | grep -c . || echo 0)
 echo "$(ts) $EXISTING_COUNT files already on device"

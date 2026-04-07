@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -137,6 +138,57 @@ void flashmoe_set_runtime_config(FlashMoEContext *ctx,
                                   int fused_attention,
                                   int cache_io_split,
                                   int fp16_accumulation);
+
+// ---- Expert Callback APIs (for distributed inference / flashswarm) ----
+
+// Expert read callback -- called instead of pread when an expert is remote.
+// Returns bytes read on success (must equal size), or -1 on error.
+typedef ssize_t (*expert_read_fn)(int layer, int expert, void *dst, size_t size,
+                                  off_t offset, void *user_data);
+
+// Set the expert read callback. When set and the bitmap marks an expert as
+// remote, this is called instead of native pread. Pass NULL to revert to
+// native I/O. user_data is forwarded to every callback invocation.
+void flashmoe_set_expert_read_callback(FlashMoEContext *ctx, expert_read_fn fn,
+                                       void *user_data);
+
+// Expert compute callback -- called instead of local GPU expert forward when
+// an expert is remote. The callback receives the hidden state and must fill
+// the output buffer (both [hidden_dim] floats). Returns 0 on success, -1 on error.
+typedef int (*expert_compute_fn)(int layer, int expert, const float *input,
+                                 float *output, int hidden_dim, void *user_data);
+
+// Set the expert compute callback. When set and the bitmap marks an expert
+// as remote, this is called instead of pread + GPU expert forward.
+// Takes priority over the read callback for remote experts.
+// Pass NULL to revert to local compute.
+void flashmoe_set_expert_compute_callback(FlashMoEContext *ctx,
+                                          expert_compute_fn fn, void *user_data);
+
+// Expert remote bitmap -- packed bit array where bit (layer * max_experts + expert)
+// indicates whether the expert should be routed through the callback.
+// If bitmap is NULL, ALL experts are routed through the callback (legacy behavior).
+// Local experts (bit=0) always use native pread+fanout.
+// bitmap_size must be >= ceil(num_layers * num_experts / 8).
+void flashmoe_set_expert_remote_bitmap(FlashMoEContext *ctx,
+                                       const uint8_t *bitmap, int bitmap_size);
+
+// ---- Per-layer Timing API ----
+
+typedef struct {
+    double cmd1_ms;
+    double cmd2_ms;
+    double io_ms;
+    double cmd3_ms;
+    double total_ms;
+    int layer_count;
+} FlashMoELayerTiming;
+
+// Get accumulated per-layer timing. Fills the provided struct with averages.
+void flashmoe_get_layer_timing(FlashMoEContext *ctx, FlashMoELayerTiming *timing);
+
+// Reset all timing accumulators to zero.
+void flashmoe_reset_timing(FlashMoEContext *ctx);
 
 // ---- Utility ----
 

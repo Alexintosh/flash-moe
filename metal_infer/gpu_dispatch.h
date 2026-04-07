@@ -871,3 +871,147 @@ static void gpu_expert_forward(
     // Copy result back to CPU
     memcpy(expert_out, [ctx->buf_expert_out contents], cfg.hidden_dim * sizeof(float));
 }
+
+// ============================================================================
+// Fused expert kernel validation: run BOTH fused and separate paths on the
+// same expert data, compare the SwiGLU activation output element-by-element.
+// Enabled by --validate-fused flag (sets g_fused_expert_validate=1).
+// Runs once for the first expert of the first layer, then auto-disables.
+// ============================================================================
+__attribute__((unused))
+static void gpu_validate_fused_expert(
+    MetalCtx *ctx,
+    id<MTLBuffer> expert_buf  // expert weight data (already loaded)
+) {
+    if (!ctx->fused_gate_up) {
+        fprintf(stderr, "[validate-fused] fused_gate_up pipeline not available, skipping.\n");
+        return;
+    }
+
+    NSUInteger gate_w_off = cfg.gate_w_off_4, gate_s_off = cfg.gate_s_off_4, gate_b_off = cfg.gate_b_off_4;
+    NSUInteger up_w_off   = cfg.up_w_off_4,   up_s_off   = cfg.up_s_off_4,   up_b_off   = cfg.up_b_off_4;
+
+    uint32_t out_dim = cfg.moe_intermediate;
+    uint32_t in_dim  = cfg.hidden_dim;
+    uint32_t gs      = cfg.group_size;
+    uint32_t num_tgs = (out_dim + 7) / 8;
+    uint32_t swiglu_tgs = (out_dim + 255) / 256;
+
+    // Allocate temporary buffer for the fused path output
+    id<MTLBuffer> fused_out_buf = [ctx->device newBufferWithLength:out_dim * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+
+    id<MTLComputePipelineState> mv_pipe = (g_use_fp16_accum && ctx->matvec_v3_fp16)
+        ? ctx->matvec_v3_fp16 : ctx->matvec_v3;
+
+    // --- Path A: separate gate + up + SwiGLU ---
+    {
+        id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+        // gate_proj -> buf_multi_expert_gate[0]
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:mv_pipe];
+            [enc setBuffer:expert_buf                      offset:gate_w_off  atIndex:0];
+            [enc setBuffer:expert_buf                      offset:gate_s_off  atIndex:1];
+            [enc setBuffer:expert_buf                      offset:gate_b_off  atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_gate[0]   offset:0           atIndex:4];
+            [enc setBytes:&out_dim length:4 atIndex:5];
+            [enc setBytes:&in_dim  length:4 atIndex:6];
+            [enc setBytes:&gs      length:4 atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+        // up_proj -> buf_multi_expert_up[0]
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:mv_pipe];
+            [enc setBuffer:expert_buf                      offset:up_w_off  atIndex:0];
+            [enc setBuffer:expert_buf                      offset:up_s_off  atIndex:1];
+            [enc setBuffer:expert_buf                      offset:up_b_off  atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_input     offset:0          atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_up[0]     offset:0          atIndex:4];
+            [enc setBytes:&out_dim length:4 atIndex:5];
+            [enc setBytes:&in_dim  length:4 atIndex:6];
+            [enc setBytes:&gs      length:4 atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+        // SwiGLU -> buf_multi_expert_act[0]
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:ctx->swiglu];
+            [enc setBuffer:ctx->buf_multi_expert_gate[0] offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_multi_expert_up[0]   offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_multi_expert_act[0]  offset:0 atIndex:2];
+            [enc setBytes:&out_dim length:4 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+        [cmdbuf commit];
+        [cmdbuf waitUntilCompleted];
+    }
+
+    // Copy separate-path result
+    float *separate_result = (float *)malloc(out_dim * sizeof(float));
+    memcpy(separate_result, [ctx->buf_multi_expert_act[0] contents], out_dim * sizeof(float));
+
+    // --- Path B: fused gate+up+SwiGLU ---
+    {
+        id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        id<MTLComputePipelineState> fused_pipe = (g_use_fp16_accum && ctx->fused_gate_up_fp16)
+            ? ctx->fused_gate_up_fp16 : ctx->fused_gate_up;
+        [enc setComputePipelineState:fused_pipe];
+        [enc setBuffer:expert_buf                      offset:gate_w_off  atIndex:0];
+        [enc setBuffer:expert_buf                      offset:gate_s_off  atIndex:1];
+        [enc setBuffer:expert_buf                      offset:gate_b_off  atIndex:2];
+        [enc setBuffer:expert_buf                      offset:up_w_off    atIndex:3];
+        [enc setBuffer:expert_buf                      offset:up_s_off    atIndex:4];
+        [enc setBuffer:expert_buf                      offset:up_b_off    atIndex:5];
+        [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:6];
+        [enc setBuffer:fused_out_buf                   offset:0           atIndex:7];
+        [enc setBytes:&out_dim length:4 atIndex:8];
+        [enc setBytes:&in_dim  length:4 atIndex:9];
+        [enc setBytes:&gs      length:4 atIndex:10];
+        [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmdbuf commit];
+        [cmdbuf waitUntilCompleted];
+    }
+
+    float *fused_result = (float *)[fused_out_buf contents];
+
+    // --- Compare ---
+    float max_abs_err = 0.0f, max_rel_err = 0.0f;
+    int worst_idx = 0;
+    int num_large = 0;
+    for (uint32_t i = 0; i < out_dim; i++) {
+        float diff = fabsf(fused_result[i] - separate_result[i]);
+        float denom = fmaxf(fabsf(separate_result[i]), 1e-8f);
+        float rel = diff / denom;
+        if (diff > max_abs_err) { max_abs_err = diff; worst_idx = (int)i; }
+        if (rel > max_rel_err) max_rel_err = rel;
+        if (rel > 0.01f) num_large++;
+    }
+    fprintf(stderr, "[validate-fused] Comparing fused vs separate SwiGLU output (%u elements):\n", out_dim);
+    fprintf(stderr, "  max_abs_err = %.6e  at index %d (fused=%.6f, separate=%.6f)\n",
+            max_abs_err, worst_idx, fused_result[worst_idx], separate_result[worst_idx]);
+    fprintf(stderr, "  max_rel_err = %.6e\n", max_rel_err);
+    fprintf(stderr, "  elements with >1%% relative error: %d / %u\n", num_large, out_dim);
+    if (max_rel_err < 0.001f) {
+        fprintf(stderr, "  PASS: fused kernel matches separate path (max rel err < 0.1%%)\n");
+    } else if (num_large == 0) {
+        fprintf(stderr, "  PASS: minor numerical differences (all within 1%%)\n");
+    } else {
+        fprintf(stderr, "  FAIL: significant divergence detected (%d elements > 1%% error)\n", num_large);
+    }
+
+    free(separate_result);
+    // fused_out_buf is ARC-managed, will be released automatically
+    g_fused_expert_validate = 0;  // auto-disable after first run
+}

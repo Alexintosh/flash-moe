@@ -7,7 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		FF1111111111111111111111 /* BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF2222222222222222222222 /* BenchmarkView.swift */; };
 		0BA5B28A95E8C0616CCA6A3D /* FlashMoEApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EAF41B16BD4314D3642DC53 /* FlashMoEApp.swift */; };
 		15BBE610777A6EF58279A4E3 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AEBDCE15020A40A8451CB5A /* ContentView.swift */; };
 		23E305445AFD3D5FB1A5E5FC /* ModelListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDD107A34A4DAEABC7E9ECFB /* ModelListView.swift */; };
@@ -24,11 +23,11 @@
 		E73BB005AD9F878023B7F75E /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51FB34EBC20226BA8269877A /* Accelerate.framework */; };
 		EE1111111111111111111111 /* ProfilerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2222222222222222222222 /* ProfilerView.swift */; };
 		F00087500AE558979B35EE06 /* FlashMoEEngine.m in Sources */ = {isa = PBXBuildFile; fileRef = 50DF36AC37579556033D375F /* FlashMoEEngine.m */; };
+		FF1111111111111111111111 /* BenchmarkView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF2222222222222222222222 /* BenchmarkView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		03B08EB0D0CE594165AB1C14 /* FlashMoE-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "FlashMoE-Bridging-Header.h"; sourceTree = "<group>"; };
-		FF2222222222222222222222 /* BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkView.swift; sourceTree = "<group>"; };
 		2AEBDCE15020A40A8451CB5A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		3321AD5929C6B6D4FAD446C8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		3404570FACF1297B40EF6369 /* FlashMoEEngine.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FlashMoEEngine.h; sourceTree = "<group>"; };
@@ -49,6 +48,7 @@
 		DEE08D3053B24D1E206627F9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EE2222222222222222222222 /* ProfilerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfilerView.swift; sourceTree = "<group>"; };
 		EEC822B6F9CE0BABA49E989B /* shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = shaders.metal; sourceTree = "<group>"; };
+		FF2222222222222222222222 /* BenchmarkView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -402,9 +402,9 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
-				CODE_SIGN_IDENTITY = "iPhone Developer";
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
-				DEVELOPMENT_TEAM = YMCRS53QKE;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 5297SX54T2;
 				GCC_OPTIMIZATION_LEVEL = 2;
 				GCC_WARN_INHIBIT_ALL_WARNINGS = NO;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -429,8 +429,9 @@
 					"-DACCELERATE_NEW_LAPACK",
 				);
 				OTHER_LDFLAGS = "-lcompression";
-				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.app;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alexintosh.flashmoe;
 				PRODUCT_NAME = FlashMoE;
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;
@@ -447,9 +448,9 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Resources/FlashMoE.entitlements;
-				CODE_SIGN_IDENTITY = "iPhone Developer";
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
-				DEVELOPMENT_TEAM = YMCRS53QKE;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 5297SX54T2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -477,8 +478,9 @@
 					"-DACCELERATE_NEW_LAPACK",
 				);
 				OTHER_LDFLAGS = "-lcompression";
-				PRODUCT_BUNDLE_IDENTIFIER = com.flashmoe.app;
+				PRODUCT_BUNDLE_IDENTIFIER = com.alexintosh.flashmoe;
 				PRODUCT_NAME = FlashMoE;
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				SUPPORTS_MACCATALYST = NO;

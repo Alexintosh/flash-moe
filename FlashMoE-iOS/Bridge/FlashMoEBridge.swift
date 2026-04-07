@@ -9,6 +9,9 @@
 
 import Foundation
 import Observation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Data Types
 
@@ -57,18 +60,66 @@ final class FlashMoEEngine: @unchecked Sendable {
     private(set) var tokensGenerated: Int = 0
     private(set) var timeToFirstToken: Double = 0
 
+    /// Set to true when generation was interrupted because the app entered the background.
+    /// ChatView uses this to show a "paused" banner. Cleared when the user sends a new message.
+    var generationPausedByBackground = false
+
     // Private engine state
     private var context: OpaquePointer?  // FlashMoEContext*
     private let engineQueue = DispatchQueue(label: "com.flashmoe.engine", qos: .userInitiated)
     private var isGenerating = false
 
-    init() {}
+#if os(iOS)
+    private var backgroundObserver: Any?
+    private var foregroundObserver: Any?
+#endif
+
+    init() {
+        #if os(iOS)
+        setupLifecycleObservers()
+        #endif
+    }
 
     deinit {
+        #if os(iOS)
+        if let obs = backgroundObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        if let obs = foregroundObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        #endif
         if let ctx = context {
             flashmoe_destroy(ctx)
         }
     }
+
+    // MARK: - iOS Lifecycle
+
+    #if os(iOS)
+    private func setupLifecycleObservers() {
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            if self.isGenerating {
+                self.generationPausedByBackground = true
+            }
+        }
+
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            // g_app_backgrounded is cleared in the C layer (FlashMoEEngine.m).
+            // The Swift-side generationPausedByBackground flag persists until
+            // the user sends a new message, so the banner stays visible.
+        }
+    }
+    #endif
 
     // MARK: - Model Loading
 

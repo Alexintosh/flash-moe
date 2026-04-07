@@ -95,6 +95,38 @@ H2O replaces sliding window when both are configured (`g_h2o_budget > 0` takes p
 - H2O keeps the most-attended tokens regardless of age, plus guaranteed sinks and recents.
 - Both have fixed memory: sliding window = `window_size` positions, H2O = `budget` positions.
 
+## RoPE Scaling (Context Extension)
+
+RoPE (Rotary Position Embedding) scaling extends the effective context length beyond the model's native training length. Three methods are implemented, each with different quality/extension tradeoffs:
+
+### Linear Scaling
+
+Divides position indices by a scale factor before computing RoPE frequencies. If the model was trained with 4K context and you set `rope_scale_factor=2.0`, it can handle 8K context.
+
+**Pros:** Simple, zero overhead.
+**Cons:** Quality degrades at high ratios (>2x). The model sees "compressed" positions it was never trained on.
+
+### NTK-aware Scaling
+
+Modifies the RoPE frequency base instead of the positions. The base frequency is raised: `base' = base * factor^(dim/(dim-2))`. This rotates all frequency components proportionally, preserving the relative structure.
+
+**Pros:** Better quality at 2-4x extension. No per-position modification.
+**Cons:** Moderate quality loss at >4x.
+
+### YaRN (Yet Another RoPE extensioN)
+
+Per-dimension interpolation between original and scaled RoPE, with an attention scaling factor. Low-frequency dimensions (which encode long-range position) are interpolated more aggressively, while high-frequency dimensions (which encode local position) are left mostly unchanged.
+
+**Pros:** Best quality at 4-8x extension. Designed for large extensions.
+**Cons:** Most complex. Requires an attention temperature correction factor.
+
+### Configuration
+
+CLI: `--rope-scale-type {none,linear,ntk,yarn}` and `--rope-scale-factor <float>`.
+iOS: Expert Settings > Context > RoPE Scaling.
+
+Default: no scaling (native context length). RoPE scaling only affects the 10 full-attention layers; the 30 GatedDeltaNet layers are position-independent.
+
 ## Combined Effect
 
 The three techniques stack:

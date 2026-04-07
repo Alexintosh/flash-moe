@@ -58,7 +58,17 @@ struct FlashMoEContext {
     dispatch_source_t memory_pressure_source;
 #if TARGET_OS_IPHONE
     id memory_warning_observer;
+    id background_observer;     // UIApplication.didEnterBackgroundNotification
+    id foreground_observer;     // UIApplication.willEnterForegroundNotification
 #endif
+
+    // Expert callback APIs (distributed inference / flashswarm)
+    expert_read_fn expert_read_cb;
+    void *expert_read_user_data;
+    expert_compute_fn expert_compute_cb;
+    void *expert_compute_user_data;
+    const uint8_t *expert_remote_bitmap;
+    int expert_remote_bitmap_size;
 
     // Error state
     char last_error[512];
@@ -484,6 +494,29 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                     atomic_store(&ctx_warn->cancelled, 1);
                 }
             }];
+
+            // Background/foreground observers — prevent IOGPUMetalError crash
+            // when iOS revokes GPU access from backgrounded apps.
+            ctx->background_observer = [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidEnterBackgroundNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                NSLog(@"[FlashMoE] App entered background — pausing GPU work");
+                g_app_backgrounded = 1;
+                if (ctx_warn && ctx_warn->loaded) {
+                    atomic_store(&ctx_warn->cancelled, 1);
+                }
+            }];
+
+            ctx->foreground_observer = [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationWillEnterForegroundNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                NSLog(@"[FlashMoE] App entering foreground — resuming GPU access");
+                g_app_backgrounded = 0;
+            }];
         }
 #endif
 
@@ -617,12 +650,21 @@ void flashmoe_unload(FlashMoEContext *ctx) {
         g_cache_telemetry_enabled = 0;
         g_kv_seq_len = 0;
 
-        // Remove iOS memory warning observer
+        // Remove iOS notification observers
 #if TARGET_OS_IPHONE
         if (ctx->memory_warning_observer) {
             [[NSNotificationCenter defaultCenter] removeObserver:ctx->memory_warning_observer];
             ctx->memory_warning_observer = nil;
         }
+        if (ctx->background_observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:ctx->background_observer];
+            ctx->background_observer = nil;
+        }
+        if (ctx->foreground_observer) {
+            [[NSNotificationCenter defaultCenter] removeObserver:ctx->foreground_observer];
+            ctx->foreground_observer = nil;
+        }
+        g_app_backgrounded = 0;
 #endif
 
         // Cancel memory pressure monitoring
@@ -1368,5 +1410,57 @@ int flashmoe_turn_count(FlashMoEContext *ctx) {
 const char *flashmoe_last_error(FlashMoEContext *ctx) {
     if (!ctx) return "NULL context";
     return ctx->last_error;
+}
+
+// ============================================================================
+// Expert Callback APIs (distributed inference / flashswarm)
+// ============================================================================
+
+void flashmoe_set_expert_read_callback(FlashMoEContext *ctx, expert_read_fn fn, void *user_data) {
+    if (!ctx) return;
+    ctx->expert_read_cb = fn;
+    ctx->expert_read_user_data = user_data;
+    g_expert_read_cb = fn;
+    g_expert_read_user_data = user_data;
+}
+
+void flashmoe_set_expert_compute_callback(FlashMoEContext *ctx, expert_compute_fn fn, void *user_data) {
+    if (!ctx) return;
+    ctx->expert_compute_cb = fn;
+    ctx->expert_compute_user_data = user_data;
+    g_expert_compute_cb = fn;
+    g_expert_compute_user_data = user_data;
+}
+
+void flashmoe_set_expert_remote_bitmap(FlashMoEContext *ctx, const uint8_t *bitmap, int bitmap_size) {
+    if (!ctx) return;
+    ctx->expert_remote_bitmap = bitmap;
+    ctx->expert_remote_bitmap_size = bitmap_size;
+    g_expert_remote_bitmap = bitmap;
+    g_expert_remote_bitmap_size = bitmap_size;
+}
+
+// ============================================================================
+// Per-layer Timing API
+// ============================================================================
+
+void flashmoe_get_layer_timing(FlashMoEContext *ctx, FlashMoELayerTiming *timing) {
+    if (!ctx || !timing) return;
+    if (g_timing.count == 0) {
+        memset(timing, 0, sizeof(*timing));
+        return;
+    }
+    int n = g_timing.count;
+    timing->cmd1_ms = (g_timing.cmd1_submit + g_timing.cmd1_wait) / n;
+    timing->cmd2_ms = (g_timing.cmd2_encode + g_timing.cmd2_wait) / n;
+    timing->io_ms = g_timing.expert_io / n;
+    timing->cmd3_ms = g_timing.cmd3_encode / n;
+    timing->total_ms = g_timing.total / n;
+    timing->layer_count = n;
+}
+
+void flashmoe_reset_timing(FlashMoEContext *ctx) {
+    (void)ctx;
+    timing_reset();
 }
 

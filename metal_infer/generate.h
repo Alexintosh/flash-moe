@@ -1174,6 +1174,13 @@ static void serve_loop(
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
                     request_id, gen_count, gen_ms,
                     gen_count > 0 ? gen_count * 1000.0 / gen_ms : 0.0);
+            if (g_expert_prefetch_enabled) {
+                int pf_total = g_prefetch_hits_total + g_prefetch_misses_total;
+                double pf_rate = pf_total > 0 ? 100.0 * g_prefetch_hits_total / pf_total : 0.0;
+                fprintf(stderr, "[serve] prefetch: %d hits, %d misses (%.1f%%), %d launched, %d skipped\n",
+                        g_prefetch_hits_total, g_prefetch_misses_total, pf_rate,
+                        g_prefetch_launched_total, g_prefetch_skipped_total);
+            }
             if (g_expert_cache) {
                 cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
             } else if (g_malloc_cache) {
@@ -1445,6 +1452,13 @@ static void serve_loop(
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
                     request_id, gen_count, gen_ms,
                     gen_count > 0 ? gen_count * 1000.0 / gen_ms : 0.0);
+            if (g_expert_prefetch_enabled) {
+                int pf_total = g_prefetch_hits_total + g_prefetch_misses_total;
+                double pf_rate = pf_total > 0 ? 100.0 * g_prefetch_hits_total / pf_total : 0.0;
+                fprintf(stderr, "[serve] prefetch: %d hits, %d misses (%.1f%%), %d launched, %d skipped\n",
+                        g_prefetch_hits_total, g_prefetch_misses_total, pf_rate,
+                        g_prefetch_launched_total, g_prefetch_skipped_total);
+            }
 
             free(gen_text);
             free(pt->ids);
@@ -1501,6 +1515,8 @@ static void print_usage(const char *prog) {
     printf("  --pfb N              Prefill batch size (default: 1 = token-by-token)\n");
     printf("  --prefill-skip-experts    Skip routed experts during prefill (shared only)\n");
     printf("  --prefill-experts-full-only  Experts only at full attention layers during prefill\n");
+    printf("  --fused-expert       Enable fused gate+up+SwiGLU expert kernel (experimental)\n");
+    printf("  --validate-fused     Run fused vs separate expert kernel comparison (enables --fused-expert)\n");
     printf("  --help               This message\n");
 }
 
@@ -1552,6 +1568,8 @@ int main(int argc, char **argv) {
             {"prefill-skip-experts",       no_argument, 0, 0x104},
             {"prefill-experts-full-only",  no_argument, 0, 0x105},
             {"validate-prefill",           no_argument, 0, 0x106},
+            {"fused-expert",               no_argument, 0, 0x107},
+            {"validate-fused",             no_argument, 0, 0x108},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -1631,6 +1649,8 @@ int main(int argc, char **argv) {
                 case 0x104: g_prefill_skip_experts = 1; break;
                 case 0x105: g_prefill_experts_full_only = 1; break;
                 case 0x106: validate_prefill = 1; break;
+                case 0x107: g_fused_expert_enabled = 1; break;
+                case 0x108: g_fused_expert_validate = 1; g_fused_expert_enabled = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -1964,6 +1984,8 @@ int main(int argc, char **argv) {
         g_prefetch_layer = -1;
         g_prefetch_hits_total = 0;
         g_prefetch_misses_total = 0;
+        g_prefetch_skipped_total = 0;
+        g_prefetch_launched_total = 0;
 
         // Warm page cache hint
         if (expert_layers_available > 0) {
@@ -2282,6 +2304,14 @@ int main(int argc, char **argv) {
                    g_spec_route_attempts, g_spec_route_preloads, g_spec_route_hits,
                    g_spec_route_attempts > 0
                        ? 100.0 * g_spec_route_hits / g_spec_route_attempts : 0.0);
+        }
+
+        if (g_expert_prefetch_enabled) {
+            int pf_total = g_prefetch_hits_total + g_prefetch_misses_total;
+            double pf_rate = pf_total > 0 ? 100.0 * g_prefetch_hits_total / pf_total : 0.0;
+            printf("Expert prefetch: %d hits, %d misses (%.1f%% hit rate), %d launched, %d skipped (buf_B in use)\n",
+                   g_prefetch_hits_total, g_prefetch_misses_total, pf_rate,
+                   g_prefetch_launched_total, g_prefetch_skipped_total);
         }
 
         if (g_freq_tracking) freq_print_analysis(K);
